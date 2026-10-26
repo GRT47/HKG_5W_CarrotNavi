@@ -5,7 +5,15 @@ export ANDROID_ROOT=/system
 export ANDROID_DATA=/data
 export BOOTCLASSPATH=/system/framework/core.jar:/system/framework/conscrypt.jar:/system/framework/okhttp.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/framework2.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/mms-common.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/apache-xml.jar:/system/framework/webviewchromium.jar:/system/framework/automotive.jar
 
-INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../NEMESIS.data" ]; then
+    INSTALL_DIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)"
+elif [ -d "/data/nemesis/apps/carrotnavi.bridge" ]; then
+    INSTALL_DIR="/data/nemesis/apps/carrotnavi.bridge"
+else
+    INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
+fi
+mkdir -p /data/dalvik-cache 2>/dev/null
 ENG_PREF="/data/data/com.hkmc.system.app.engineering/shared_prefs/com.hkmc.system.app.engineering_preferences.xml"
 BRIDGE_PID=""
 LOOP_COUNT=0
@@ -91,10 +99,10 @@ start_bridge_java() {
         return 0
     fi
     kill_bridge_java
-    CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain daemon "$INSTALL_DIR" >> /data/local/tmp/carrotbridge_daemon.log 2>&1 &
+    CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain daemon "$INSTALL_DIR" 2>&1 &
     BRIDGE_PID="$!"
     BRIDGE_START_LOOP="$LOOP_COUNT"
-    log_info "Started CarrotBridgeMain daemon (pid=$BRIDGE_PID)"
+    log_info "Started CarrotBridgeMain daemon (pid=$BRIDGE_PID, dir=$INSTALL_DIR)"
 }
 
 check_bridge_java_watchdog() {
@@ -111,7 +119,7 @@ check_bridge_java_watchdog() {
 
 run_github_update_check() {
     log_info "Running GitHub Auto-Update check (GRT47/HKG_5W_CarrotNavi)..."
-    CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" >> /data/local/tmp/carrotbridge_updater.log 2>&1
+    CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" 2>&1
     rc="$?"
     if [ "$rc" = "10" ]; then
         log_info "GitHub update applied -> restarting CarrotBridgeMain daemon"

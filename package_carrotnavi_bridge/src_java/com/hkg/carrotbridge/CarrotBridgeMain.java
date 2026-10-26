@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.2";
+    public static final String BRIDGE_VERSION = "1.1.3";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -2051,7 +2051,7 @@ public class CarrotBridgeMain {
     // =========================================================================
 
     public static final class StatusDashboardOverlay {
-        private static volatile String installDir = "/data/nemesis/packages/carrotnavi.bridge";
+        private static volatile String installDir = "/data/nemesis/apps/carrotnavi.bridge";
         private static volatile NavState navStateRef = null;
         private static volatile Object uiHandler = null;
         private static volatile Object windowManager = null;
@@ -2858,13 +2858,13 @@ public class CarrotBridgeMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0 || "daemon".equals(args[0])) {
-            String installDir = args.length >= 2 ? args[1] : "/data/nemesis/packages/carrotnavi.bridge";
+            String installDir = args.length >= 2 ? args[1] : "/data/nemesis/apps/carrotnavi.bridge";
             runDaemon(installDir);
         } else if ("update".equals(args[0])) {
             String owner = args.length >= 2 ? args[1] : "GRT47";
             String repo = args.length >= 3 ? args[2] : "HKG_5W_CarrotNavi";
             String branch = args.length >= 4 ? args[3] : "main";
-            String installDir = args.length >= 5 ? args[4] : "/data/nemesis/packages/carrotnavi.bridge";
+            String installDir = args.length >= 5 ? args[4] : "/data/nemesis/apps/carrotnavi.bridge";
             boolean force = args.length >= 6 && "--force".equals(args[5]);
             int code = runAutoUpdate(owner, repo, branch, installDir, force);
             System.exit(code);

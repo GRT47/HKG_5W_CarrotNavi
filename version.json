@@ -1,5 +1,5 @@
 {
-  "version": "1.1.2",
+  "version": "1.1.3",
   "repository": "https://github.com/GRT47/HKG_5W_CarrotNavi.git",
   "branch": "main",
   "release_jar_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar",
@@ -7,11 +7,11 @@
   "files": {
     "svc/bridge-daemon.sh": {
       "remote": "package_carrotnavi_bridge/svc/bridge-daemon.sh",
-      "sha256": "2e4e1d083622100d1d19e330b61d6c686d2e8ae33abd54d52245abe8cfc6a04a"
+      "sha256": "63c34511c71c98ae0e84d1451e71633ac51b8c9d4e763a1f18f284e38b72ef71"
     },
     "bin/launch.sh": {
       "remote": "package_carrotnavi_bridge/bin/launch.sh",
-      "sha256": "2f16706ba5ee040553c6b651f52528fc661ecb4c7663f46af8e8452a42637595"
+      "sha256": "1ce3042fd87fd61c5971bc08aef8aca736f98cbdf9d406750003f9c647656c93"
     },
     "scripts/tbt-dump.sh": {
       "remote": "package_carrotnavi_bridge/scripts/tbt-dump.sh",

@@ -5,7 +5,15 @@ export ANDROID_ROOT=/system
 export ANDROID_DATA=/data
 export BOOTCLASSPATH=/system/framework/core.jar:/system/framework/conscrypt.jar:/system/framework/okhttp.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/framework2.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/mms-common.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/apache-xml.jar:/system/framework/webviewchromium.jar:/system/framework/automotive.jar
 
-INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../NEMESIS.data" ]; then
+    INSTALL_DIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)"
+elif [ -d "/data/nemesis/apps/carrotnavi.bridge" ]; then
+    INSTALL_DIR="/data/nemesis/apps/carrotnavi.bridge"
+else
+    INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
+fi
+mkdir -p /data/dalvik-cache 2>/dev/null
 
 # 1. Immediately signal the Status Dashboard Overlay to appear on screen
 echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
