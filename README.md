@@ -31,10 +31,10 @@
    - `am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0` 브로드캐스트로 `com.mnsoft.navi` 내부 `[Cluster]` 평문 TBT 로거 자동 활성화
    - 경로안내 중 모든 TBT 이벤트와 `dumpsys` 스냅샷을 `/data/local/tmp/hkg_tbt_dump/tbt_live_trace.log`에 기록하며, USB 메모리(`/storage/usb0`) 장착 시 `/storage/usb0/HKG_TBT_Dump/`로 자동 복사
 
-5. **MAP 버튼 3연타 상태 대시보드 오버레이 (`StatusDashboardOverlay`)**
-   - 전면 물리 `MAP` 버튼을 연속 3번 누르면(`ivi_mode_broadcast` `KEYCODE_SHORTCUT_MAP` / `com.hkmc.intent.action.MAP_SHORTCUT` 감지), 현재 화면 위에 **실시간 패키지 버전·동작 상태 대시보드 오버레이**가 즉시 표시됨
+5. **MAP 버튼 3연타 & NEMESIS 대시보드 상태 오버레이 (`StatusDashboardOverlay`)**
+   - 전면 물리 `MAP` 버튼을 연속 3번 누르거나(`ivi_mode_broadcast` `KEYCODE_SHORTCUT_MAP` / `com.hkmc.intent.action.MAP_SHORTCUT` 감지), NEMESIS 대시보드에서 `CarrotNavi 7706 Bridge`를 선택하면 현재 화면 위에 **실시간 패키지 버전·동작 상태 대시보드 오버레이**가 즉시 표시됨
    - 실시간 표시 항목: 패키지 버전, UDP `7706` 송신 카운터, Wi-Fi 핫스팟 상태, 콤마(캐럿파일럿) 연결 IP 및 수신 차속, 현재 도로 제한속도, 전방 단속카메라/구간단속/방지턱(SDI), 1차/2차 TBT 회전 및 한글 교차로명, 목적지 잔여 거리/시간
-   - 터치 조작 버튼: `[📶 핫스팟 설정 화면]`(`com.hkmc.wifisettings/.WifiHotspot` 즉시 진입), `[📡 핫스팟 즉시 켜기]`, `[🔄 GitHub 업데이트 확인]`, `[💾 TBT 정밀 덤프 저장]`, `[✖ 닫기 (MAP 3연타)]`
+   - 터치 조작 버튼: `[📶 핫스팟 설정 화면]`(`com.hkmc.wifisettings/.WifiHotspot` 즉시 진입), `[⚙️ 엔지니어링 WiFi]`(`com.hkmc.system.app.engineering/.module.WifiInfo` 진입), `[📡 핫스팟 즉시 켜기]`, `[🔄 GitHub 업데이트]`, `[💾 TBT 정밀 덤프]`, `[✖ 닫기 (MAP 3연타)]`
 
 ---
 

@@ -41,4 +41,10 @@ am startservice -n com.hkmc.wifisettings/.service.HotspotService >/dev/null 2>&1
 # 4. Wake up com.mnsoft.navi [Cluster] plain-text TBT logger (intArray[14] == 0 -> gq=false)
 am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 >/dev/null 2>&1
 
+# 5. Immediately start carrot-7706-bridge background service if not already running, and show Status Dashboard UI
+echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
+if ! ps 2>/dev/null | grep -q "[b]ridge-daemon.sh"; then
+    /system/bin/sh "$INSTALL_DIR/svc/bridge-daemon.sh" </dev/null >>/data/local/tmp/carrotbridge_svc.log 2>&1 &
+fi
+
 exit 0

@@ -8,10 +8,21 @@ export BOOTCLASSPATH=/system/framework/core.jar:/system/framework/conscrypt.jar:
 INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
 ENG_PREF="/data/data/com.hkmc.system.app.engineering/shared_prefs/com.hkmc.system.app.engineering_preferences.xml"
 BRIDGE_PID=""
+LOOP_COUNT=0
+BRIDGE_START_LOOP=0
 
 log_info() {
     echo "[CarrotBridge] $*"
     log -t CarrotBridge "$*" 2>/dev/null
+}
+
+kill_bridge_java() {
+    if [ -n "$BRIDGE_PID" ]; then
+        kill "$BRIDGE_PID" >/dev/null 2>&1
+        BRIDGE_PID=""
+    fi
+    /system/bin/busybox pkill -f "com.hkg.carrotbridge.CarrotBridgeMain daemon" >/dev/null 2>&1
+    pkill -f "com.hkg.carrotbridge.CarrotBridgeMain daemon" >/dev/null 2>&1
 }
 
 disable_adb_tcp() {
@@ -79,19 +90,18 @@ start_bridge_java() {
     if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
         return 0
     fi
-    pkill -f "com.hkg.carrotbridge.CarrotBridgeMain daemon" >/dev/null 2>&1
+    kill_bridge_java
     CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain daemon "$INSTALL_DIR" >> /data/local/tmp/carrotbridge_daemon.log 2>&1 &
     BRIDGE_PID="$!"
-    BRIDGE_START_TS="$(date +%s 2>/dev/null || echo 0)"
+    BRIDGE_START_LOOP="$LOOP_COUNT"
     log_info "Started CarrotBridgeMain daemon (pid=$BRIDGE_PID)"
 }
 
 check_bridge_java_watchdog() {
     if [ -z "$BRIDGE_PID" ] || ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
-        now_ts="$(date +%s 2>/dev/null || echo 100)"
-        elapsed=$((now_ts - ${BRIDGE_START_TS:-0}))
-        if [ "$elapsed" -ge 0 ] && [ "$elapsed" -lt 15 ] && [ -f "$INSTALL_DIR/bin/carrotbridge.jar.bak" ]; then
-            log_info "Daemon exited within ${elapsed}s! Rolling back carrotbridge.jar.bak -> carrotbridge.jar"
+        elapsed_loops=$((LOOP_COUNT - ${BRIDGE_START_LOOP:-0}))
+        if [ "$elapsed_loops" -ge 0 ] && [ "$elapsed_loops" -le 3 ] && [ -f "$INSTALL_DIR/bin/carrotbridge.jar.bak" ]; then
+            log_info "Daemon exited within ${elapsed_loops} loops! Rolling back carrotbridge.jar.bak -> carrotbridge.jar"
             cp "$INSTALL_DIR/bin/carrotbridge.jar.bak" "$INSTALL_DIR/bin/carrotbridge.jar" 2>/dev/null
             rm -f "$INSTALL_DIR/bin/carrotbridge.jar.bak" 2>/dev/null
         fi
@@ -105,21 +115,14 @@ run_github_update_check() {
     rc="$?"
     if [ "$rc" = "10" ]; then
         log_info "GitHub update applied -> restarting CarrotBridgeMain daemon"
-        if [ -n "$BRIDGE_PID" ]; then
-            kill "$BRIDGE_PID" >/dev/null 2>&1
-            BRIDGE_PID=""
-        fi
-        pkill -f "com.hkg.carrotbridge.CarrotBridgeMain daemon" >/dev/null 2>&1
+        kill_bridge_java
         start_bridge_java
     fi
 }
 
 on_stop() {
     log_info "Service stopped via NEMESIS Manager"
-    if [ -n "$BRIDGE_PID" ]; then
-        kill "$BRIDGE_PID" >/dev/null 2>&1
-    fi
-    pkill -f "com.hkg.carrotbridge.CarrotBridgeMain" >/dev/null 2>&1
+    kill_bridge_java
     exit 0
 }
 trap 'on_stop' TERM INT
@@ -134,15 +137,19 @@ if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
     apply_hotspot_props
 fi
 
+# Start the 7706 Java Bridge Daemon & MAP 3-Press UI Overlay immediately (even before sys.boot_completed)
+start_bridge_java
+
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
     if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
         apply_hotspot_props
     fi
+    check_bridge_java_watchdog
     sleep 2 &
     wait $!
 done
 
-sleep 3 &
+sleep 2 &
 wait $!
 
 if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
@@ -156,8 +163,8 @@ fi
 # Wake up com.mnsoft.navi [Cluster] plain-text TBT logger
 am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 >/dev/null 2>&1
 
-# Start the 7706 Java Bridge Daemon
-start_bridge_java
+# Ensure the 7706 Java Bridge Daemon is alive
+check_bridge_java_watchdog
 
 LOOP_COUNT=0
 USB_DUMPED_SESSION=0

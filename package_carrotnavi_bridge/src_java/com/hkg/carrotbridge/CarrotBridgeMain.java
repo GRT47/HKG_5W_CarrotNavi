@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.1";
+    public static final String BRIDGE_VERSION = "1.1.2";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -1368,10 +1368,12 @@ public class CarrotBridgeMain {
 
     /**
      * Checks if a logcat line from events (ivi_mode_broadcast) or main/system (ModeKeyDispatcher)
-     * indicates a physical MAP button press, and returns true when 3 presses occur within 2.0 seconds.
+     * indicates a physical MAP button press, and returns true when 3 presses occur within 2.5 seconds.
      */
     public static boolean checkMapShortcutLine(String line, long nowMs) {
         if (line == null || line.isEmpty()) return false;
+        // Ignore key-release lines so a single press (DOWN + UP) never counts twice
+        if (line.contains("ACTION_UP")) return false;
         boolean matched = line.contains("KEYCODE_SHORTCUT_MAP")
                 || line.contains("com.hkmc.intent.action.MAP_SHORTCUT")
                 || line.contains("Map shortcut received");
@@ -1379,13 +1381,13 @@ public class CarrotBridgeMain {
 
         synchronized (MAP_KEY_LOCK) {
             // Single physical press emits both KEYCODE_SHORTCUT_MAP and MAP_SHORTCUT ~40-80ms apart.
-            // Debounce signals within 130ms so 1 physical press = 1 count.
-            if (nowMs - lastMapKeySignalMs < 130L) {
+            // Debounce signals within 160ms so 1 physical press = 1 count.
+            if (nowMs - lastMapKeySignalMs < 160L) {
                 return false;
             }
             lastMapKeySignalMs = nowMs;
 
-            if (nowMs - firstMapPressWindowMs > 2000L) {
+            if (nowMs - firstMapPressWindowMs > 2500L) {
                 firstMapPressWindowMs = nowMs;
                 mapPressCounter = 1;
             } else {
@@ -1468,7 +1470,7 @@ public class CarrotBridgeMain {
                         String line;
                         while ((line = br.readLine()) != null) {
                             long nowMs = System.currentTimeMillis();
-                            if (nowMs - streamStartMs > 1500L && checkMapShortcutLine(line, nowMs)) {
+                            if (nowMs - streamStartMs > 600L && checkMapShortcutLine(line, nowMs)) {
                                 System.out.println("[CarrotBridge] MAP 3-press detected via ModeKeyDispatcher -> toggling Status Dashboard");
                                 StatusDashboardOverlay.toggle();
                             }
@@ -1494,15 +1496,14 @@ public class CarrotBridgeMain {
                     try {
                         long streamStartMs = System.currentTimeMillis();
                         proc = new ProcessBuilder(
-                                "/system/bin/logcat", "-b", "events", "-v", "brief",
-                                "ivi_mode_broadcast:I", "*:S"
+                                "/system/bin/logcat", "-b", "events", "-v", "brief"
                         ).redirectErrorStream(true).start();
                         BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), UTF8));
                         String line;
                         while ((line = br.readLine()) != null) {
                             long nowMs = System.currentTimeMillis();
-                            // Ignore historical buffered lines dumped during the first 1.5s of stream start
-                            if (nowMs - streamStartMs < 1500L) {
+                            // Ignore historical buffered lines dumped during the first 600ms of stream start
+                            if (nowMs - streamStartMs < 600L) {
                                 continue;
                             }
                             if (checkMapShortcutLine(line, nowMs)) {
@@ -2087,11 +2088,7 @@ public class CarrotBridgeMain {
                         Class<?> handlerCls = Class.forName("android.os.Handler");
                         uiHandler = handlerCls.getConstructor(looperCls).newInstance(myLooper);
 
-                        Class<?> atCls = Class.forName("android.app.ActivityThread");
-                        Object at = atCls.getMethod("systemMain").invoke(null);
-                        sysContext = atCls.getMethod("getSystemContext").invoke(at);
-                        Method getSysSvc = sysContext.getClass().getMethod("getSystemService", String.class);
-                        windowManager = getSysSvc.invoke(sysContext, "window");
+                        ensureUiContextOnUiThread();
 
                         System.out.println("[CarrotBridge] StatusDashboardOverlay UI Looper initialized.");
                         looperCls.getMethod("loop").invoke(null);
@@ -2102,6 +2099,33 @@ public class CarrotBridgeMain {
             }, "CarrotStatusUiThread");
             uiThread.setDaemon(true);
             uiThread.start();
+        }
+
+        private static boolean ensureUiContextOnUiThread() {
+            if (sysContext != null && windowManager != null) {
+                return true;
+            }
+            try {
+                Class<?> atCls = Class.forName("android.app.ActivityThread");
+                Object at = null;
+                try {
+                    at = atCls.getMethod("currentActivityThread").invoke(null);
+                } catch (Throwable ignored) {
+                }
+                if (at == null) {
+                    at = atCls.getMethod("systemMain").invoke(null);
+                }
+                if (at != null && sysContext == null) {
+                    sysContext = atCls.getMethod("getSystemContext").invoke(at);
+                }
+                if (sysContext != null && windowManager == null) {
+                    Method getSysSvc = sysContext.getClass().getMethod("getSystemService", String.class);
+                    windowManager = getSysSvc.invoke(sysContext, "window");
+                }
+            } catch (Throwable t) {
+                System.out.println("[CarrotBridge] ensureUiContextOnUiThread failed: " + t.getMessage());
+            }
+            return sysContext != null && windowManager != null;
         }
 
         public static void toggle() {
@@ -2162,217 +2186,257 @@ public class CarrotBridgeMain {
             }
         }
 
+        private static Object[] buildDashboardViewTree() throws Exception {
+            Class<?> ctxCls = Class.forName("android.content.Context");
+            Class<?> viewCls = Class.forName("android.view.View");
+            Class<?> vgCls = Class.forName("android.view.ViewGroup");
+            Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
+            Class<?> llCls = Class.forName("android.widget.LinearLayout");
+            Class<?> llLpCls = Class.forName("android.widget.LinearLayout$LayoutParams");
+            Class<?> tvCls = Class.forName("android.widget.TextView");
+            Class<?> btnCls = Class.forName("android.widget.Button");
+
+            Constructor<?> llCtor = llCls.getConstructor(ctxCls);
+            Constructor<?> tvCtor = tvCls.getConstructor(ctxCls);
+            Constructor<?> btnCtor = btnCls.getConstructor(ctxCls);
+            Constructor<?> llLpCtor2 = llLpCls.getConstructor(int.class, int.class);
+            Constructor<?> llLpCtor3 = llLpCls.getConstructor(int.class, int.class, float.class);
+
+            final int MATCH_PARENT = -1;
+            final int WRAP_CONTENT = -2;
+
+            // Root card container (vertical LinearLayout)
+            Object root = llCtor.newInstance(sysContext);
+            llCls.getMethod("setOrientation", int.class).invoke(root, 1); // VERTICAL
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(root, 26, 20, 26, 20);
+            setRoundedBg(root, 0xF20F172A, 0xFF38BDF8, 3, 18f);
+
+            // 1. Header Row (Horizontal)
+            Object headerRow = llCtor.newInstance(sysContext);
+            llCls.getMethod("setOrientation", int.class).invoke(headerRow, 0); // HORIZONTAL
+            llCls.getMethod("setGravity", int.class).invoke(headerRow, 16);    // CENTER_VERTICAL
+
+            Object titleTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(titleTv, "🥕 HKG CarrotNavi 7706 Bridge — 상태 대시보드 (v" + BRIDGE_VERSION + ")", 21f, 0xFF38BDF8, true);
+            Object titleLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, titleTv, titleLp);
+
+            Object closeBtn = btnCtor.newInstance(sysContext);
+            setTextViewStyle(closeBtn, "  ✖ 닫기 (MAP 3연타)  ", 15.5f, 0xFFFFFFFF, true);
+            setRoundedBg(closeBtn, 0xFFDC2626, 0xFFF87171, 2, 10f);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(closeBtn, 18, 9, 18, 9);
+            attachClickListener(closeBtn, new Runnable() {
+                @Override
+                public void run() {
+                    hide();
+                }
+            });
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, closeBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, headerRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            // Divider
+            Object div1 = viewCls.getConstructor(ctxCls).newInstance(sysContext);
+            viewCls.getMethod("setBackgroundColor", int.class).invoke(div1, 0xFF334155);
+            Object divLp1 = llLpCtor2.newInstance(MATCH_PARENT, 2);
+            setMargins(divLp1, 0, 10, 0, 12);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, div1, divLp1);
+
+            // 2. Two-Column Body Row
+            Object bodyRow = llCtor.newInstance(sysContext);
+            llCls.getMethod("setOrientation", int.class).invoke(bodyRow, 0); // HORIZONTAL
+
+            // Left Column Card
+            Object leftCard = llCtor.newInstance(sysContext);
+            llCls.getMethod("setOrientation", int.class).invoke(leftCard, 1);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftCard, 16, 12, 16, 12);
+            setRoundedBg(leftCard, 0xFF1E293B, 0xFF475569, 1, 12f);
+
+            Object leftHdr = tvCtor.newInstance(sysContext);
+            setTextViewStyle(leftHdr, "[ 패키지 버전 및 통신/핫스팟 상태 ]", 16.5f, 0xFF34D399, true);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object leftTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(leftTv, "", 15f, 0xFFE2E8F0, false);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftTv, 0, 8, 0, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
+            setMargins(leftCardLp, 0, 0, 8, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, leftCard, leftCardLp);
+
+            // Right Column Card
+            Object rightCard = llCtor.newInstance(sysContext);
+            llCls.getMethod("setOrientation", int.class).invoke(rightCard, 1);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightCard, 16, 12, 16, 12);
+            setRoundedBg(rightCard, 0xFF1E293B, 0xFF475569, 1, 12f);
+
+            Object rightHdr = tvCtor.newInstance(sysContext);
+            setTextViewStyle(rightHdr, "[ 실시간 순정 내비 SDI / TBT 변환 데이터 ]", 16.5f, 0xFFFBBF24, true);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object rightTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(rightTv, "", 15f, 0xFFE2E8F0, false);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightTv, 0, 8, 0, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object rightCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.15f);
+            setMargins(rightCardLp, 8, 0, 0, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, rightCard, rightCardLp);
+
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, bodyRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            // 3. Action Buttons Row
+            Object btnRow = llCtor.newInstance(sysContext);
+            llCls.getMethod("setOrientation", int.class).invoke(btnRow, 0); // HORIZONTAL
+            llCls.getMethod("setGravity", int.class).invoke(btnRow, 17);    // CENTER
+            Object btnRowLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(btnRowLp, 0, 12, 0, 6);
+
+            // Button A: Open Hotspot Settings Screen Directly (com.hkmc.wifisettings/.WifiHotspot)
+            Object hsUiBtn = btnCtor.newInstance(sysContext);
+            setTextViewStyle(hsUiBtn, "📶 핫스팟 설정 화면", 14.5f, 0xFFFFFFFF, true);
+            setRoundedBg(hsUiBtn, 0xFF7C3AED, 0xFFA78BFA, 2, 10f);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(hsUiBtn, 10, 10, 10, 10);
+            attachClickListener(hsUiBtn, new Runnable() {
+                @Override
+                public void run() {
+                    openHotspotSettingsFromUi();
+                }
+            });
+            Object hsUiBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+            setMargins(hsUiBtnLp, 0, 0, 6, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, hsUiBtn, hsUiBtnLp);
+
+            // Button B: Open Engineering Mode WiFi Info Screen Directly (com.hkmc.system.app.engineering/.module.WifiInfo)
+            Object engUiBtn = btnCtor.newInstance(sysContext);
+            setTextViewStyle(engUiBtn, "⚙️ 엔지니어링 WiFi", 14.5f, 0xFFFFFFFF, true);
+            setRoundedBg(engUiBtn, 0xFF475569, 0xFF94A3B8, 2, 10f);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(engUiBtn, 10, 10, 10, 10);
+            attachClickListener(engUiBtn, new Runnable() {
+                @Override
+                public void run() {
+                    openEngineeringWifiFromUi();
+                }
+            });
+            Object engUiBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 0.95f);
+            setMargins(engUiBtnLp, 6, 0, 6, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, engUiBtn, engUiBtnLp);
+
+            // Button C: Re-assert Hotspot in Background
+            Object apBtn = btnCtor.newInstance(sysContext);
+            setTextViewStyle(apBtn, "📡 핫스팟 즉시 켜기", 14.5f, 0xFFFFFFFF, true);
+            setRoundedBg(apBtn, 0xFF0284C7, 0xFF38BDF8, 2, 10f);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(apBtn, 10, 10, 10, 10);
+            attachClickListener(apBtn, new Runnable() {
+                @Override
+                public void run() {
+                    triggerHotspotCheckFromUi();
+                }
+            });
+            Object apBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 0.95f);
+            setMargins(apBtnLp, 6, 0, 6, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, apBtn, apBtnLp);
+
+            // Button D: Check GitHub Update Now
+            Object updBtn = btnCtor.newInstance(sysContext);
+            setTextViewStyle(updBtn, "🔄 GitHub 업데이트", 14.5f, 0xFFFFFFFF, true);
+            setRoundedBg(updBtn, 0xFF2563EB, 0xFF60A5FA, 2, 10f);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(updBtn, 10, 10, 10, 10);
+            attachClickListener(updBtn, new Runnable() {
+                @Override
+                public void run() {
+                    triggerManualUpdateFromUi();
+                }
+            });
+            Object updBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+            setMargins(updBtnLp, 6, 0, 6, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, updBtn, updBtnLp);
+
+            // Button E: Dump TBT to USB/Local Now
+            Object dumpBtn = btnCtor.newInstance(sysContext);
+            setTextViewStyle(dumpBtn, "💾 TBT 정밀 덤프", 14.5f, 0xFFFFFFFF, true);
+            setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 2, 10f);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(dumpBtn, 10, 10, 10, 10);
+            attachClickListener(dumpBtn, new Runnable() {
+                @Override
+                public void run() {
+                    triggerManualDumpFromUi();
+                }
+            });
+            Object dumpBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 0.95f);
+            setMargins(dumpBtnLp, 6, 0, 0, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, dumpBtn, dumpBtnLp);
+
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, btnRow, btnRowLp);
+
+            // 4. Footer Status Line
+            Object footerTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(footerTv, actionBannerMsg, 14.5f, 0xFF93C5FD, false);
+            tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            return new Object[]{root, leftTv, rightTv, footerTv};
+        }
+
         private static void showOnUiThread() {
             try {
-                if (sysContext == null || windowManager == null) return;
+                if (!ensureUiContextOnUiThread()) {
+                    System.out.println("[CarrotBridge] StatusDashboardOverlay show skipped: UI context unavailable");
+                    return;
+                }
                 if (isVisible && rootOverlayView != null) {
                     shownAtMs = System.currentTimeMillis();
                     refreshOnUiThread();
                     return;
                 }
 
-                Class<?> ctxCls = Class.forName("android.content.Context");
                 Class<?> viewCls = Class.forName("android.view.View");
-                Class<?> vgCls = Class.forName("android.view.ViewGroup");
                 Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
-                Class<?> llCls = Class.forName("android.widget.LinearLayout");
-                Class<?> llLpCls = Class.forName("android.widget.LinearLayout$LayoutParams");
-                Class<?> tvCls = Class.forName("android.widget.TextView");
-                Class<?> btnCls = Class.forName("android.widget.Button");
                 Class<?> wmLpCls = Class.forName("android.view.WindowManager$LayoutParams");
                 Class<?> vmCls = Class.forName("android.view.ViewManager");
 
-                Constructor<?> llCtor = llCls.getConstructor(ctxCls);
-                Constructor<?> tvCtor = tvCls.getConstructor(ctxCls);
-                Constructor<?> btnCtor = btnCls.getConstructor(ctxCls);
-                Constructor<?> llLpCtor2 = llLpCls.getConstructor(int.class, int.class);
-                Constructor<?> llLpCtor3 = llLpCls.getConstructor(int.class, int.class, float.class);
-
-                final int MATCH_PARENT = -1;
-                final int WRAP_CONTENT = -2;
-
-                // Root card container (vertical LinearLayout)
-                Object root = llCtor.newInstance(sysContext);
-                llCls.getMethod("setOrientation", int.class).invoke(root, 1); // VERTICAL
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(root, 28, 22, 28, 22);
-                setRoundedBg(root, 0xF20F172A, 0xFF38BDF8, 3, 18f);
-
-                // 1. Header Row (Horizontal)
-                Object headerRow = llCtor.newInstance(sysContext);
-                llCls.getMethod("setOrientation", int.class).invoke(headerRow, 0); // HORIZONTAL
-                llCls.getMethod("setGravity", int.class).invoke(headerRow, 16);    // CENTER_VERTICAL
-
-                Object titleTv = tvCtor.newInstance(sysContext);
-                setTextViewStyle(titleTv, "🥕 HKG CarrotNavi 7706 Bridge — 상태 대시보드 (v" + BRIDGE_VERSION + ")", 22f, 0xFF38BDF8, true);
-                Object titleLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, titleTv, titleLp);
-
-                Object closeBtn = btnCtor.newInstance(sysContext);
-                setTextViewStyle(closeBtn, "  ✖ 닫기 (MAP 3연타)  ", 16f, 0xFFFFFFFF, true);
-                setRoundedBg(closeBtn, 0xFFDC2626, 0xFFF87171, 2, 10f);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(closeBtn, 20, 10, 20, 10);
-                attachClickListener(closeBtn, new Runnable() {
-                    @Override
-                    public void run() {
-                        hide();
-                    }
-                });
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, closeBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, headerRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-                // Divider
-                Object div1 = viewCls.getConstructor(ctxCls).newInstance(sysContext);
-                viewCls.getMethod("setBackgroundColor", int.class).invoke(div1, 0xFF334155);
-                Object divLp1 = llLpCtor2.newInstance(MATCH_PARENT, 2);
-                setMargins(divLp1, 0, 12, 0, 14);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, div1, divLp1);
-
-                // 2. Two-Column Body Row
-                Object bodyRow = llCtor.newInstance(sysContext);
-                llCls.getMethod("setOrientation", int.class).invoke(bodyRow, 0); // HORIZONTAL
-
-                // Left Column Card
-                Object leftCard = llCtor.newInstance(sysContext);
-                llCls.getMethod("setOrientation", int.class).invoke(leftCard, 1);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftCard, 18, 14, 18, 14);
-                setRoundedBg(leftCard, 0xFF1E293B, 0xFF475569, 1, 12f);
-
-                Object leftHdr = tvCtor.newInstance(sysContext);
-                setTextViewStyle(leftHdr, "[ 패키지 버전 및 통신/핫스팟 상태 ]", 17f, 0xFF34D399, true);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-                Object leftTv = tvCtor.newInstance(sysContext);
-                setTextViewStyle(leftTv, "", 15.5f, 0xFFE2E8F0, false);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftTv, 0, 8, 0, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-                Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
-                setMargins(leftCardLp, 0, 0, 10, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, leftCard, leftCardLp);
-
-                // Right Column Card
-                Object rightCard = llCtor.newInstance(sysContext);
-                llCls.getMethod("setOrientation", int.class).invoke(rightCard, 1);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightCard, 18, 14, 18, 14);
-                setRoundedBg(rightCard, 0xFF1E293B, 0xFF475569, 1, 12f);
-
-                Object rightHdr = tvCtor.newInstance(sysContext);
-                setTextViewStyle(rightHdr, "[ 실시간 순정 내비 SDI / TBT 변환 데이터 ]", 17f, 0xFFFBBF24, true);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-                Object rightTv = tvCtor.newInstance(sysContext);
-                setTextViewStyle(rightTv, "", 15.5f, 0xFFE2E8F0, false);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightTv, 0, 8, 0, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-                Object rightCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.15f);
-                setMargins(rightCardLp, 10, 0, 0, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, rightCard, rightCardLp);
-
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, bodyRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-                // 3. Action Buttons Row
-                Object btnRow = llCtor.newInstance(sysContext);
-                llCls.getMethod("setOrientation", int.class).invoke(btnRow, 0); // HORIZONTAL
-                llCls.getMethod("setGravity", int.class).invoke(btnRow, 17);    // CENTER
-                Object btnRowLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
-                setMargins(btnRowLp, 0, 14, 0, 6);
-
-                // Button A: Open Hotspot Settings Screen Directly (com.hkmc.wifisettings/.WifiHotspot)
-                Object hsUiBtn = btnCtor.newInstance(sysContext);
-                setTextViewStyle(hsUiBtn, "📶 핫스팟 설정 화면", 15f, 0xFFFFFFFF, true);
-                setRoundedBg(hsUiBtn, 0xFF7C3AED, 0xFFA78BFA, 2, 10f);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(hsUiBtn, 14, 10, 14, 10);
-                attachClickListener(hsUiBtn, new Runnable() {
-                    @Override
-                    public void run() {
-                        openHotspotSettingsFromUi();
-                    }
-                });
-                Object hsUiBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-                setMargins(hsUiBtnLp, 0, 0, 8, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, hsUiBtn, hsUiBtnLp);
-
-                // Button B: Re-assert Hotspot in Background
-                Object apBtn = btnCtor.newInstance(sysContext);
-                setTextViewStyle(apBtn, "📡 핫스팟 즉시 켜기", 15f, 0xFFFFFFFF, true);
-                setRoundedBg(apBtn, 0xFF0284C7, 0xFF38BDF8, 2, 10f);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(apBtn, 14, 10, 14, 10);
-                attachClickListener(apBtn, new Runnable() {
-                    @Override
-                    public void run() {
-                        triggerHotspotCheckFromUi();
-                    }
-                });
-                Object apBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-                setMargins(apBtnLp, 8, 0, 8, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, apBtn, apBtnLp);
-
-                // Button C: Check GitHub Update Now
-                Object updBtn = btnCtor.newInstance(sysContext);
-                setTextViewStyle(updBtn, "🔄 GitHub 업데이트 확인", 15f, 0xFFFFFFFF, true);
-                setRoundedBg(updBtn, 0xFF2563EB, 0xFF60A5FA, 2, 10f);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(updBtn, 14, 10, 14, 10);
-                attachClickListener(updBtn, new Runnable() {
-                    @Override
-                    public void run() {
-                        triggerManualUpdateFromUi();
-                    }
-                });
-                Object updBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.05f);
-                setMargins(updBtnLp, 8, 0, 8, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, updBtn, updBtnLp);
-
-                // Button D: Dump TBT to USB/Local Now
-                Object dumpBtn = btnCtor.newInstance(sysContext);
-                setTextViewStyle(dumpBtn, "💾 TBT 정밀 덤프 저장", 15f, 0xFFFFFFFF, true);
-                setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 2, 10f);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(dumpBtn, 14, 10, 14, 10);
-                attachClickListener(dumpBtn, new Runnable() {
-                    @Override
-                    public void run() {
-                        triggerManualDumpFromUi();
-                    }
-                });
-                Object dumpBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-                setMargins(dumpBtnLp, 8, 0, 0, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, dumpBtn, dumpBtnLp);
-
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, btnRow, btnRowLp);
-
-                // 4. Footer Status Line
-                Object footerTv = tvCtor.newInstance(sysContext);
-                setTextViewStyle(footerTv, actionBannerMsg, 14.5f, 0xFF93C5FD, false);
-                tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-                // Try adding window with highest-priority system window types
-                int[] candidateTypes = new int[]{2010, 2003, 2002, 2005};
-                boolean added = false;
+                // Window types verified in android.policy.odex (PhoneWindowManager.checkAddPermission @ 0x1bce4):
+                // 2020 = TYPE_VOLUME_OVERLAY (layer 18, outAppOp = -1, INTERNAL_SYSTEM_WINDOW granted to uid=0, touchable)
+                // 2008 = TYPE_SYSTEM_DIALOG  (layer 17, outAppOp = -1, INTERNAL_SYSTEM_WINDOW granted to uid=0, touchable)
+                // 2009 = TYPE_KEYGUARD_DIALOG(layer 13, outAppOp = -1, INTERNAL_SYSTEM_WINDOW granted to uid=0, touchable)
+                // 2005 = TYPE_TOAST          (layer 6,  outAppOp = -1, no permission required, touchable)
+                // Note: 2010/2003/2002 set outAppOp=24 (OP_SYSTEM_ALERT_WINDOW), which causes AppOpsService
+                // to throw SecurityException("Bad call: specified package android under uid 0 but it is really 1000").
+                int[] candidateTypes = new int[]{2020, 2008, 2009, 2005};
                 int flags = 0x00000008 | 0x00000020 | 0x00000080; // FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL | FLAG_KEEP_SCREEN_ON
                 Constructor<?> wmLpCtor = wmLpCls.getConstructor(int.class, int.class, int.class, int.class, int.class);
                 Method addViewMethod = vmCls.getMethod("addView", viewCls, vgLpCls);
 
                 for (int wtype : candidateTypes) {
+                    Object[] tree = null;
                     try {
-                        Object wmLp = wmLpCtor.newInstance(1220, WRAP_CONTENT, wtype, flags, -3); // -3 = PixelFormat.TRANSLUCENT
+                        // Build a fresh view tree per candidate so a failed addView never leaves a poisoned View in WindowManagerGlobal.mViews
+                        tree = buildDashboardViewTree();
+                        Object candidateRoot = tree[0];
+                        Object wmLp = wmLpCtor.newInstance(1220, -2, wtype, flags, -3); // -2=WRAP_CONTENT, -3=PixelFormat.TRANSLUCENT
                         wmLpCls.getField("gravity").setInt(wmLp, 17); // Gravity.CENTER
-                        addViewMethod.invoke(windowManager, root, wmLp);
-                        added = true;
-                        System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
-                        break;
-                    } catch (Throwable ignored) {
-                    }
-                }
+                        wmLpCls.getMethod("setTitle", CharSequence.class).invoke(wmLp, "CarrotNaviStatusOverlay");
+                        addViewMethod.invoke(windowManager, candidateRoot, wmLp);
 
-                if (added) {
-                    rootOverlayView = root;
-                    leftColTextView = leftTv;
-                    rightColTextView = rightTv;
-                    footerStatusTextView = footerTv;
-                    isVisible = true;
-                    shownAtMs = System.currentTimeMillis();
-                    refreshOnUiThread();
+                        rootOverlayView = candidateRoot;
+                        leftColTextView = tree[1];
+                        rightColTextView = tree[2];
+                        footerStatusTextView = tree[3];
+                        isVisible = true;
+                        shownAtMs = System.currentTimeMillis();
+                        System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
+                        refreshOnUiThread();
+                        break;
+                    } catch (Throwable t) {
+                        Throwable cause = (t.getCause() != null) ? t.getCause() : t;
+                        System.out.println("[CarrotBridge] addView(wtype=" + wtype + ") failed: " + cause);
+                        if (tree != null && tree[0] != null) {
+                            try {
+                                windowManager.getClass().getMethod("removeViewImmediate", viewCls).invoke(windowManager, tree[0]);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
                 }
             } catch (Throwable t) {
                 System.out.println("[CarrotBridge] StatusDashboardOverlay show error: " + t.getMessage());
@@ -2570,6 +2634,24 @@ public class CarrotBridgeMain {
             }, "HotspotSettingsLauncher").start();
         }
 
+        private static void openEngineeringWifiFromUi() {
+            actionBannerMsg = "⏳ 엔지니어링 WiFi 설정 화면을 여는 중...";
+            hide();
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        execCommandCapture(new String[]{
+                                "/system/bin/am", "start",
+                                "-f", "0x10000000",
+                                "-n", "com.hkmc.system.app.engineering/.module.WifiInfo"
+                        }, 20);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, "EngineeringWifiLauncher").start();
+        }
+
         private static void triggerHotspotCheckFromUi() {
             actionBannerMsg = "⏳ Wi-Fi 핫스팟(Public APN) 상태 점검 및 활성화 중...";
             new Thread(new Runnable() {
@@ -2749,7 +2831,7 @@ public class CarrotBridgeMain {
             throw new AssertionError("DNS query packet too short");
         }
 
-        // 4. Test MAP button 3-press detector with realistic dual-line ivi_mode_broadcast events
+        // 4. Test MAP button 3-press detector with realistic dual-line ivi_mode_broadcast & ModeKeyDispatcher events
         long t0 = 100000L;
         if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0)) {
             throw new AssertionError("Should not trigger on 1st press");
@@ -2757,13 +2839,16 @@ public class CarrotBridgeMain {
         if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [com.hkmc.intent.action.MAP_SHORTCUT,2,3]", t0 + 50L)) {
             throw new AssertionError("Should debounce 2nd line of 1st press");
         }
-        if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0 + 320L)) {
+        if (checkMapShortcutLine("V/ModeKeyDispatcher(  524): KeyEvent { action=ACTION_UP, keyCode=KEYCODE_SHORTCUT_MAP }", t0 + 210L)) {
+            throw new AssertionError("Should ignore ACTION_UP line");
+        }
+        if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0 + 380L)) {
             throw new AssertionError("Should not trigger on 2nd press");
         }
-        if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [com.hkmc.intent.action.MAP_SHORTCUT,2,3]", t0 + 370L)) {
+        if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [com.hkmc.intent.action.MAP_SHORTCUT,2,3]", t0 + 430L)) {
             throw new AssertionError("Should debounce 2nd line of 2nd press");
         }
-        if (!checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0 + 640L)) {
+        if (!checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0 + 760L)) {
             throw new AssertionError("Should trigger on 3rd MAP press!");
         }
 
