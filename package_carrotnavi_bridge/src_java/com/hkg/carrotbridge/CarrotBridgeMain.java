@@ -9,7 +9,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -19,8 +22,10 @@ import java.nio.charset.Charset;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -48,10 +53,12 @@ import javax.net.ssl.X509TrustManager;
  *    guidance is active, enabling precision TBT reverse engineering via USB or local dump.
  * 5. Android 4.4.2 GitHub Auto-Updater with custom UDP DNS (8.8.8.8 / 1.1.1.1 to bypass rmnet1 private DNS),
  *    explicit TLSv1.2 + SNI via conscrypt.odex, HTTP redirect support, and SHA-256 verification.
+ * 6. MAP Button 3-Press Status Dashboard Overlay (ivi_mode_broadcast KEYCODE_SHORTCUT_MAP / MAP_SHORTCUT
+ *    listener + Android System WindowManager Overlay UI).
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.0.0";
+    public static final String BRIDGE_VERSION = "1.1.0";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -1349,16 +1356,62 @@ public class CarrotBridgeMain {
     private static volatile String discoveredCarrotIp = "";
     private static volatile long discoveredCarrotTimeMs = 0L;
     private static volatile double carrotVEgoKph = 0.0;
+    private static volatile CarrotPacket latestSentPacket = null;
+    private static volatile String latestTargetsStr = "[]";
+    private static volatile String lastAutoUpdateStatus = "자동 감시 중 (30분 주기)";
 
-    public static void runDaemon(String installDir) throws Exception {
+    // MAP button 3-press detector state
+    private static final Object MAP_KEY_LOCK = new Object();
+    private static long lastMapKeySignalMs = 0L;
+    private static long firstMapPressWindowMs = 0L;
+    private static int mapPressCounter = 0;
+
+    /**
+     * Checks if a logcat line from events (ivi_mode_broadcast) or main/system (ModeKeyDispatcher)
+     * indicates a physical MAP button press, and returns true when 3 presses occur within 2.0 seconds.
+     */
+    public static boolean checkMapShortcutLine(String line, long nowMs) {
+        if (line == null || line.isEmpty()) return false;
+        boolean matched = line.contains("KEYCODE_SHORTCUT_MAP")
+                || line.contains("com.hkmc.intent.action.MAP_SHORTCUT")
+                || line.contains("Map shortcut received");
+        if (!matched) return false;
+
+        synchronized (MAP_KEY_LOCK) {
+            // Single physical press emits both KEYCODE_SHORTCUT_MAP and MAP_SHORTCUT ~40-80ms apart.
+            // Debounce signals within 130ms so 1 physical press = 1 count.
+            if (nowMs - lastMapKeySignalMs < 130L) {
+                return false;
+            }
+            lastMapKeySignalMs = nowMs;
+
+            if (nowMs - firstMapPressWindowMs > 2000L) {
+                firstMapPressWindowMs = nowMs;
+                mapPressCounter = 1;
+            } else {
+                mapPressCounter++;
+            }
+
+            if (mapPressCounter >= 3) {
+                mapPressCounter = 0;
+                firstMapPressWindowMs = 0L;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    public static void runDaemon(final String installDir) throws Exception {
         final NavState navState = new NavState();
         final File dumpDir = new File("/data/local/tmp/hkg_tbt_dump");
         if (!dumpDir.exists()) dumpDir.mkdirs();
         final File traceFile = new File(dumpDir, "tbt_live_trace.log");
         final File statusFile = new File("/data/local/tmp/carrotbridge_status.json");
+        final File showUiTriggerFile = new File("/data/local/tmp/carrotbridge_show_ui");
 
         System.out.println("[CarrotBridge] Starting daemon v" + BRIDGE_VERSION + " (installDir=" + installDir + ")");
         enableMnsoftClusterLogging();
+        StatusDashboardOverlay.init(installDir, navState);
 
         // 1. Thread: Listen on UDP 7705 for CarrotPilot broadcasts
         Thread udp7705Thread = new Thread(new Runnable() {
@@ -1399,20 +1452,26 @@ public class CarrotBridgeMain {
         udp7705Thread.setDaemon(true);
         udp7705Thread.start();
 
-        // 2. Thread: Stream logcat
+        // 2. Thread: Stream main/system logcat
         Thread logcatThread = new Thread(new Runnable() {
             @Override
             public void run() {
                 while (true) {
                     Process proc = null;
                     try {
+                        long streamStartMs = System.currentTimeMillis();
                         proc = new ProcessBuilder(
                                 "/system/bin/logcat", "-v", "brief",
-                                "ClusterService:D", "NavigationCluster:D", "Java_Layer:I", "BrdCast:D", "*:S"
+                                "ClusterService:D", "NavigationCluster:D", "Java_Layer:I", "BrdCast:D", "ModeKeyDispatcher:V", "*:S"
                         ).redirectErrorStream(true).start();
                         BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), UTF8));
                         String line;
                         while ((line = br.readLine()) != null) {
+                            long nowMs = System.currentTimeMillis();
+                            if (nowMs - streamStartMs > 1500L && checkMapShortcutLine(line, nowMs)) {
+                                System.out.println("[CarrotBridge] MAP 3-press detected via ModeKeyDispatcher -> toggling Status Dashboard");
+                                StatusDashboardOverlay.toggle();
+                            }
                             parseLogcatLine(line, navState, traceFile);
                         }
                     } catch (Exception e) {
@@ -1425,6 +1484,42 @@ public class CarrotBridgeMain {
         }, "LogcatReader");
         logcatThread.setDaemon(true);
         logcatThread.start();
+
+        // 2b. Thread: Stream events logcat (ivi_mode_broadcast) for instant MAP button 3-press detection
+        Thread eventsLogcatThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (true) {
+                    Process proc = null;
+                    try {
+                        long streamStartMs = System.currentTimeMillis();
+                        proc = new ProcessBuilder(
+                                "/system/bin/logcat", "-b", "events", "-v", "brief",
+                                "ivi_mode_broadcast:I", "*:S"
+                        ).redirectErrorStream(true).start();
+                        BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), UTF8));
+                        String line;
+                        while ((line = br.readLine()) != null) {
+                            long nowMs = System.currentTimeMillis();
+                            // Ignore historical buffered lines dumped during the first 1.5s of stream start
+                            if (nowMs - streamStartMs < 1500L) {
+                                continue;
+                            }
+                            if (checkMapShortcutLine(line, nowMs)) {
+                                System.out.println("[CarrotBridge] MAP 3-press detected via ivi_mode_broadcast -> toggling Status Dashboard");
+                                StatusDashboardOverlay.toggle();
+                            }
+                        }
+                    } catch (Exception e) {
+                        try { Thread.sleep(1500L); } catch (InterruptedException ignored) {}
+                    } finally {
+                        if (proc != null) try { proc.destroy(); } catch (Exception ignored) {}
+                    }
+                }
+            }
+        }, "MapButtonEventsReader");
+        eventsLogcatThread.setDaemon(true);
+        eventsLogcatThread.start();
 
         // 3. Thread: Poll dumpsys activity service com.hkmc.micom.ClusterService
         Thread dumpsysThread = new Thread(new Runnable() {
@@ -1470,12 +1565,18 @@ public class CarrotBridgeMain {
 
         while (true) {
             long now = System.currentTimeMillis();
+            if (showUiTriggerFile.exists()) {
+                showUiTriggerFile.delete();
+                StatusDashboardOverlay.show();
+            }
+
             if (now - lastArpScanMs > 5000L) {
                 arpPeers = scanWlanArpPeers();
                 lastArpScanMs = now;
             }
 
             CarrotPacket pkt = buildCarrotPacket(navState);
+            latestSentPacket = pkt;
             String json = pkt.toJson();
             byte[] payload = json.getBytes(UTF8);
 
@@ -1487,6 +1588,7 @@ public class CarrotBridgeMain {
             if (targets.isEmpty() || (pkt.carrotIndex % 5 == 0)) {
                 targets.add("192.168.0.255");
             }
+            latestTargetsStr = targets.toString();
 
             for (String ip : targets) {
                 try {
@@ -1944,6 +2046,586 @@ public class CarrotBridgeMain {
     }
 
     // =========================================================================
+    // MAP BUTTON 3-PRESS STATUS DASHBOARD OVERLAY UI (Android 4.4.2 System UI)
+    // =========================================================================
+
+    public static final class StatusDashboardOverlay {
+        private static volatile String installDir = "/data/nemesis/packages/carrotnavi.bridge";
+        private static volatile NavState navStateRef = null;
+        private static volatile Object uiHandler = null;
+        private static volatile Object windowManager = null;
+        private static volatile Object sysContext = null;
+        private static volatile Object rootOverlayView = null;
+        private static volatile Object leftColTextView = null;
+        private static volatile Object rightColTextView = null;
+        private static volatile Object footerStatusTextView = null;
+        private static volatile boolean isVisible = false;
+        private static volatile long shownAtMs = 0L;
+        private static volatile String actionBannerMsg = "MAP 버튼 3연타로 열기/닫기 | 60초 후 자동 닫힘";
+
+        private static final Runnable REFRESH_TASK = new Runnable() {
+            @Override
+            public void run() {
+                refreshOnUiThread();
+            }
+        };
+
+        public static void init(final String dir, final NavState navState) {
+            installDir = dir;
+            navStateRef = navState;
+            Thread uiThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Class<?> looperCls = Class.forName("android.os.Looper");
+                        try {
+                            looperCls.getMethod("prepareMainLooper").invoke(null);
+                        } catch (Throwable ignored) {
+                            looperCls.getMethod("prepare").invoke(null);
+                        }
+                        Object myLooper = looperCls.getMethod("myLooper").invoke(null);
+                        Class<?> handlerCls = Class.forName("android.os.Handler");
+                        uiHandler = handlerCls.getConstructor(looperCls).newInstance(myLooper);
+
+                        Class<?> atCls = Class.forName("android.app.ActivityThread");
+                        Object at = atCls.getMethod("systemMain").invoke(null);
+                        sysContext = atCls.getMethod("getSystemContext").invoke(at);
+                        Method getSysSvc = sysContext.getClass().getMethod("getSystemService", String.class);
+                        windowManager = getSysSvc.invoke(sysContext, "window");
+
+                        System.out.println("[CarrotBridge] StatusDashboardOverlay UI Looper initialized.");
+                        looperCls.getMethod("loop").invoke(null);
+                    } catch (Throwable t) {
+                        System.out.println("[CarrotBridge] StatusDashboardOverlay init skipped: " + t.getMessage());
+                    }
+                }
+            }, "CarrotStatusUiThread");
+            uiThread.setDaemon(true);
+            uiThread.start();
+        }
+
+        public static void toggle() {
+            postToUi(new Runnable() {
+                @Override
+                public void run() {
+                    if (isVisible) {
+                        hideOnUiThread();
+                    } else {
+                        showOnUiThread();
+                    }
+                }
+            });
+        }
+
+        public static void show() {
+            postToUi(new Runnable() {
+                @Override
+                public void run() {
+                    showOnUiThread();
+                }
+            });
+        }
+
+        public static void hide() {
+            postToUi(new Runnable() {
+                @Override
+                public void run() {
+                    hideOnUiThread();
+                }
+            });
+        }
+
+        private static void postToUi(Runnable r) {
+            Object h = uiHandler;
+            if (h == null) return;
+            try {
+                h.getClass().getMethod("post", Runnable.class).invoke(h, r);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private static void postDelayedToUi(Runnable r, long delayMs) {
+            Object h = uiHandler;
+            if (h == null) return;
+            try {
+                h.getClass().getMethod("postDelayed", Runnable.class, long.class).invoke(h, r, delayMs);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private static void removeCallbacksFromUi(Runnable r) {
+            Object h = uiHandler;
+            if (h == null) return;
+            try {
+                h.getClass().getMethod("removeCallbacks", Runnable.class).invoke(h, r);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private static void showOnUiThread() {
+            try {
+                if (sysContext == null || windowManager == null) return;
+                if (isVisible && rootOverlayView != null) {
+                    shownAtMs = System.currentTimeMillis();
+                    refreshOnUiThread();
+                    return;
+                }
+
+                Class<?> ctxCls = Class.forName("android.content.Context");
+                Class<?> viewCls = Class.forName("android.view.View");
+                Class<?> vgCls = Class.forName("android.view.ViewGroup");
+                Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
+                Class<?> llCls = Class.forName("android.widget.LinearLayout");
+                Class<?> llLpCls = Class.forName("android.widget.LinearLayout$LayoutParams");
+                Class<?> tvCls = Class.forName("android.widget.TextView");
+                Class<?> btnCls = Class.forName("android.widget.Button");
+                Class<?> wmLpCls = Class.forName("android.view.WindowManager$LayoutParams");
+                Class<?> vmCls = Class.forName("android.view.ViewManager");
+
+                Constructor<?> llCtor = llCls.getConstructor(ctxCls);
+                Constructor<?> tvCtor = tvCls.getConstructor(ctxCls);
+                Constructor<?> btnCtor = btnCls.getConstructor(ctxCls);
+                Constructor<?> llLpCtor2 = llLpCls.getConstructor(int.class, int.class);
+                Constructor<?> llLpCtor3 = llLpCls.getConstructor(int.class, int.class, float.class);
+
+                final int MATCH_PARENT = -1;
+                final int WRAP_CONTENT = -2;
+
+                // Root card container (vertical LinearLayout)
+                Object root = llCtor.newInstance(sysContext);
+                llCls.getMethod("setOrientation", int.class).invoke(root, 1); // VERTICAL
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(root, 28, 22, 28, 22);
+                setRoundedBg(root, 0xF20F172A, 0xFF38BDF8, 3, 18f);
+
+                // 1. Header Row (Horizontal)
+                Object headerRow = llCtor.newInstance(sysContext);
+                llCls.getMethod("setOrientation", int.class).invoke(headerRow, 0); // HORIZONTAL
+                llCls.getMethod("setGravity", int.class).invoke(headerRow, 16);    // CENTER_VERTICAL
+
+                Object titleTv = tvCtor.newInstance(sysContext);
+                setTextViewStyle(titleTv, "🥕 HKG CarrotNavi 7706 Bridge — 상태 대시보드 (v" + BRIDGE_VERSION + ")", 22f, 0xFF38BDF8, true);
+                Object titleLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, titleTv, titleLp);
+
+                Object closeBtn = btnCtor.newInstance(sysContext);
+                setTextViewStyle(closeBtn, "  ✖ 닫기 (MAP 3연타)  ", 16f, 0xFFFFFFFF, true);
+                setRoundedBg(closeBtn, 0xFFDC2626, 0xFFF87171, 2, 10f);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(closeBtn, 20, 10, 20, 10);
+                attachClickListener(closeBtn, new Runnable() {
+                    @Override
+                    public void run() {
+                        hide();
+                    }
+                });
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, closeBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, headerRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+                // Divider
+                Object div1 = viewCls.getConstructor(ctxCls).newInstance(sysContext);
+                viewCls.getMethod("setBackgroundColor", int.class).invoke(div1, 0xFF334155);
+                Object divLp1 = llLpCtor2.newInstance(MATCH_PARENT, 2);
+                setMargins(divLp1, 0, 12, 0, 14);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, div1, divLp1);
+
+                // 2. Two-Column Body Row
+                Object bodyRow = llCtor.newInstance(sysContext);
+                llCls.getMethod("setOrientation", int.class).invoke(bodyRow, 0); // HORIZONTAL
+
+                // Left Column Card
+                Object leftCard = llCtor.newInstance(sysContext);
+                llCls.getMethod("setOrientation", int.class).invoke(leftCard, 1);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftCard, 18, 14, 18, 14);
+                setRoundedBg(leftCard, 0xFF1E293B, 0xFF475569, 1, 12f);
+
+                Object leftHdr = tvCtor.newInstance(sysContext);
+                setTextViewStyle(leftHdr, "[ 패키지 버전 및 통신/핫스팟 상태 ]", 17f, 0xFF34D399, true);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+                Object leftTv = tvCtor.newInstance(sysContext);
+                setTextViewStyle(leftTv, "", 15.5f, 0xFFE2E8F0, false);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftTv, 0, 8, 0, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+                Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
+                setMargins(leftCardLp, 0, 0, 10, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, leftCard, leftCardLp);
+
+                // Right Column Card
+                Object rightCard = llCtor.newInstance(sysContext);
+                llCls.getMethod("setOrientation", int.class).invoke(rightCard, 1);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightCard, 18, 14, 18, 14);
+                setRoundedBg(rightCard, 0xFF1E293B, 0xFF475569, 1, 12f);
+
+                Object rightHdr = tvCtor.newInstance(sysContext);
+                setTextViewStyle(rightHdr, "[ 실시간 순정 내비 SDI / TBT 변환 데이터 ]", 17f, 0xFFFBBF24, true);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+                Object rightTv = tvCtor.newInstance(sysContext);
+                setTextViewStyle(rightTv, "", 15.5f, 0xFFE2E8F0, false);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightTv, 0, 8, 0, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+                Object rightCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.15f);
+                setMargins(rightCardLp, 10, 0, 0, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, rightCard, rightCardLp);
+
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, bodyRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+                // 3. Action Buttons Row
+                Object btnRow = llCtor.newInstance(sysContext);
+                llCls.getMethod("setOrientation", int.class).invoke(btnRow, 0); // HORIZONTAL
+                llCls.getMethod("setGravity", int.class).invoke(btnRow, 17);    // CENTER
+                Object btnRowLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+                setMargins(btnRowLp, 0, 14, 0, 6);
+
+                // Button A: Check GitHub Update Now
+                Object updBtn = btnCtor.newInstance(sysContext);
+                setTextViewStyle(updBtn, "  🔄 지금 GitHub 업데이트 확인  ", 15.5f, 0xFFFFFFFF, true);
+                setRoundedBg(updBtn, 0xFF2563EB, 0xFF60A5FA, 2, 10f);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(updBtn, 18, 10, 18, 10);
+                attachClickListener(updBtn, new Runnable() {
+                    @Override
+                    public void run() {
+                        triggerManualUpdateFromUi();
+                    }
+                });
+                Object updBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+                setMargins(updBtnLp, 0, 0, 12, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, updBtn, updBtnLp);
+
+                // Button B: Dump TBT to USB/Local Now
+                Object dumpBtn = btnCtor.newInstance(sysContext);
+                setTextViewStyle(dumpBtn, "  💾 USB/로컬 TBT 정밀 덤프 저장  ", 15.5f, 0xFFFFFFFF, true);
+                setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 2, 10f);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(dumpBtn, 18, 10, 18, 10);
+                attachClickListener(dumpBtn, new Runnable() {
+                    @Override
+                    public void run() {
+                        triggerManualDumpFromUi();
+                    }
+                });
+                Object dumpBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+                setMargins(dumpBtnLp, 12, 0, 12, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, dumpBtn, dumpBtnLp);
+
+                // Button C: Re-assert Hotspot
+                Object apBtn = btnCtor.newInstance(sysContext);
+                setTextViewStyle(apBtn, "  📡 핫스팟 즉시 재점검  ", 15.5f, 0xFFFFFFFF, true);
+                setRoundedBg(apBtn, 0xFF475569, 0xFF94A3B8, 2, 10f);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(apBtn, 18, 10, 18, 10);
+                attachClickListener(apBtn, new Runnable() {
+                    @Override
+                    public void run() {
+                        triggerHotspotCheckFromUi();
+                    }
+                });
+                Object apBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+                setMargins(apBtnLp, 12, 0, 0, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, apBtn, apBtnLp);
+
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, btnRow, btnRowLp);
+
+                // 4. Footer Status Line
+                Object footerTv = tvCtor.newInstance(sysContext);
+                setTextViewStyle(footerTv, actionBannerMsg, 14.5f, 0xFF93C5FD, false);
+                tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+                // Try adding window with highest-priority system window types
+                int[] candidateTypes = new int[]{2010, 2003, 2002, 2005};
+                boolean added = false;
+                int flags = 0x00000008 | 0x00000020 | 0x00000080; // FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL | FLAG_KEEP_SCREEN_ON
+                Constructor<?> wmLpCtor = wmLpCls.getConstructor(int.class, int.class, int.class, int.class, int.class);
+                Method addViewMethod = vmCls.getMethod("addView", viewCls, vgLpCls);
+
+                for (int wtype : candidateTypes) {
+                    try {
+                        Object wmLp = wmLpCtor.newInstance(1220, WRAP_CONTENT, wtype, flags, -3); // -3 = PixelFormat.TRANSLUCENT
+                        wmLpCls.getField("gravity").setInt(wmLp, 17); // Gravity.CENTER
+                        addViewMethod.invoke(windowManager, root, wmLp);
+                        added = true;
+                        System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
+                        break;
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                if (added) {
+                    rootOverlayView = root;
+                    leftColTextView = leftTv;
+                    rightColTextView = rightTv;
+                    footerStatusTextView = footerTv;
+                    isVisible = true;
+                    shownAtMs = System.currentTimeMillis();
+                    refreshOnUiThread();
+                }
+            } catch (Throwable t) {
+                System.out.println("[CarrotBridge] StatusDashboardOverlay show error: " + t.getMessage());
+            }
+        }
+
+        private static void hideOnUiThread() {
+            try {
+                removeCallbacksFromUi(REFRESH_TASK);
+                if (isVisible && rootOverlayView != null && windowManager != null) {
+                    Class<?> viewCls = Class.forName("android.view.View");
+                    Class<?> vmCls = Class.forName("android.view.ViewManager");
+                    vmCls.getMethod("removeView", viewCls).invoke(windowManager, rootOverlayView);
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                rootOverlayView = null;
+                leftColTextView = null;
+                rightColTextView = null;
+                footerStatusTextView = null;
+                isVisible = false;
+            }
+        }
+
+        private static void refreshOnUiThread() {
+            if (!isVisible || rootOverlayView == null) return;
+            long now = System.currentTimeMillis();
+            long elapsedSec = (now - shownAtMs) / 1000L;
+            if (elapsedSec >= 60L) {
+                hideOnUiThread();
+                return;
+            }
+
+            try {
+                CarrotPacket pkt = latestSentPacket;
+                NavState st = navStateRef;
+                if (pkt == null && st != null) {
+                    pkt = buildCarrotPacket(st);
+                }
+
+                String subProp = getSystemProperty("wifi.hotspot.subscription", "true");
+                String apnProp = getSystemProperty("wifi.hotspot.apn", "Public");
+                String autoProp = getSystemProperty("persist.sys.hotspot.auto", "1");
+                String hotspotStr = (!"0".equals(autoProp) && "true".equals(subProp))
+                        ? "활성 (Auto=ON, APN=" + apnProp + ")"
+                        : "수동/비활성 (Auto=" + autoProp + ")";
+
+                boolean commaAlive = !discoveredCarrotIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
+                String commaStr = commaAlive
+                        ? ("연결됨 (" + discoveredCarrotIp + " | 차속: " + String.format(Locale.US, "%.1f", carrotVEgoKph) + " km/h)")
+                        : (discoveredCarrotIp.isEmpty() ? "브로드캐스트 송출 중 (192.168.0.255:7706)" : "최근 IP: " + discoveredCarrotIp + " (대기 중)");
+
+                long pktIdx = pkt != null ? pkt.carrotIndex : 0L;
+                StringBuilder leftSb = new StringBuilder(512);
+                leftSb.append("• 패키지 버전 : v").append(BRIDGE_VERSION).append(" (HKG_5W_CarrotNavi)\n");
+                leftSb.append("• 브릿지 데몬 : 정상 가동 중 (UDP 7706 @ 5Hz, #").append(pktIdx).append(")\n");
+                leftSb.append("• Wi-Fi 핫스팟 : ").append(hotspotStr).append("\n");
+                leftSb.append("• 콤마(캐럿) 기기 : ").append(commaStr).append("\n");
+                leftSb.append("• 패킷 타겟 IP : ").append(latestTargetsStr).append("\n");
+                leftSb.append("• 자동 업데이트 : ").append(lastAutoUpdateStatus);
+
+                StringBuilder rightSb = new StringBuilder(512);
+                if (pkt != null) {
+                    String roadKind = pkt.roadcate == 1 ? "고속/자동차전용(1)" : "일반도로(" + pkt.roadcate + ")";
+                    rightSb.append("• 도로 제한속도 : ").append(pkt.nRoadLimitSpeed).append(" km/h  [종별: ").append(roadKind)
+                            .append(" | 차속: ").append(String.format(Locale.US, "%.0f", pkt.nPosSpeed)).append(" km/h]\n");
+                    rightSb.append("• 1차 SDI(카메라) : ").append(describeSdiType(pkt.nSdiType))
+                            .append(" | 거리: ").append(pkt.nSdiDist).append("m | 단속: ").append(pkt.nSdiSpeedLimit).append(" km/h\n");
+                    if (pkt.nSdiBlockType > 0) {
+                        rightSb.append("• 구간단속/보조 : 구간단속 중 (남은거리: ").append(pkt.nSdiBlockDist)
+                                .append("m, 평균: ").append(pkt.nSdiBlockAverageSpeed).append(" km/h)\n");
+                    } else {
+                        rightSb.append("• 보조 SDI(방지턱) : ").append(describeSdiType(pkt.nSdiPlusType))
+                                .append(" | 거리: ").append(pkt.nSdiPlusDist).append("m\n");
+                    }
+
+                    boolean guiding = st != null && st.isGuidanceActive();
+                    rightSb.append("• 순정 내비 경로 : ").append(guiding ? "경로 안내 중 (Active)" : "미안내 (카메라/제한속도만 전송 중)").append("\n");
+                    rightSb.append("• 1차 TBT 회전 : ").append(describeTurnType(pkt.nTBTTurnType))
+                            .append(" (코드:").append(pkt.nTBTTurnType).append(") | 남은거리: ").append(pkt.nTBTDist).append("m\n");
+                    String mainTxt = (pkt.szTBTMainText == null || pkt.szTBTMainText.isEmpty()) ? "(교차로명 없음)" : pkt.szTBTMainText;
+                    rightSb.append("• 교차로/안내명 : ").append(mainTxt).append("\n");
+                    String remKm = String.format(Locale.US, "%.1f", pkt.nGoPosDist / 1000.0);
+                    int remMin = pkt.nGoPosTime / 60;
+                    rightSb.append("• 2차 TBT / 목적지 : ").append(describeTurnType(pkt.nTBTTurnTypeNext))
+                            .append(" (").append(pkt.nTBTDistNext).append("m) | 잔여: ").append(remKm).append("km (").append(remMin).append("분)");
+                }
+
+                Class<?> tvCls = Class.forName("android.widget.TextView");
+                Method setText = tvCls.getMethod("setText", CharSequence.class);
+                setText.invoke(leftColTextView, leftSb.toString());
+                setText.invoke(rightColTextView, rightSb.toString());
+                long remainClose = Math.max(1L, 60L - elapsedSec);
+                setText.invoke(footerStatusTextView, actionBannerMsg + "  (" + remainClose + "초 후 자동 닫힘)");
+            } catch (Throwable ignored) {
+            }
+
+            postDelayedToUi(REFRESH_TASK, 500L);
+        }
+
+        private static void triggerManualUpdateFromUi() {
+            actionBannerMsg = "⏳ GitHub 최신 버전(GRT47/HKG_5W_CarrotNavi) 확인 중...";
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+                    int rc = runAutoUpdate("GRT47", "HKG_5W_CarrotNavi", "main", installDir, false);
+                    if (rc == 0) {
+                        lastAutoUpdateStatus = "최신 버전 유지 중 (v" + BRIDGE_VERSION + ", 확인: " + nowStr + ")";
+                        actionBannerMsg = "✅ 현재 최신 버전(v" + BRIDGE_VERSION + ")입니다. (" + nowStr + ")";
+                    } else if (rc == 10) {
+                        lastAutoUpdateStatus = "새 버전 적용 완료 -> 데몬 재시작 중 (" + nowStr + ")";
+                        actionBannerMsg = "🎉 업데이트 적용 완료! 브릿지 데몬을 재시작합니다...";
+                        try { Thread.sleep(1500L); } catch (InterruptedException ignored) {}
+                        System.exit(0); // Watchdog in bridge-daemon.sh immediately restarts updated JAR
+                    } else {
+                        lastAutoUpdateStatus = "업데이트 확인 실패 (LTE 연결 확인 필요, " + nowStr + ")";
+                        actionBannerMsg = "⚠️ GitHub 연결 실패 (LTE/데이터 연결 상태를 확인해주세요)";
+                    }
+                }
+            }, "ManualUpdateTrigger").start();
+        }
+
+        private static void triggerManualDumpFromUi() {
+            actionBannerMsg = "⏳ USB 및 로컬 경로로 TBT 정밀 덤프 저장 중...";
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        enableMnsoftClusterLogging();
+                        File script = new File(installDir, "scripts/tbt-dump.sh");
+                        if (script.exists()) {
+                            execCommandCapture(new String[]{"/system/bin/sh", script.getAbsolutePath()}, 200);
+                        }
+                        String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+                        File usbDir = new File("/storage/usb0/HKG_TBT_Dump");
+                        if (usbDir.exists()) {
+                            actionBannerMsg = "✅ USB(/storage/usb0/HKG_TBT_Dump) 및 로컬 덤프 저장 완료! (" + nowStr + ")";
+                        } else {
+                            actionBannerMsg = "✅ 로컬(/data/local/tmp/hkg_tbt_dump) 덤프 완료! (USB 꽃으면 자동 복사됨)";
+                        }
+                    } catch (Throwable t) {
+                        actionBannerMsg = "⚠️ 덤프 실행 중 오류: " + t.getMessage();
+                    }
+                }
+            }, "ManualDumpTrigger").start();
+        }
+
+        private static void triggerHotspotCheckFromUi() {
+            actionBannerMsg = "⏳ Wi-Fi 핫스팟(Public APN) 상태 점검 및 활성화 중...";
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.subscription", "true"}, 10);
+                        execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.apn", "Public"}, 10);
+                        execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "29", "i32", "0", "i32", "1"}, 10);
+                        actionBannerMsg = "✅ Wi-Fi 핫스팟(APN=Public) 활성화 명령 전송 완료!";
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, "ManualHotspotTrigger").start();
+        }
+
+        private static void setTextViewStyle(Object tv, String text, float sizeSp, int color, boolean bold) throws Exception {
+            Class<?> tvCls = Class.forName("android.widget.TextView");
+            tvCls.getMethod("setText", CharSequence.class).invoke(tv, text);
+            tvCls.getMethod("setTextSize", int.class, float.class).invoke(tv, 2, sizeSp); // 2 = COMPLEX_UNIT_SP
+            tvCls.getMethod("setTextColor", int.class).invoke(tv, color);
+            if (bold) {
+                Class<?> tfCls = Class.forName("android.graphics.Typeface");
+                Object defaultBold = tfCls.getField("DEFAULT_BOLD").get(null);
+                tvCls.getMethod("setTypeface", tfCls, int.class).invoke(tv, defaultBold, 1);
+            }
+        }
+
+        private static void setRoundedBg(Object view, int fillColor, int strokeColor, int strokeWidthPx, float radiusPx) throws Exception {
+            Class<?> gdCls = Class.forName("android.graphics.drawable.GradientDrawable");
+            Class<?> drawableCls = Class.forName("android.graphics.drawable.Drawable");
+            Class<?> viewCls = Class.forName("android.view.View");
+            Object gd = gdCls.getConstructor().newInstance();
+            gdCls.getMethod("setColor", int.class).invoke(gd, fillColor);
+            gdCls.getMethod("setCornerRadius", float.class).invoke(gd, radiusPx);
+            gdCls.getMethod("setStroke", int.class, int.class).invoke(gd, strokeWidthPx, strokeColor);
+            viewCls.getMethod("setBackgroundDrawable", drawableCls).invoke(view, gd);
+        }
+
+        private static void setMargins(Object marginLp, int l, int t, int r, int b) throws Exception {
+            Class<?> mlpCls = Class.forName("android.view.ViewGroup$MarginLayoutParams");
+            mlpCls.getMethod("setMargins", int.class, int.class, int.class, int.class).invoke(marginLp, l, t, r, b);
+        }
+
+        private static void attachClickListener(Object view, final Runnable action) throws Exception {
+            Class<?> listenerCls = Class.forName("android.view.View$OnClickListener");
+            Class<?> viewCls = Class.forName("android.view.View");
+            Object proxy = Proxy.newProxyInstance(
+                    listenerCls.getClassLoader(),
+                    new Class<?>[]{listenerCls},
+                    new InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxyObj, Method method, Object[] args) {
+                            if ("onClick".equals(method.getName())) {
+                                action.run();
+                            }
+                            return null;
+                        }
+                    }
+            );
+            viewCls.getMethod("setOnClickListener", listenerCls).invoke(view, proxy);
+        }
+    }
+
+    private static String getSystemProperty(String key, String def) {
+        try {
+            Class<?> spCls = Class.forName("android.os.SystemProperties");
+            String val = (String) spCls.getMethod("get", String.class, String.class).invoke(null, key, def);
+            return (val == null || val.isEmpty()) ? def : val;
+        } catch (Throwable ignored) {
+            return def;
+        }
+    }
+
+    public static String describeSdiType(int sdiType) {
+        switch (sdiType) {
+            case 0: return "없음(0)";
+            case 1: return "고정식 과속카메라(1)";
+            case 2: return "가변형 단속카메라(2)";
+            case 3: return "신호+과속 카메라(3)";
+            case 4: return "구간단속 카메라(4)";
+            case 7: return "이동식 단속카메라(7)";
+            case 8: return "고정식(박스) 카메라(8)";
+            case 9: return "버스전용차로 단속(9)";
+            case 15: return "혼잡통행료/톨게이트(15)";
+            case 20: return "어린이보호구역/스쿨존(20)";
+            case 21: return "급커브 주의구간(21)";
+            case 22: return "과속방지턱(22)";
+            case 66: return "합류도로 주의(66)";
+            default: return "기타안전구간(" + sdiType + ")";
+        }
+    }
+
+    public static String describeTurnType(int turnType) {
+        switch (turnType) {
+            case 0: return "안내없음";
+            case 11: return "직진";
+            case 12: return "좌회전";
+            case 13: return "우회전";
+            case 14: return "유턴(U-Turn)";
+            case 16: return "8시방향 급좌회전";
+            case 17: return "10시방향 좌측방면";
+            case 18: return "2시방향 우측방면";
+            case 19: return "4시방향 급우회전";
+            case 43: return "우측 고가/지하차도 진입";
+            case 44: return "좌측 고가/지하차도 진입";
+            case 51: return "전방 주의/안내";
+            case 75: return "고속도로 첫 출구";
+            case 101: return "우측 출구(IC/JC)";
+            case 102: return "좌측 출구(IC/JC)";
+            case 104: return "고속도로 분기(우)";
+            case 105: return "고속도로 분기(좌)";
+            case 131: return "회전교차로(로터리)";
+            case 153: return "톨게이트";
+            case 201: return "목적지 도착";
+            default: return "회전(" + turnType + ")";
+        }
+    }
+
+    // =========================================================================
     // SELF-TEST SUITE (Runs on Host JVM or Target Android)
     // =========================================================================
 
@@ -2003,6 +2685,24 @@ public class CarrotBridgeMain {
             throw new AssertionError("DNS query packet too short");
         }
 
+        // 4. Test MAP button 3-press detector with realistic dual-line ivi_mode_broadcast events
+        long t0 = 100000L;
+        if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0)) {
+            throw new AssertionError("Should not trigger on 1st press");
+        }
+        if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [com.hkmc.intent.action.MAP_SHORTCUT,2,3]", t0 + 50L)) {
+            throw new AssertionError("Should debounce 2nd line of 1st press");
+        }
+        if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0 + 320L)) {
+            throw new AssertionError("Should not trigger on 2nd press");
+        }
+        if (checkMapShortcutLine("I/ivi_mode_broadcast(  524): [com.hkmc.intent.action.MAP_SHORTCUT,2,3]", t0 + 370L)) {
+            throw new AssertionError("Should debounce 2nd line of 2nd press");
+        }
+        if (!checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0 + 640L)) {
+            throw new AssertionError("Should trigger on 3rd MAP press!");
+        }
+
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());
         return 0;
     }
@@ -2019,11 +2719,14 @@ public class CarrotBridgeMain {
             boolean force = args.length >= 6 && "--force".equals(args[5]);
             int code = runAutoUpdate(owner, repo, branch, installDir, force);
             System.exit(code);
+        } else if ("show-ui".equals(args[0])) {
+            writeBytesAtomic(new File("/data/local/tmp/carrotbridge_show_ui"), "1".getBytes(UTF8));
         } else if ("test-self".equals(args[0])) {
             System.exit(runSelfTest());
         } else {
-            System.err.println("Usage: CarrotBridgeMain [daemon|update|test-self]");
+            System.err.println("Usage: CarrotBridgeMain [daemon|update|show-ui|test-self]");
             System.exit(2);
         }
     }
 }
+

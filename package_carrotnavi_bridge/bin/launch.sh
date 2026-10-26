@@ -45,6 +45,8 @@ if [ -f "$INSTALL_DIR/bin/carrotbridge.jar" ]; then
     ) &
 fi
 
-# 4. Open Engineering WiFi Info screen
+# 4. Show Status Dashboard Overlay (and open Engineering WiFi Info screen)
+echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
 am start -n com.hkmc.system.app.engineering/.module.WifiInfo
 exit 0
+
