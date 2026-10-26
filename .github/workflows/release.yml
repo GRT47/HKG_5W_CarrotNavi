@@ -1,0 +1,42 @@
+name: Build & Publish CarrotBridge Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK Build-Tools (d8)
+        uses: android-actions/setup-android@v3
+
+      - name: Build CarrotNavi Bridge DEX & USB Bundle
+        run: python3 package_carrotnavi_bridge/build_package.py
+
+      - name: Publish to Latest GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "HKG 5W CarrotNavi Bridge (Latest Auto-Update Build)"
+          body: "Automated build from main branch."
+          prerelease: false
+          make_latest: true
+          files: |
+            package_carrotnavi_bridge/build/carrotbridge.jar
+            package_carrotnavi_bridge/build/carrotbridge.jar.sha256
+            HKG_5W_CarrotNavi_USB.zip

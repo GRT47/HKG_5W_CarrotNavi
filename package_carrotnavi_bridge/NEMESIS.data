@@ -1,0 +1,19 @@
+[nemesis]
+version=1.0.0
+id=carrotnavi.bridge
+name=CarrotNavi 7706 Bridge
+types=application,service
+postinstall=scripts/post.sh
+preuninstall=scripts/preun.sh
+
+[app.0]
+kind=sh
+path=bin/launch.sh
+uid=root
+
+[service.0]
+name=carrotnavi-bridge
+kind=sh
+path=svc/bridge-daemon.sh
+uid=root
+mode=background

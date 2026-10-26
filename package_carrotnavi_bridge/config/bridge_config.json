@@ -1,0 +1,11 @@
+{
+  "github_owner": "GRT47",
+  "github_repo": "HKG_5W_CarrotNavi",
+  "github_branch": "main",
+  "auto_update_enabled": true,
+  "auto_update_interval_sec": 1800,
+  "auto_hotspot_enabled": true,
+  "auto_usb_tbt_dump_enabled": true,
+  "udp_target_port": 7706,
+  "udp_broadcast_port": 7705
+}
