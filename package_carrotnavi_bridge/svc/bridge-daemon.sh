@@ -5,15 +5,22 @@ export ANDROID_ROOT=/system
 export ANDROID_DATA=/data
 export BOOTCLASSPATH=/system/framework/core.jar:/system/framework/conscrypt.jar:/system/framework/okhttp.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/framework2.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/mms-common.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/apache-xml.jar:/system/framework/webviewchromium.jar:/system/framework/automotive.jar
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../NEMESIS.data" ]; then
-    INSTALL_DIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)"
-elif [ -d "/data/nemesis/apps/carrotnavi.bridge" ]; then
+if [ -d "/data/nemesis/apps/carrotnavi.bridge" ]; then
     INSTALL_DIR="/data/nemesis/apps/carrotnavi.bridge"
 else
     INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
 fi
 mkdir -p /data/dalvik-cache 2>/dev/null
+SVC_PID_FILE="/data/local/tmp/carrotbridge_svc.pid"
+JAVA_PID_FILE="/data/local/tmp/carrotbridge_java.pid"
+
+if [ -f "$SVC_PID_FILE" ]; then
+    old_svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
+    if [ -n "$old_svc_pid" ] && [ "$old_svc_pid" != "$$" ] && kill -0 "$old_svc_pid" 2>/dev/null; then
+        exit 0
+    fi
+fi
+echo "$$" > "$SVC_PID_FILE" 2>/dev/null
 ENG_PREF="/data/data/com.hkmc.system.app.engineering/shared_prefs/com.hkmc.system.app.engineering_preferences.xml"
 BRIDGE_PID=""
 LOOP_COUNT=0
@@ -98,9 +105,17 @@ start_bridge_java() {
     if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
         return 0
     fi
+    if [ -f "$JAVA_PID_FILE" ]; then
+        saved_jpid="$(cat "$JAVA_PID_FILE" 2>/dev/null)"
+        if [ -n "$saved_jpid" ] && kill -0 "$saved_jpid" 2>/dev/null; then
+            BRIDGE_PID="$saved_jpid"
+            return 0
+        fi
+    fi
     kill_bridge_java
     CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain daemon "$INSTALL_DIR" 2>&1 &
     BRIDGE_PID="$!"
+    echo "$BRIDGE_PID" > "$JAVA_PID_FILE" 2>/dev/null
     BRIDGE_START_LOOP="$LOOP_COUNT"
     log_info "Started CarrotBridgeMain daemon (pid=$BRIDGE_PID, dir=$INSTALL_DIR)"
 }
@@ -130,6 +145,7 @@ run_github_update_check() {
 
 on_stop() {
     log_info "Service stopped via NEMESIS Manager"
+    rm -f "$SVC_PID_FILE" "$JAVA_PID_FILE" 2>/dev/null
     kill_bridge_java
     exit 0
 }
@@ -145,14 +161,10 @@ if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
     apply_hotspot_props
 fi
 
-# Start the 7706 Java Bridge Daemon & MAP 3-Press UI Overlay immediately (even before sys.boot_completed)
-start_bridge_java
-
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
     if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
         apply_hotspot_props
     fi
-    check_bridge_java_watchdog
     sleep 2 &
     wait $!
 done
@@ -171,8 +183,8 @@ fi
 # Wake up com.mnsoft.navi [Cluster] plain-text TBT logger
 am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 >/dev/null 2>&1
 
-# Ensure the 7706 Java Bridge Daemon is alive
-check_bridge_java_watchdog
+# Start the 7706 Java Bridge Daemon & MAP 3-Press UI Overlay once Android system services are up
+start_bridge_java
 
 LOOP_COUNT=0
 USB_DUMPED_SESSION=0

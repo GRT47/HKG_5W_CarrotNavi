@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.3";
+    public static final String BRIDGE_VERSION = "1.1.4";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -2088,8 +2088,6 @@ public class CarrotBridgeMain {
                         Class<?> handlerCls = Class.forName("android.os.Handler");
                         uiHandler = handlerCls.getConstructor(looperCls).newInstance(myLooper);
 
-                        ensureUiContextOnUiThread();
-
                         System.out.println("[CarrotBridge] StatusDashboardOverlay UI Looper initialized.");
                         looperCls.getMethod("loop").invoke(null);
                     } catch (Throwable t) {
@@ -2106,6 +2104,18 @@ public class CarrotBridgeMain {
                 return true;
             }
             try {
+                // Verify Android system_server services (window, display, activity) are ready before touching ActivityThread.
+                // Calling ActivityThread.systemMain() before "display" service is registered leaves ActivityThread.mSystemContext
+                // half-initialized with mPackageInfo=null.
+                Class<?> smCls = Class.forName("android.os.ServiceManager");
+                Method getSvc = smCls.getMethod("getService", String.class);
+                if (getSvc.invoke(null, "window") == null
+                        || getSvc.invoke(null, "display") == null
+                        || getSvc.invoke(null, "activity") == null) {
+                    System.out.println("[CarrotBridge] ensureUiContextOnUiThread deferred: system services not ready yet");
+                    return false;
+                }
+
                 Class<?> atCls = Class.forName("android.app.ActivityThread");
                 Object at = null;
                 try {
@@ -2123,7 +2133,20 @@ public class CarrotBridgeMain {
                     windowManager = getSysSvc.invoke(sysContext, "window");
                 }
             } catch (Throwable t) {
-                System.out.println("[CarrotBridge] ensureUiContextOnUiThread failed: " + t.getMessage());
+                Throwable cause = (t.getCause() != null) ? t.getCause() : t;
+                System.out.println("[CarrotBridge] ensureUiContextOnUiThread failed: " + cause);
+                sysContext = null;
+                windowManager = null;
+                try {
+                    Class<?> atCls = Class.forName("android.app.ActivityThread");
+                    java.lang.reflect.Field fSysCtx = atCls.getDeclaredField("mSystemContext");
+                    fSysCtx.setAccessible(true);
+                    fSysCtx.set(null, null);
+                    java.lang.reflect.Field fCurAt = atCls.getDeclaredField("sCurrentActivityThread");
+                    fCurAt.setAccessible(true);
+                    fCurAt.set(null, null);
+                } catch (Throwable ignored) {
+                }
             }
             return sysContext != null && windowManager != null;
         }
@@ -2194,13 +2217,12 @@ public class CarrotBridgeMain {
             Class<?> llCls = Class.forName("android.widget.LinearLayout");
             Class<?> llLpCls = Class.forName("android.widget.LinearLayout$LayoutParams");
             Class<?> tvCls = Class.forName("android.widget.TextView");
-            Class<?> btnCls = Class.forName("android.widget.Button");
 
             Constructor<?> llCtor = llCls.getConstructor(ctxCls);
             Constructor<?> tvCtor = tvCls.getConstructor(ctxCls);
-            Constructor<?> btnCtor = btnCls.getConstructor(ctxCls);
             Constructor<?> llLpCtor2 = llLpCls.getConstructor(int.class, int.class);
             Constructor<?> llLpCtor3 = llLpCls.getConstructor(int.class, int.class, float.class);
+            Method tvSetGravity = tvCls.getMethod("setGravity", int.class);
 
             final int MATCH_PARENT = -1;
             final int WRAP_CONTENT = -2;
@@ -2221,8 +2243,10 @@ public class CarrotBridgeMain {
             Object titleLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, titleTv, titleLp);
 
-            Object closeBtn = btnCtor.newInstance(sysContext);
+            // Note: Use TextView instead of Button because HKMC firmware removed Button's default drawable (#0x1080100 popup_btn_default.xml)
+            Object closeBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(closeBtn, "  ✖ 닫기 (MAP 3연타)  ", 15.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(closeBtn, 17); // CENTER
             setRoundedBg(closeBtn, 0xFFDC2626, 0xFFF87171, 2, 10f);
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(closeBtn, 18, 9, 18, 9);
             attachClickListener(closeBtn, new Runnable() {
@@ -2293,8 +2317,9 @@ public class CarrotBridgeMain {
             setMargins(btnRowLp, 0, 12, 0, 6);
 
             // Button A: Open Hotspot Settings Screen Directly (com.hkmc.wifisettings/.WifiHotspot)
-            Object hsUiBtn = btnCtor.newInstance(sysContext);
+            Object hsUiBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(hsUiBtn, "📶 핫스팟 설정 화면", 14.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(hsUiBtn, 17);
             setRoundedBg(hsUiBtn, 0xFF7C3AED, 0xFFA78BFA, 2, 10f);
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(hsUiBtn, 10, 10, 10, 10);
             attachClickListener(hsUiBtn, new Runnable() {
@@ -2308,8 +2333,9 @@ public class CarrotBridgeMain {
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, hsUiBtn, hsUiBtnLp);
 
             // Button B: Open Engineering Mode WiFi Info Screen Directly (com.hkmc.system.app.engineering/.module.WifiInfo)
-            Object engUiBtn = btnCtor.newInstance(sysContext);
+            Object engUiBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(engUiBtn, "⚙️ 엔지니어링 WiFi", 14.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(engUiBtn, 17);
             setRoundedBg(engUiBtn, 0xFF475569, 0xFF94A3B8, 2, 10f);
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(engUiBtn, 10, 10, 10, 10);
             attachClickListener(engUiBtn, new Runnable() {
@@ -2323,8 +2349,9 @@ public class CarrotBridgeMain {
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, engUiBtn, engUiBtnLp);
 
             // Button C: Re-assert Hotspot in Background
-            Object apBtn = btnCtor.newInstance(sysContext);
+            Object apBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(apBtn, "📡 핫스팟 즉시 켜기", 14.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(apBtn, 17);
             setRoundedBg(apBtn, 0xFF0284C7, 0xFF38BDF8, 2, 10f);
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(apBtn, 10, 10, 10, 10);
             attachClickListener(apBtn, new Runnable() {
@@ -2338,8 +2365,9 @@ public class CarrotBridgeMain {
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, apBtn, apBtnLp);
 
             // Button D: Check GitHub Update Now
-            Object updBtn = btnCtor.newInstance(sysContext);
+            Object updBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(updBtn, "🔄 GitHub 업데이트", 14.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(updBtn, 17);
             setRoundedBg(updBtn, 0xFF2563EB, 0xFF60A5FA, 2, 10f);
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(updBtn, 10, 10, 10, 10);
             attachClickListener(updBtn, new Runnable() {
@@ -2353,8 +2381,9 @@ public class CarrotBridgeMain {
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, updBtn, updBtnLp);
 
             // Button E: Dump TBT to USB/Local Now
-            Object dumpBtn = btnCtor.newInstance(sysContext);
+            Object dumpBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(dumpBtn, "💾 TBT 정밀 덤프", 14.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(dumpBtn, 17);
             setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 2, 10f);
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(dumpBtn, 10, 10, 10, 10);
             attachClickListener(dumpBtn, new Runnable() {

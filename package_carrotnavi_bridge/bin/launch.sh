@@ -5,24 +5,27 @@ export ANDROID_ROOT=/system
 export ANDROID_DATA=/data
 export BOOTCLASSPATH=/system/framework/core.jar:/system/framework/conscrypt.jar:/system/framework/okhttp.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/framework2.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/mms-common.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/apache-xml.jar:/system/framework/webviewchromium.jar:/system/framework/automotive.jar
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../NEMESIS.data" ]; then
-    INSTALL_DIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)"
-elif [ -d "/data/nemesis/apps/carrotnavi.bridge" ]; then
+if [ -d "/data/nemesis/apps/carrotnavi.bridge" ]; then
     INSTALL_DIR="/data/nemesis/apps/carrotnavi.bridge"
 else
     INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
 fi
 mkdir -p /data/dalvik-cache 2>/dev/null
+SVC_PID_FILE="/data/local/tmp/carrotbridge_svc.pid"
 
 # 1. Immediately signal the Status Dashboard Overlay to appear on screen
 echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
 
-# 2. Ensure carrot-7706-bridge background service is running
-if ! ps 2>/dev/null | grep -q "[b]ridge-daemon.sh"; then
+# 2. Ensure carrot-7706-bridge background service is running (only if not already running via svcmgr)
+svc_alive=0
+if [ -f "$SVC_PID_FILE" ]; then
+    svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
+    if [ -n "$svc_pid" ] && kill -0 "$svc_pid" 2>/dev/null; then
+        svc_alive=1
+    fi
+fi
+if [ "$svc_alive" = "0" ]; then
     /system/bin/sh "$INSTALL_DIR/svc/bridge-daemon.sh" </dev/null >>/data/local/tmp/carrotbridge_svc.log 2>&1 &
-elif ! ps 2>/dev/null | grep -q "[C]arrotBridgeMain"; then
-    CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain daemon "$INSTALL_DIR" </dev/null >>/data/local/tmp/carrotbridge_daemon.log 2>&1 &
 fi
 
 # 3. Run Hotspot assertion, TBT logger wakeup, and GitHub Auto-Update check asynchronously in background
