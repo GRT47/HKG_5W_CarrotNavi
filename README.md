@@ -34,7 +34,7 @@
 5. **MAP 버튼 3연타 상태 대시보드 오버레이 (`StatusDashboardOverlay`)**
    - 전면 물리 `MAP` 버튼을 연속 3번 누르면(`ivi_mode_broadcast` `KEYCODE_SHORTCUT_MAP` / `com.hkmc.intent.action.MAP_SHORTCUT` 감지), 현재 화면 위에 **실시간 패키지 버전·동작 상태 대시보드 오버레이**가 즉시 표시됨
    - 실시간 표시 항목: 패키지 버전, UDP `7706` 송신 카운터, Wi-Fi 핫스팟 상태, 콤마(캐럿파일럿) 연결 IP 및 수신 차속, 현재 도로 제한속도, 전방 단속카메라/구간단속/방지턱(SDI), 1차/2차 TBT 회전 및 한글 교차로명, 목적지 잔여 거리/시간
-   - 터치 조작 버튼: `[지금 GitHub 업데이트 확인]`, `[USB/로컬 TBT 정밀 덤프 저장]`, `[핫스팟 즉시 재점검]`, `[닫기 (MAP 3연타)]`
+   - 터치 조작 버튼: `[📶 핫스팟 설정 화면]`(`com.hkmc.wifisettings/.WifiHotspot` 즉시 진입), `[📡 핫스팟 즉시 켜기]`, `[🔄 GitHub 업데이트 확인]`, `[💾 TBT 정밀 덤프 저장]`, `[✖ 닫기 (MAP 3연타)]`
 
 ---
 

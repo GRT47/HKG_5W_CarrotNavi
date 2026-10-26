@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.0";
+    public static final String BRIDGE_VERSION = "1.1.1";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -2278,50 +2278,65 @@ public class CarrotBridgeMain {
                 Object btnRowLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
                 setMargins(btnRowLp, 0, 14, 0, 6);
 
-                // Button A: Check GitHub Update Now
-                Object updBtn = btnCtor.newInstance(sysContext);
-                setTextViewStyle(updBtn, "  🔄 지금 GitHub 업데이트 확인  ", 15.5f, 0xFFFFFFFF, true);
-                setRoundedBg(updBtn, 0xFF2563EB, 0xFF60A5FA, 2, 10f);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(updBtn, 18, 10, 18, 10);
-                attachClickListener(updBtn, new Runnable() {
+                // Button A: Open Hotspot Settings Screen Directly (com.hkmc.wifisettings/.WifiHotspot)
+                Object hsUiBtn = btnCtor.newInstance(sysContext);
+                setTextViewStyle(hsUiBtn, "📶 핫스팟 설정 화면", 15f, 0xFFFFFFFF, true);
+                setRoundedBg(hsUiBtn, 0xFF7C3AED, 0xFFA78BFA, 2, 10f);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(hsUiBtn, 14, 10, 14, 10);
+                attachClickListener(hsUiBtn, new Runnable() {
                     @Override
                     public void run() {
-                        triggerManualUpdateFromUi();
+                        openHotspotSettingsFromUi();
                     }
                 });
-                Object updBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-                setMargins(updBtnLp, 0, 0, 12, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, updBtn, updBtnLp);
+                Object hsUiBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+                setMargins(hsUiBtnLp, 0, 0, 8, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, hsUiBtn, hsUiBtnLp);
 
-                // Button B: Dump TBT to USB/Local Now
-                Object dumpBtn = btnCtor.newInstance(sysContext);
-                setTextViewStyle(dumpBtn, "  💾 USB/로컬 TBT 정밀 덤프 저장  ", 15.5f, 0xFFFFFFFF, true);
-                setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 2, 10f);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(dumpBtn, 18, 10, 18, 10);
-                attachClickListener(dumpBtn, new Runnable() {
-                    @Override
-                    public void run() {
-                        triggerManualDumpFromUi();
-                    }
-                });
-                Object dumpBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-                setMargins(dumpBtnLp, 12, 0, 12, 0);
-                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, dumpBtn, dumpBtnLp);
-
-                // Button C: Re-assert Hotspot
+                // Button B: Re-assert Hotspot in Background
                 Object apBtn = btnCtor.newInstance(sysContext);
-                setTextViewStyle(apBtn, "  📡 핫스팟 즉시 재점검  ", 15.5f, 0xFFFFFFFF, true);
-                setRoundedBg(apBtn, 0xFF475569, 0xFF94A3B8, 2, 10f);
-                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(apBtn, 18, 10, 18, 10);
+                setTextViewStyle(apBtn, "📡 핫스팟 즉시 켜기", 15f, 0xFFFFFFFF, true);
+                setRoundedBg(apBtn, 0xFF0284C7, 0xFF38BDF8, 2, 10f);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(apBtn, 14, 10, 14, 10);
                 attachClickListener(apBtn, new Runnable() {
                     @Override
                     public void run() {
                         triggerHotspotCheckFromUi();
                     }
                 });
-                Object apBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-                setMargins(apBtnLp, 12, 0, 0, 0);
+                Object apBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+                setMargins(apBtnLp, 8, 0, 8, 0);
                 vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, apBtn, apBtnLp);
+
+                // Button C: Check GitHub Update Now
+                Object updBtn = btnCtor.newInstance(sysContext);
+                setTextViewStyle(updBtn, "🔄 GitHub 업데이트 확인", 15f, 0xFFFFFFFF, true);
+                setRoundedBg(updBtn, 0xFF2563EB, 0xFF60A5FA, 2, 10f);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(updBtn, 14, 10, 14, 10);
+                attachClickListener(updBtn, new Runnable() {
+                    @Override
+                    public void run() {
+                        triggerManualUpdateFromUi();
+                    }
+                });
+                Object updBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.05f);
+                setMargins(updBtnLp, 8, 0, 8, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, updBtn, updBtnLp);
+
+                // Button D: Dump TBT to USB/Local Now
+                Object dumpBtn = btnCtor.newInstance(sysContext);
+                setTextViewStyle(dumpBtn, "💾 TBT 정밀 덤프 저장", 15f, 0xFFFFFFFF, true);
+                setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 2, 10f);
+                viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(dumpBtn, 14, 10, 14, 10);
+                attachClickListener(dumpBtn, new Runnable() {
+                    @Override
+                    public void run() {
+                        triggerManualDumpFromUi();
+                    }
+                });
+                Object dumpBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+                setMargins(dumpBtnLp, 8, 0, 0, 0);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, dumpBtn, dumpBtnLp);
 
                 vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, btnRow, btnRowLp);
 
@@ -2504,6 +2519,55 @@ public class CarrotBridgeMain {
                     }
                 }
             }, "ManualDumpTrigger").start();
+        }
+
+        private static void openHotspotSettingsFromUi() {
+            actionBannerMsg = "⏳ 순정 Wi-Fi 핫스팟 설정 화면을 여는 중...";
+            hide();
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.subscription", "true"}, 10);
+                        execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.apn", "Public"}, 10);
+                        boolean startedInProc = false;
+                        if (sysContext != null) {
+                            try {
+                                Class<?> intentCls = Class.forName("android.content.Intent");
+                                Object intent = intentCls.getConstructor().newInstance();
+                                intentCls.getMethod("setClassName", String.class, String.class)
+                                        .invoke(intent, "com.hkmc.wifisettings", "com.hkmc.wifisettings.WifiHotspot");
+                                intentCls.getMethod("setAction", String.class)
+                                        .invoke(intent, "android.intent.action.MAIN");
+                                intentCls.getMethod("addCategory", String.class)
+                                        .invoke(intent, "android.intent.category.LAUNCHER");
+                                intentCls.getMethod("addFlags", int.class)
+                                        .invoke(intent, 0x10010000); // FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_NO_ANIMATION
+                                sysContext.getClass().getMethod("startActivity", intentCls).invoke(sysContext, intent);
+                                startedInProc = true;
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        if (!startedInProc) {
+                            String out = execCommandCapture(new String[]{
+                                    "/system/bin/am", "start",
+                                    "-a", "android.intent.action.MAIN",
+                                    "-c", "android.intent.category.LAUNCHER",
+                                    "-f", "0x10010000",
+                                    "-n", "com.hkmc.wifisettings/com.hkmc.wifisettings.WifiHotspot"
+                            }, 20);
+                            if (out.contains("Error") || out.contains("Exception")) {
+                                execCommandCapture(new String[]{
+                                        "/system/bin/am", "start",
+                                        "-f", "0x10000000",
+                                        "-n", "com.hkmc.system.app.engineering/.module.WifiInfo"
+                                }, 20);
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, "HotspotSettingsLauncher").start();
         }
 
         private static void triggerHotspotCheckFromUi() {
