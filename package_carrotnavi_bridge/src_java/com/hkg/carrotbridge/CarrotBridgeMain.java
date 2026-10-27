@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.8";
+    public static final String BRIDGE_VERSION = "1.1.9";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -2179,12 +2179,20 @@ public class CarrotBridgeMain {
         private static volatile Object windowManager = null;
         private static volatile Object sysContext = null;
         private static volatile Object rootOverlayView = null;
+        private static volatile Object headerSysInfoTextView = null;
         private static volatile Object leftColTextView = null;
         private static volatile Object rightColTextView = null;
         private static volatile Object footerStatusTextView = null;
         private static volatile boolean isVisible = false;
         private static volatile long shownAtMs = 0L;
         private static volatile String actionBannerMsg = "MAP 버튼 3연타로 열기/닫기 | 60초 후 자동 닫힘";
+        private static volatile long lastSysBadgeMs = 0L;
+        private static volatile String cachedSysBadgeText = "🌡️ CPU: --°C  |  💾 RAM: --/--MB";
+        private static volatile long lastCpuTotalTicks = 0L;
+        private static volatile long lastCpuIdleTicks = 0L;
+        private static volatile int lastCpuLoadPct = 0;
+        private static volatile File cachedThermalFile = null;
+        private static volatile boolean thermalSearchDone = false;
 
         private static final Runnable REFRESH_TASK = new Runnable() {
             @Override
@@ -2375,9 +2383,19 @@ public class CarrotBridgeMain {
             llCls.getMethod("setGravity", int.class).invoke(headerRow, 16);    // CENTER_VERTICAL
 
             Object titleTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(titleTv, "🥕 HKG 5W CarrotNavi — 상태 대시보드 (v" + BRIDGE_VERSION + ")", 21f, 0xFF38BDF8, true);
+            setTextViewStyle(titleTv, "🥕 HKG 5W CarrotNavi — 상태 대시보드 (v" + BRIDGE_VERSION + ")", 20.5f, 0xFF38BDF8, true);
             Object titleLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, titleTv, titleLp);
+
+            // System CPU Temp & RAM Usage Badge (between Header Title and Close Button)
+            Object sysInfoTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(sysInfoTv, updateSystemResourceBadge(System.currentTimeMillis()), 14.5f, 0xFFA7F3D0, true);
+            tvSetGravity.invoke(sysInfoTv, 17); // CENTER
+            setRoundedBg(sysInfoTv, 0xFF1E293B, 0xFF475569, 1, 10f);
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(sysInfoTv, 14, 8, 14, 8);
+            Object sysInfoLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(sysInfoLp, 8, 0, 12, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, sysInfoTv, sysInfoLp);
 
             // Note: Use TextView instead of Button because HKMC firmware removed Button's default drawable (#0x1080100 popup_btn_default.xml)
             Object closeBtn = tvCtor.newInstance(sysContext);
@@ -2540,7 +2558,7 @@ public class CarrotBridgeMain {
             tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
-            return new Object[]{root, leftTv, rightTv, footerTv};
+            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv};
         }
 
         private static void showOnUiThread() {
@@ -2600,6 +2618,7 @@ public class CarrotBridgeMain {
                         leftColTextView = tree[1];
                         rightColTextView = tree[2];
                         footerStatusTextView = tree[3];
+                        headerSysInfoTextView = tree.length > 4 ? tree[4] : null;
                         isVisible = true;
                         shownAtMs = System.currentTimeMillis();
                         System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
@@ -2624,6 +2643,7 @@ public class CarrotBridgeMain {
         private static void hideOnUiThread() {
             Object oldRoot = rootOverlayView;
             rootOverlayView = null;
+            headerSysInfoTextView = null;
             leftColTextView = null;
             rightColTextView = null;
             footerStatusTextView = null;
@@ -2713,6 +2733,9 @@ public class CarrotBridgeMain {
 
                 Class<?> tvCls = Class.forName("android.widget.TextView");
                 Method setText = tvCls.getMethod("setText", CharSequence.class);
+                if (headerSysInfoTextView != null) {
+                    setText.invoke(headerSysInfoTextView, updateSystemResourceBadge(now));
+                }
                 setText.invoke(leftColTextView, leftSb.toString());
                 setText.invoke(rightColTextView, rightSb.toString());
                 long remainClose = Math.max(1L, 60L - elapsedSec);
@@ -2721,6 +2744,184 @@ public class CarrotBridgeMain {
             }
 
             postDelayedToUi(REFRESH_TASK, 500L);
+        }
+
+        private static String updateSystemResourceBadge(long nowMs) {
+            if (nowMs - lastSysBadgeMs < 950L && cachedSysBadgeText != null) {
+                return cachedSysBadgeText;
+            }
+            lastSysBadgeMs = nowMs;
+            try {
+                int cpuPct = sampleCpuUsagePercent();
+                Double tempC = readCpuTemperatureCelsius();
+                String cpuPart;
+                if (tempC != null) {
+                    cpuPart = String.format(Locale.US, "🌡️ CPU: %.0f°C (%d%%)", tempC, cpuPct);
+                } else {
+                    int freqMhz = readCpuFreqMhz();
+                    cpuPart = freqMhz > 0
+                            ? ("🌡️ CPU: " + cpuPct + "% (" + freqMhz + "MHz)")
+                            : ("🌡️ CPU: " + cpuPct + "%");
+                }
+                String ramPart = readRamUsageSummary();
+                cachedSysBadgeText = "  " + cpuPart + "   |   " + ramPart + "  ";
+            } catch (Throwable ignored) {
+            }
+            return cachedSysBadgeText;
+        }
+
+        private static Double readCpuTemperatureCelsius() {
+            try {
+                if (!thermalSearchDone) {
+                    thermalSearchDone = true;
+                    String[] candidates = new String[]{
+                            "/sys/class/thermal/thermal_zone0/temp",
+                            "/sys/class/thermal/thermal_zone1/temp",
+                            "/sys/devices/virtual/thermal/thermal_zone0/temp",
+                            "/sys/class/hwmon/hwmon0/temp1_input",
+                            "/sys/class/hwmon/hwmon0/device/temp1_input",
+                            "/sys/class/hwmon/hwmon1/temp1_input",
+                            "/sys/devices/platform/tcc-tsensor/temp",
+                            "/sys/bus/platform/devices/tcc-tsensor/temp",
+                            "/proc/tcc_tsensor"
+                    };
+                    for (String p : candidates) {
+                        File f = new File(p);
+                        if (f.isFile() && f.canRead()) {
+                            cachedThermalFile = f;
+                            break;
+                        }
+                    }
+                    if (cachedThermalFile == null) {
+                        String[] dirs = new String[]{"/sys/class/thermal", "/sys/class/hwmon"};
+                        for (String d : dirs) {
+                            File dir = new File(d);
+                            File[] children = dir.listFiles();
+                            if (children == null) continue;
+                            for (File sub : children) {
+                                for (String leaf : new String[]{"temp", "temp1_input", "device/temp1_input"}) {
+                                    File cand = new File(sub, leaf);
+                                    if (cand.isFile() && cand.canRead()) {
+                                        cachedThermalFile = cand;
+                                        break;
+                                    }
+                                }
+                                if (cachedThermalFile != null) break;
+                            }
+                            if (cachedThermalFile != null) break;
+                        }
+                    }
+                }
+                if (cachedThermalFile != null) {
+                    String raw = readFirstLineQuick(cachedThermalFile);
+                    double v = parseLeadingDouble(raw, -999.0);
+                    if (v > -900.0) {
+                        if (v >= 1000.0) v = v / 1000.0;
+                        else if (v >= 150.0) v = v / 10.0;
+                        if (v >= -30.0 && v <= 135.0) {
+                            return Double.valueOf(v);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            return null;
+        }
+
+        private static int readCpuFreqMhz() {
+            try {
+                File f = new File("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq");
+                if (f.isFile() && f.canRead()) {
+                    int khz = parseIntSafe(readFirstLineQuick(f), 0);
+                    if (khz > 1000) return khz / 1000;
+                }
+            } catch (Throwable ignored) {
+            }
+            return 0;
+        }
+
+        private static int sampleCpuUsagePercent() {
+            try {
+                String line = readFirstLineQuick(new File("/proc/stat"));
+                if (line != null && line.startsWith("cpu")) {
+                    String[] parts = line.trim().split("\\s+");
+                    if (parts.length >= 5) {
+                        long user = Long.parseLong(parts[1]);
+                        long nice = Long.parseLong(parts[2]);
+                        long sys = Long.parseLong(parts[3]);
+                        long idle = Long.parseLong(parts[4]);
+                        long iowait = parts.length >= 6 ? Long.parseLong(parts[5]) : 0L;
+                        long irq = parts.length >= 7 ? Long.parseLong(parts[6]) : 0L;
+                        long softirq = parts.length >= 8 ? Long.parseLong(parts[7]) : 0L;
+                        long idleAll = idle + iowait;
+                        long total = user + nice + sys + idleAll + irq + softirq;
+                        long dTotal = total - lastCpuTotalTicks;
+                        long dIdle = idleAll - lastCpuIdleTicks;
+                        lastCpuTotalTicks = total;
+                        lastCpuIdleTicks = idleAll;
+                        if (dTotal > 0L) {
+                            int pct = (int) Math.round(((dTotal - dIdle) * 100.0) / dTotal);
+                            lastCpuLoadPct = Math.max(0, Math.min(100, pct));
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            return lastCpuLoadPct;
+        }
+
+        private static String readRamUsageSummary() {
+            BufferedReader br = null;
+            try {
+                File memFile = new File("/proc/meminfo");
+                if (!memFile.exists()) return "💾 RAM: --";
+                br = new BufferedReader(new InputStreamReader(new FileInputStream(memFile), UTF8));
+                long totalKb = 0L;
+                long freeKb = 0L;
+                long buffersKb = 0L;
+                long cachedKb = 0L;
+                String line;
+                int found = 0;
+                while ((line = br.readLine()) != null && found < 4) {
+                    if (line.startsWith("MemTotal:")) {
+                        totalKb = (long) parseLeadingDouble(line.substring(9), 0.0);
+                        found++;
+                    } else if (line.startsWith("MemFree:")) {
+                        freeKb = (long) parseLeadingDouble(line.substring(8), 0.0);
+                        found++;
+                    } else if (line.startsWith("Buffers:")) {
+                        buffersKb = (long) parseLeadingDouble(line.substring(8), 0.0);
+                        found++;
+                    } else if (line.startsWith("Cached:")) {
+                        cachedKb = (long) parseLeadingDouble(line.substring(7), 0.0);
+                        found++;
+                    }
+                }
+                if (totalKb > 0L) {
+                    long usedKb = Math.max(0L, totalKb - freeKb - buffersKb - cachedKb);
+                    long totalMb = totalKb / 1024L;
+                    long usedMb = usedKb / 1024L;
+                    int pct = (int) Math.round((usedKb * 100.0) / totalKb);
+                    return "💾 RAM: " + usedMb + "/" + totalMb + "MB (" + pct + "%)";
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (br != null) try { br.close(); } catch (Exception ignored) {}
+            }
+            return "💾 RAM: --";
+        }
+
+        private static String readFirstLineQuick(File f) {
+            BufferedReader br = null;
+            try {
+                br = new BufferedReader(new InputStreamReader(new FileInputStream(f), UTF8));
+                String s = br.readLine();
+                return s != null ? s.trim() : "";
+            } catch (Throwable e) {
+                return "";
+            } finally {
+                if (br != null) try { br.close(); } catch (Exception ignored) {}
+            }
         }
 
         private static void triggerManualUpdateFromUi() {
