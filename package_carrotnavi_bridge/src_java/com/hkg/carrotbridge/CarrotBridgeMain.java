@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.7";
+    public static final String BRIDGE_VERSION = "1.1.8";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -2375,7 +2375,7 @@ public class CarrotBridgeMain {
             llCls.getMethod("setGravity", int.class).invoke(headerRow, 16);    // CENTER_VERTICAL
 
             Object titleTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(titleTv, "🥕 HKG CarrotNavi 7706 Bridge — 상태 대시보드 (v" + BRIDGE_VERSION + ")", 21f, 0xFF38BDF8, true);
+            setTextViewStyle(titleTv, "🥕 HKG 5W CarrotNavi — 상태 대시보드 (v" + BRIDGE_VERSION + ")", 21f, 0xFF38BDF8, true);
             Object titleLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, titleTv, titleLp);
 
