@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.9";
+    public static final String BRIDGE_VERSION = "1.2.0";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -2181,6 +2181,7 @@ public class CarrotBridgeMain {
         private static volatile Object rootOverlayView = null;
         private static volatile Object headerSysInfoTextView = null;
         private static volatile Object leftColTextView = null;
+        private static volatile Object autoHotspotCheckTextView = null;
         private static volatile Object rightColTextView = null;
         private static volatile Object footerStatusTextView = null;
         private static volatile boolean isVisible = false;
@@ -2438,6 +2439,21 @@ public class CarrotBridgeMain {
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftTv, 0, 8, 0, 0);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
+            // Interactive Checkbox for Boot Auto-Hotspot (ON/OFF)
+            Object autoHsCheckTv = tvCtor.newInstance(sysContext);
+            styleAutoHotspotCheckbox(autoHsCheckTv, isBootAutoHotspotEnabled());
+            tvSetGravity.invoke(autoHsCheckTv, 17); // CENTER
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(autoHsCheckTv, 12, 8, 12, 8);
+            attachClickListener(autoHsCheckTv, new Runnable() {
+                @Override
+                public void run() {
+                    toggleBootAutoHotspotFromUi();
+                }
+            });
+            Object autoHsCheckLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(autoHsCheckLp, 0, 10, 0, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, autoHsCheckTv, autoHsCheckLp);
+
             Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
             setMargins(leftCardLp, 0, 0, 8, 0);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, leftCard, leftCardLp);
@@ -2558,7 +2574,7 @@ public class CarrotBridgeMain {
             tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
-            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv};
+            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv, autoHsCheckTv};
         }
 
         private static void showOnUiThread() {
@@ -2619,6 +2635,7 @@ public class CarrotBridgeMain {
                         rightColTextView = tree[2];
                         footerStatusTextView = tree[3];
                         headerSysInfoTextView = tree.length > 4 ? tree[4] : null;
+                        autoHotspotCheckTextView = tree.length > 5 ? tree[5] : null;
                         isVisible = true;
                         shownAtMs = System.currentTimeMillis();
                         System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
@@ -2645,6 +2662,7 @@ public class CarrotBridgeMain {
             rootOverlayView = null;
             headerSysInfoTextView = null;
             leftColTextView = null;
+            autoHotspotCheckTextView = null;
             rightColTextView = null;
             footerStatusTextView = null;
             isVisible = false;
@@ -2736,6 +2754,9 @@ public class CarrotBridgeMain {
                 if (headerSysInfoTextView != null) {
                     setText.invoke(headerSysInfoTextView, updateSystemResourceBadge(now));
                 }
+                if (autoHotspotCheckTextView != null) {
+                    styleAutoHotspotCheckbox(autoHotspotCheckTextView, isBootAutoHotspotEnabled());
+                }
                 setText.invoke(leftColTextView, leftSb.toString());
                 setText.invoke(rightColTextView, rightSb.toString());
                 long remainClose = Math.max(1L, 60L - elapsedSec);
@@ -2744,6 +2765,61 @@ public class CarrotBridgeMain {
             }
 
             postDelayedToUi(REFRESH_TASK, 500L);
+        }
+
+        private static boolean isBootAutoHotspotEnabled() {
+            try {
+                File conf = new File(installDir, "config/hotspot_auto.conf");
+                if (conf.isFile()) {
+                    String val = readFirstLineQuick(conf);
+                    if ("0".equals(val)) return false;
+                    if ("1".equals(val)) return true;
+                }
+            } catch (Throwable ignored) {
+            }
+            String autoProp = getSystemProperty("persist.sys.hotspot.auto", "1");
+            return !"0".equals(autoProp);
+        }
+
+        private static void styleAutoHotspotCheckbox(Object view, boolean enabled) throws Exception {
+            if (enabled) {
+                setTextViewStyle(view, "☑ 부팅 시 핫스팟 자동 활성화 : ON (터치하여 변경)", 14.5f, 0xFFFFFFFF, true);
+                setRoundedBg(view, 0xFF065F46, 0xFF34D399, 2, 10f);
+            } else {
+                setTextViewStyle(view, "☐ 부팅 시 핫스팟 자동 활성화 : OFF (터치하여 변경)", 14.5f, 0xFFCBD5E1, true);
+                setRoundedBg(view, 0xFF334155, 0xFF64748B, 2, 10f);
+            }
+        }
+
+        private static void toggleBootAutoHotspotFromUi() {
+            final boolean nextState = !isBootAutoHotspotEnabled();
+            try {
+                File conf = new File(installDir, "config/hotspot_auto.conf");
+                writeBytesAtomic(conf, (nextState ? "1\n" : "0\n").getBytes(UTF8));
+            } catch (Throwable ignored) {
+            }
+            actionBannerMsg = nextState
+                    ? "✅ 부팅 시 핫스팟 자동 활성화가 [ON]으로 설정되었습니다."
+                    : "ℹ️ 부팅 시 핫스팟 자동 활성화가 [OFF]로 해제되었습니다.";
+            postToUi(REFRESH_TASK);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (nextState) {
+                            execCommandCapture(new String[]{"/system/bin/setprop", "persist.sys.hotspot.auto", "1"}, 10);
+                            execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.subscription", "true"}, 10);
+                            execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.apn", "Public"}, 10);
+                            execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "29", "i32", "0", "i32", "1"}, 10);
+                        } else {
+                            execCommandCapture(new String[]{"/system/bin/setprop", "persist.sys.hotspot.auto", "0"}, 10);
+                            execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.subscription", "false"}, 10);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "ToggleBootAutoHotspot").start();
         }
 
         private static String updateSystemResourceBadge(long nowMs) {

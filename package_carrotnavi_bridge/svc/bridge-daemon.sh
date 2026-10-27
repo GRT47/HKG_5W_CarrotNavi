@@ -153,8 +153,16 @@ trap 'on_stop' TERM INT
 
 log_info "Service started (pid=$$)"
 
-if [ -z "$(getprop persist.sys.hotspot.auto)" ]; then
+HOTSPOT_CONF="$INSTALL_DIR/config/hotspot_auto.conf"
+if [ -f "$HOTSPOT_CONF" ]; then
+    conf_val="$(cat "$HOTSPOT_CONF" 2>/dev/null | tr -d '\r\n ')"
+    if [ "$conf_val" = "0" ] || [ "$conf_val" = "1" ]; then
+        setprop persist.sys.hotspot.auto "$conf_val"
+    fi
+elif [ -z "$(getprop persist.sys.hotspot.auto)" ]; then
     setprop persist.sys.hotspot.auto 1
+    mkdir -p "$INSTALL_DIR/config" 2>/dev/null
+    echo "1" > "$HOTSPOT_CONF" 2>/dev/null
 fi
 
 if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
@@ -194,21 +202,33 @@ WAS_SLEEP_OR_OFF=0
 while true; do
     LOOP_COUNT=$((LOOP_COUNT + 1))
 
-    # 1. Auto-Hotspot maintenance
+    # 1. Auto-Hotspot maintenance (respects dashboard checkbox config/hotspot_auto.conf and persist.sys.hotspot.auto)
+    if [ -f "$HOTSPOT_CONF" ]; then
+        conf_val="$(cat "$HOTSPOT_CONF" 2>/dev/null | tr -d '\r\n ')"
+        if [ "$conf_val" = "0" ] || [ "$conf_val" = "1" ]; then
+            if [ "$(getprop persist.sys.hotspot.auto)" != "$conf_val" ]; then
+                setprop persist.sys.hotspot.auto "$conf_val"
+            fi
+        fi
+    fi
     auto_mode="$(getprop persist.sys.hotspot.auto)"
     sub_prop="$(getprop wifi.hotspot.subscription)"
 
-    if [ "$auto_mode" != "0" ] && [ "$sub_prop" = "false" ]; then
-        log_info "Hotspot Activation turned OFF in WiFi Test -> disabling auto-hotspot"
-        setprop persist.sys.hotspot.auto 0
-        disable_hotspot
-        auto_mode="0"
-    elif [ "$auto_mode" = "0" ] && [ "$sub_prop" = "true" ]; then
-        log_info "Hotspot Activation turned ON in WiFi Test -> enabling auto-hotspot"
-        setprop persist.sys.hotspot.auto 1
-        setprop wifi.hotspot.apn Public
-        enable_hotspot
-        auto_mode="1"
+    if [ ! -f "$HOTSPOT_CONF" ]; then
+        if [ "$auto_mode" != "0" ] && [ "$sub_prop" = "false" ]; then
+            log_info "Hotspot Activation turned OFF in WiFi Test -> disabling auto-hotspot"
+            setprop persist.sys.hotspot.auto 0
+            echo "0" > "$HOTSPOT_CONF" 2>/dev/null
+            disable_hotspot
+            auto_mode="0"
+        elif [ "$auto_mode" = "0" ] && [ "$sub_prop" = "true" ]; then
+            log_info "Hotspot Activation turned ON in WiFi Test -> enabling auto-hotspot"
+            setprop persist.sys.hotspot.auto 1
+            echo "1" > "$HOTSPOT_CONF" 2>/dev/null
+            setprop wifi.hotspot.apn Public
+            enable_hotspot
+            auto_mode="1"
+        fi
     fi
 
     if [ "$auto_mode" != "0" ]; then
