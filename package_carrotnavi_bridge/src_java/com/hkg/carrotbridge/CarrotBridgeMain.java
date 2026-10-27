@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.6";
+    public static final String BRIDGE_VERSION = "1.1.7";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -1440,7 +1440,17 @@ public class CarrotBridgeMain {
     private static volatile double carrotVEgoKph = 0.0;
     private static volatile CarrotPacket latestSentPacket = null;
     private static volatile String latestTargetsStr = "[]";
-    private static volatile String lastAutoUpdateStatus = "자동 감시 중 (30분 주기)";
+    private static volatile String lastAutoUpdateStatus = "내비 켜질 때 1회 자동 확인 (콜드/웜부팅 모두 지원)";
+    private static volatile long lastWarmWakeUpdateMs = System.currentTimeMillis();
+
+    public static boolean isWarmWakeNaviOnLine(String line) {
+        if (line == null || line.isEmpty()) return false;
+        return line.contains("ACC Status Changed : 0 -> 1")
+                || line.contains("Broadcasting ACC Status (not buffering) : 1")
+                || line.contains("SCREEN_ON broadcast has arrived")
+                || line.contains("ACTION_POST_QUICKBOOT")
+                || line.contains("com.mobis.intent.ACTION_POWER_ON");
+    }
 
     // MAP button 3-press detector state
     private static final Object MAP_KEY_LOCK = new Object();
@@ -1546,15 +1556,35 @@ public class CarrotBridgeMain {
                         long streamStartMs = System.currentTimeMillis();
                         proc = new ProcessBuilder(
                                 "/system/bin/logcat", "-v", "brief",
-                                "ClusterService:D", "NavigationCluster:D", "Java_Layer:I", "BrdCast:D", "ModeKeyDispatcher:V", "*:S"
+                                "ClusterService:D", "NavigationCluster:D", "Java_Layer:I", "BrdCast:D", "ModeKeyDispatcher:V", "MicomPowerService:D", "*:S"
                         ).redirectErrorStream(true).start();
                         BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), UTF8));
                         String line;
                         while ((line = br.readLine()) != null) {
                             long nowMs = System.currentTimeMillis();
-                            if (nowMs - streamStartMs > 600L && checkMapShortcutLine(line, nowMs)) {
-                                System.out.println("[CarrotBridge] MAP 3-press detected via ModeKeyDispatcher -> toggling Status Dashboard");
-                                StatusDashboardOverlay.toggle();
+                            if (nowMs - streamStartMs > 600L) {
+                                if (checkMapShortcutLine(line, nowMs)) {
+                                    System.out.println("[CarrotBridge] MAP 3-press detected via ModeKeyDispatcher -> toggling Status Dashboard");
+                                    StatusDashboardOverlay.toggle();
+                                } else if (isWarmWakeNaviOnLine(line) && (nowMs - lastWarmWakeUpdateMs) > 60000L && !navState.isGuidanceActive()) {
+                                    lastWarmWakeUpdateMs = nowMs;
+                                    System.out.println("[CarrotBridge] Warm Wakeup / ACC ON detected -> running one-time GitHub Auto-Update check");
+                                    new Thread(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            try { Thread.sleep(8000L); } catch (InterruptedException ignored) {}
+                                            String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+                                            int rc = runAutoUpdate("GRT47", "HKG_5W_CarrotNavi", "main", installDir, false);
+                                            if (rc == 0) {
+                                                lastAutoUpdateStatus = "시동/내비 ON 확인 완료 (최신 v" + BRIDGE_VERSION + ", " + nowStr + ")";
+                                            } else if (rc == 10) {
+                                                lastAutoUpdateStatus = "시동/내비 ON 새 버전 적용 -> 재시작 (" + nowStr + ")";
+                                                try { Thread.sleep(1000L); } catch (InterruptedException ignored) {}
+                                                System.exit(0);
+                                            }
+                                        }
+                                    }, "WarmWakeAutoUpdater").start();
+                                }
                             }
                             parseLogcatLine(line, navState, traceFile);
                         }

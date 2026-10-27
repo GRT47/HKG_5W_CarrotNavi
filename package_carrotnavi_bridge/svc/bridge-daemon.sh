@@ -188,6 +188,8 @@ start_bridge_java
 
 LOOP_COUNT=0
 USB_DUMPED_SESSION=0
+NAVI_STARTUP_UPDATED=0
+WAS_SLEEP_OR_OFF=0
 
 while true; do
     LOOP_COUNT=$((LOOP_COUNT + 1))
@@ -229,9 +231,28 @@ while true; do
         USB_DUMPED_SESSION=0
     fi
 
-    # 4. GitHub Auto-Update check (~35s after boot = loop 7, and every 30 min = 360 loops)
-    if [ "$LOOP_COUNT" -eq 7 ] || [ $((LOOP_COUNT % 360)) -eq 0 ]; then
-        run_github_update_check &
+    # 4. GitHub Auto-Update ONLY once when Navigation turns ON (supports both Cold Boot & Warm Boot / ACC ON)
+    navi_status="$(getprop sys.hkmc.navistatus)"
+    lcd_disable="$(getprop tcc.hwc.lcd.disable)"
+    show_screen="$(getprop sys.boot.show_screen)"
+
+    if [ "$lcd_disable" = "1" ] || [ "$show_screen" = "false" ] || { [ -n "$navi_status" ] && [ "$navi_status" != "3" ] && [ "$NAVI_STARTUP_UPDATED" = "1" ]; }; then
+        WAS_SLEEP_OR_OFF=1
+    fi
+
+    if [ "$lcd_disable" != "1" ] && [ "$show_screen" != "false" ]; then
+        if [ "$NAVI_STARTUP_UPDATED" = "0" ]; then
+            if [ "$navi_status" = "3" ] || [ "$LOOP_COUNT" -ge 7 ]; then
+                NAVI_STARTUP_UPDATED=1
+                WAS_SLEEP_OR_OFF=0
+                log_info "Navigation ON (Cold Boot, navistatus=${navi_status}) -> running one-time GitHub Auto-Update"
+                run_github_update_check &
+            fi
+        elif [ "$WAS_SLEEP_OR_OFF" = "1" ] && [ "$navi_status" = "3" ]; then
+            WAS_SLEEP_OR_OFF=0
+            log_info "Navigation ON (Warm Wakeup / ACC ON, navistatus=${navi_status}) -> running one-time GitHub Auto-Update"
+            run_github_update_check &
+        fi
     fi
 
     sleep 5 &
