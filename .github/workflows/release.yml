@@ -1,42 +1,49 @@
-name: Build & Publish CarrotBridge Release
+name: Build and Publish Release
 
 on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-release:
+  release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
+      - name: Build DEX JAR and USB Package from source
+        run: |
+          python3 package_carrotnavi_bridge/build_package.py
+          ls -lh package_carrotnavi_bridge/build/carrotbridge.jar package_carrotnavi_bridge/build/carrotbridge.jar.sha256 HKG_5W_CarrotNavi_USB.zip
+          cat package_carrotnavi_bridge/build/carrotbridge.jar.sha256
 
-      - name: Set up Android SDK Build-Tools (d8)
-        uses: android-actions/setup-android@v3
-
-      - name: Build CarrotNavi Bridge DEX & USB Bundle
-        run: python3 package_carrotnavi_bridge/build_package.py
-
-      - name: Publish to Latest GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: "HKG 5W CarrotNavi Bridge (Latest Auto-Update Build)"
-          body: "Automated build from main branch."
-          prerelease: false
-          make_latest: true
-          files: |
-            package_carrotnavi_bridge/build/carrotbridge.jar
-            package_carrotnavi_bridge/build/carrotbridge.jar.sha256
-            HKG_5W_CarrotNavi_USB.zip
+      - name: Publish GitHub Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER=$(python3 -c "import json; print(json.load(open('version.json'))['version'])")
+          TAG="v${VER}"
+          echo "Publishing release ${TAG}..."
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" \
+              package_carrotnavi_bridge/build/carrotbridge.jar \
+              package_carrotnavi_bridge/build/carrotbridge.jar.sha256 \
+              HKG_5W_CarrotNavi_USB.zip \
+              --clobber
+            gh release edit "${TAG}" --latest
+          else
+            gh release create "${TAG}" \
+              package_carrotnavi_bridge/build/carrotbridge.jar \
+              package_carrotnavi_bridge/build/carrotbridge.jar.sha256 \
+              HKG_5W_CarrotNavi_USB.zip \
+              --title "HKG 5W CarrotNavi Bridge ${TAG}" \
+              --notes "Automated build and release of ${TAG} from pure source." \
+              --latest
+          fi

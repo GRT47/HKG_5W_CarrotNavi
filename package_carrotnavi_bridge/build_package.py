@@ -57,6 +57,7 @@ def find_d8() -> str:
         os.environ.get("ANDROID_HOME", ""),
         os.environ.get("ANDROID_SDK_ROOT", ""),
         os.path.expanduser(r"~\AppData\Local\Android\Sdk"),
+        "/usr/local/lib/android/sdk",
         "/usr/lib/android-sdk",
     ]
     for root in sdk_roots:
@@ -160,7 +161,9 @@ def build() -> None:
 
     jar_path = BUILD_DIR / "carrotbridge.jar"
     with zipfile.ZipFile(jar_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.write(classes_dex, "classes.dex")
+        zinfo = zipfile.ZipInfo("classes.dex", date_time=(2026, 1, 1, 0, 0, 0))
+        zinfo.compress_type = zipfile.ZIP_DEFLATED
+        zf.writestr(zinfo, dex_bytes)
 
     jar_sha = sha256_bytes(jar_path.read_bytes())
     (BUILD_DIR / "carrotbridge.jar.sha256").write_bytes(f"{jar_sha}  carrotbridge.jar\n".encode("utf-8"))

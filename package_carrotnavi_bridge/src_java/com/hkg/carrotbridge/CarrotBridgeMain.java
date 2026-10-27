@@ -2016,9 +2016,11 @@ public class CarrotBridgeMain {
                 byte[] localBytes = readAllBytes(new FileInputStream(localVerFile));
                 localVersion = extractJsonString(new String(localBytes, UTF8), "version");
             }
+            File jarFile = new File(installDir, "bin/carrotbridge.jar");
+            boolean jarNeedsUpdate = !jarFile.exists() || !remoteVersion.equals(BRIDGE_VERSION);
 
-            System.out.println("[AutoUpdate] Local version=" + localVersion + ", Remote version=" + remoteVersion);
-            if (!force && remoteVersion.equals(localVersion)) {
+            System.out.println("[AutoUpdate] Local version=" + localVersion + " (jar=" + BRIDGE_VERSION + "), Remote version=" + remoteVersion);
+            if (!force && remoteVersion.equals(localVersion) && !jarNeedsUpdate) {
                 System.out.println("[AutoUpdate] Already up to date.");
                 return 0;
             }
@@ -2032,6 +2034,12 @@ public class CarrotBridgeMain {
                 String remotePath = m.group(2);
                 String expectedSha = m.group(3).toLowerCase(Locale.US);
 
+                File targetFile = new File(installDir, relTarget);
+                String currentSha = targetFile.exists() ? sha256Hex(readAllBytes(new FileInputStream(targetFile))) : "";
+                if (!force && expectedSha.equals(currentSha)) {
+                    continue;
+                }
+
                 String fileUrl = remotePath.startsWith("https://") ? remotePath : (baseUrl + "/" + remotePath);
                 byte[] fileBytes = httpsDownloadWithTls12(fileUrl, 5);
                 String actualSha = sha256Hex(fileBytes);
@@ -2039,13 +2047,12 @@ public class CarrotBridgeMain {
                     throw new IOException("SHA-256 mismatch for " + relTarget + ": expected=" + expectedSha + " actual=" + actualSha);
                 }
 
-                File targetFile = new File(installDir, relTarget);
                 backupAndWriteAtomic(targetFile, fileBytes);
                 updatedCount++;
                 System.out.println("[AutoUpdate] Updated " + relTarget + " (sha256=" + actualSha.substring(0, 12) + "...)");
             }
 
-            // 2. Check optional release JAR (carrotbridge.jar + carrotbridge.jar.sha256)
+            // 2. Check release JAR (carrotbridge.jar + carrotbridge.jar.sha256)
             String releaseJarUrl = extractJsonString(verJson, "release_jar_url");
             String releaseShaUrl = extractJsonString(verJson, "release_jar_sha256_url");
             if (!releaseJarUrl.isEmpty() && !releaseShaUrl.isEmpty()) {
@@ -2053,9 +2060,8 @@ public class CarrotBridgeMain {
                     byte[] shaBytes = httpsDownloadWithTls12(releaseShaUrl, 5);
                     String expectedJarSha = new String(shaBytes, UTF8).trim().split("\\s+")[0].toLowerCase(Locale.US);
                     if (expectedJarSha.length() == 64) {
-                        File jarFile = new File(installDir, "bin/carrotbridge.jar");
                         String currentJarSha = jarFile.exists() ? sha256Hex(readAllBytes(new FileInputStream(jarFile))) : "";
-                        if (!expectedJarSha.equals(currentJarSha)) {
+                        if (force || !expectedJarSha.equals(currentJarSha)) {
                             byte[] jarBytes = httpsDownloadWithTls12(releaseJarUrl, 5);
                             String actualJarSha = sha256Hex(jarBytes);
                             if (!actualJarSha.equals(expectedJarSha)) {
@@ -2067,7 +2073,11 @@ public class CarrotBridgeMain {
                         }
                     }
                 } catch (Exception jarEx) {
-                    System.out.println("[AutoUpdate] Release JAR check skipped/failed: " + jarEx.getMessage());
+                    System.out.println("[AutoUpdate] Release JAR check failed: " + jarEx.getMessage());
+                    if (jarNeedsUpdate) {
+                        // Do not mark local version.json as up-to-date if the required JAR update failed
+                        return 1;
+                    }
                 }
             }
 
