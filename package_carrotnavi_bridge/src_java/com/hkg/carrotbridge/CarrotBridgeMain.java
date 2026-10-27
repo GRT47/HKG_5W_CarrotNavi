@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.0";
+    public static final String BRIDGE_VERSION = "1.2.1";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -1440,7 +1440,7 @@ public class CarrotBridgeMain {
     private static volatile double carrotVEgoKph = 0.0;
     private static volatile CarrotPacket latestSentPacket = null;
     private static volatile String latestTargetsStr = "[]";
-    private static volatile String lastAutoUpdateStatus = "내비 켜질 때 1회 자동 확인 (콜드/웜부팅 모두 지원)";
+    private static volatile String lastAutoUpdateStatus = "내비 켜질 때 1회 자동 확인 (대기 중)";
     private static volatile long lastWarmWakeUpdateMs = System.currentTimeMillis();
 
     public static boolean isWarmWakeNaviOnLine(String line) {
@@ -2026,6 +2026,8 @@ public class CarrotBridgeMain {
     }
 
     public static int runAutoUpdate(String owner, String repo, String branch, String installDir, boolean force) {
+        String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+        File statusNoteFile = new File(installDir, "config/last_update_status.txt");
         try {
             String baseUrl = "https://raw.githubusercontent.com/" + owner + "/" + repo + "/" + branch;
             String verUrl = baseUrl + "/version.json";
@@ -2052,6 +2054,9 @@ public class CarrotBridgeMain {
             System.out.println("[AutoUpdate] Local version=" + localVersion + " (jar=" + BRIDGE_VERSION + "), Remote version=" + remoteVersion);
             if (!force && remoteVersion.equals(localVersion) && !jarNeedsUpdate) {
                 System.out.println("[AutoUpdate] Already up to date.");
+                String msg = "최신 버전 유지 중 (v" + BRIDGE_VERSION + ", 내비ON 확인: " + nowStr + ")";
+                lastAutoUpdateStatus = msg;
+                try { writeBytesAtomic(statusNoteFile, (msg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
                 return 0;
             }
 
@@ -2113,9 +2118,17 @@ public class CarrotBridgeMain {
 
             writeBytesAtomic(localVerFile, verBytes);
             System.out.println("[AutoUpdate] Update completed successfully (" + updatedCount + " files updated to v" + remoteVersion + ").");
+            String doneMsg = updatedCount > 0
+                    ? ("새 버전(v" + remoteVersion + ") 업데이트 완료 (" + nowStr + ")")
+                    : ("최신 버전 유지 중 (v" + remoteVersion + ", 내비ON 확인: " + nowStr + ")");
+            lastAutoUpdateStatus = doneMsg;
+            try { writeBytesAtomic(statusNoteFile, (doneMsg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
             return updatedCount > 0 ? 10 : 0; // 10 signals caller to restart daemon
         } catch (Exception e) {
             System.out.println("[AutoUpdate] Error: " + e.getMessage());
+            String errMsg = "내비 켜질 때 1회 자동 확인 (최근 확인 실패: " + nowStr + ")";
+            lastAutoUpdateStatus = errMsg;
+            try { writeBytesAtomic(statusNoteFile, (errMsg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
             return 1;
         }
     }
@@ -2713,6 +2726,18 @@ public class CarrotBridgeMain {
                         ? ("연결됨 (" + discoveredCarrotIp + " | 차속: " + String.format(Locale.US, "%.1f", carrotVEgoKph) + " km/h)")
                         : (discoveredCarrotIp.isEmpty() ? "브로드캐스트 송출 중 (192.168.0.255:7706)" : "최근 IP: " + discoveredCarrotIp + " (대기 중)");
 
+                String autoUpdText = lastAutoUpdateStatus;
+                try {
+                    File updNote = new File(installDir, "config/last_update_status.txt");
+                    if (updNote.isFile()) {
+                        String fromDisk = readFirstLineQuick(updNote);
+                        if (fromDisk != null && !fromDisk.isEmpty()) {
+                            autoUpdText = fromDisk;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+
                 long pktIdx = pkt != null ? pkt.carrotIndex : 0L;
                 StringBuilder leftSb = new StringBuilder(512);
                 leftSb.append("• 패키지 버전 : v").append(BRIDGE_VERSION).append(" (HKG_5W_CarrotNavi)\n");
@@ -2720,7 +2745,7 @@ public class CarrotBridgeMain {
                 leftSb.append("• Wi-Fi 핫스팟 : ").append(hotspotStr).append("\n");
                 leftSb.append("• 콤마(캐럿) 기기 : ").append(commaStr).append("\n");
                 leftSb.append("• 패킷 타겟 IP : ").append(latestTargetsStr).append("\n");
-                leftSb.append("• 자동 업데이트 : ").append(lastAutoUpdateStatus);
+                leftSb.append("• 자동 업데이트 : ").append(autoUpdText);
 
                 StringBuilder rightSb = new StringBuilder(512);
                 if (pkt != null) {
