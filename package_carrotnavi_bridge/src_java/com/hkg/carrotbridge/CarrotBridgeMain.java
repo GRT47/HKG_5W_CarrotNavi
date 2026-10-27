@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.5";
+    public static final String BRIDGE_VERSION = "1.1.6";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -156,11 +156,11 @@ public class CarrotBridgeMain {
         public long lastUpdateMs = System.currentTimeMillis();
 
         public synchronized boolean isGuidanceActive() {
-            if (bGuid || setDestStatus == 1 || operationStatus == 1) {
+            if (bGuid || setDestStatus == 1 || operationStatus == 1 || remainDistM > 0) {
                 if (displayTypeCode != 8 && displayTypeCode != 0 && displayTypeCode != 1) {
                     return true;
                 }
-                return bGuid || setDestStatus == 1;
+                return bGuid || setDestStatus == 1 || remainDistM > 0;
             }
             return displayTypeCode != 8 && displayTypeCode != 0 && displayTypeCode != 1
                     && displayTypeCode != 6 && displayTypeCode != 7;
@@ -349,6 +349,7 @@ public class CarrotBridgeMain {
                     st.cameraSafetyAlert = parseIntSafe(mTail.group(1), 0);
                 }
                 if (st.fixedSpeed == 0 && st.mobileSpeed == 0 && st.redlineSpeed == 0
+                        && st.speedInfoType == 0 && st.cameraSafetyAlert == 0
                         && st.warningZone == 0 && st.nonSpeed == 0) {
                     st.camWarnDistM = 0;
                 }
@@ -413,14 +414,24 @@ public class CarrotBridgeMain {
                 }
             }
             // 4. NaviCluster.updateNaviWarnDist()
+            // Note: 2-arg updateNaviWarnDist logs 4 separate lines (warnDistOverDec / unit1 / popupInfo / popupDistScale).
+            // Only parse the first line containing warnDistOverDec or overDec so trailing lines don't overwrite camWarnDistM with 0.
             else if (line.contains("updateNaviWarnDist()")) {
-                interestingForTrace = true;
                 Map<String, Integer> kv = extractIntMap(line);
-                int overDec = kv.containsKey("overDec") ? kv.get("overDec") : 0;
-                int underDec = kv.containsKey("underDec") ? kv.get("underDec") : 0;
-                int scale = kv.containsKey("scale") ? kv.get("scale") : 0;
-                st.camWarnDistM = convertDistToMeters(overDec, underDec, scale, false);
-                st.lastCamWarnDistMs = System.currentTimeMillis();
+                if (kv.containsKey("warnDistOverDec") || kv.containsKey("overDec")) {
+                    interestingForTrace = true;
+                    int overDec = kv.containsKey("warnDistOverDec") ? kv.get("warnDistOverDec") : kv.get("overDec");
+                    int underDec = kv.containsKey("warnDistUnderDec") ? kv.get("warnDistUnderDec")
+                            : (kv.containsKey("underDec") ? kv.get("underDec") : 0);
+                    int scale = kv.containsKey("warnDistScale") ? kv.get("warnDistScale")
+                            : (kv.containsKey("scale") ? kv.get("scale") : 0);
+                    if (overDec < 0 || overDec >= 65535 || scale < 0 || scale >= 15) {
+                        st.camWarnDistM = 0;
+                    } else {
+                        st.camWarnDistM = convertDistToMeters(overDec, underDec, scale, false);
+                        st.lastCamWarnDistMs = System.currentTimeMillis();
+                    }
+                }
             }
             // 5. NaviCluster.updateRemainDis() (Bar-graph countdown distance to next turn: scale_unit 0=m, 1=km)
             else if (line.contains("updateRemainDis()")) {
@@ -484,6 +495,9 @@ public class CarrotBridgeMain {
                 int unit = extractIntAfter(line, "unit:", 15);
                 if (distVal >= 0.0 && unit >= 0 && unit < 15) {
                     st.remainDistM = convertFloatDistToMeters(distVal, unit, false);
+                } else if (unit == 15) {
+                    st.remainDistM = 0;
+                    st.remainTimeSec = 0;
                 }
             }
             // 10. ClusterService: updateTPCrossroadName()::crossroadname is ...
@@ -585,8 +599,13 @@ public class CarrotBridgeMain {
             }
         } else if (line.contains("[IL TBT Sub Info - 0x4D] Distance To Destination =")) {
             String val = substringAfter(line, "Distance To Destination =").trim();
-            int d = parseDistanceWithUnitText(val);
-            if (d >= 0) st.remainDistM = d;
+            if (val.contains("Invalid") || val.contains("None")) {
+                st.remainDistM = 0;
+                st.remainTimeSec = 0;
+            } else {
+                int d = parseDistanceWithUnitText(val);
+                if (d >= 0) st.remainDistM = d;
+            }
         } else if (line.contains("[IL TBT Sub Info - 0x4D] Compass =")) {
             String val = substringAfter(line, "Compass =").trim();
             double deg = parseLeadingDouble(val, -1.0);
@@ -778,30 +797,30 @@ public class CarrotBridgeMain {
             pkt.nRoadLimitSpeed = st.nRoadLimitSpeed > 0 ? st.nRoadLimitSpeed : 30;
             pkt.roadcate = st.roadcate;
 
-            // 1. Determine camera distance (prefer updateNaviWarnDist overDec, fallback to nextCamDist, fallback to barGraph)
+            // 1. Determine camera distance (prefer updateNaviWarnDist warnDistOverDec/overDec, fallback to nextCamDist)
+            // Note: trapBarGraph (barGraphLevel in updateTBTTrapInfo) is TBT_BarGraph100Level for turns, NOT camera distance.
             int camDist = st.camWarnDistM;
             if (camDist <= 0 && st.nextCamDist > 0 && st.nextCamDist < 1023) {
                 camDist = st.nextCamDist;
             }
-            if (camDist <= 0 && st.trapBarGraph > 0 && st.trapBarGraph <= 100) {
-                camDist = Math.max(30, (100 - st.trapBarGraph) * 5);
-            }
 
+            int gen5wCamLimit = st.trapSpeedLimit > 0 ? st.trapSpeedLimit
+                    : (st.slifSpeedLimit > 0 ? st.slifSpeedLimit : pkt.nRoadLimitSpeed);
             boolean isSchoolZone = (st.warningZone == 2 || st.warningZone2 == 2);
             boolean isSpeedBump = (st.warningZone == 8 || st.warningZone == 15 || st.warningZone == 128
                     || st.warningZone2 == 8 || st.warningZone2 == 15 || st.warningZone2 == 128);
             boolean isSectionActive = (st.rangeCamInfo > 0 && st.rangeCamInfo < 7 && st.rangeCamDist > 0 && st.rangeCamDist < 65535)
-                    || (st.speedInfoType == 4 && st.fixedSpeed > 0);
+                    || ((st.speedInfoType == 4 || st.cameraSafetyAlert == 4) && (st.fixedSpeed > 0 || st.trapSpeedLimit > 0));
             boolean isRearCamera = (st.nonSpeed == 7 || st.nonSpeed == 64 || st.nonSpeed == 31);
 
             int avgSpd = st.rangeCamAvgMovingSpd > 0 ? st.rangeCamAvgMovingSpd : st.stdPosRangeAvgSpeed;
             if (avgSpd >= 255) avgSpd = 0;
 
-            // 2. Primary SDI mapping (7 items)
+            // 2. Primary SDI mapping (7 items, supporting both legacy fixedSpeed/redlineSpeed/mobileSpeed and Gen5W speedInfoType/cameraSafetyAlert/speedLimit)
             if (isSectionActive) {
                 // Item 4 & 5: Section speed enforcement + average vehicle speed
                 int secLimit = st.rangeCamSpdLimit > 0 ? st.rangeCamSpdLimit
-                        : (st.fixedSpeed > 0 ? st.fixedSpeed : pkt.nRoadLimitSpeed);
+                        : (st.fixedSpeed > 0 ? st.fixedSpeed : gen5wCamLimit);
                 int secDist = (st.rangeCamDist > 0 && st.rangeCamDist < 65535) ? st.rangeCamDist : Math.max(camDist, 100);
                 pkt.nSdiType = 4;
                 pkt.nSdiSpeedLimit = secLimit;
@@ -826,6 +845,21 @@ public class CarrotBridgeMain {
                 pkt.nSdiType = 7;
                 pkt.nSdiSpeedLimit = st.mobileSpeed;
                 pkt.nSdiDist = Math.max(camDist, 50);
+            } else if ((st.speedInfoType == 5 || st.cameraSafetyAlert == 3) && gen5wCamLimit > 0) {
+                // Gen5W Signal + Speed Camera (speedInfoType: 5, cameraSafetyAlert3, speedLimit: 50/60/70...)
+                pkt.nSdiType = isRearCamera ? 76 : 0;
+                pkt.nSdiSpeedLimit = gen5wCamLimit;
+                pkt.nSdiDist = camDist > 0 ? camDist : 50;
+            } else if ((st.speedInfoType == 1 || st.cameraSafetyAlert == 1) && gen5wCamLimit > 0) {
+                // Gen5W Fixed Speed Camera (speedInfoType: 1, cameraSafetyAlert1, speedLimit: 30/50/60...)
+                pkt.nSdiType = isRearCamera ? 75 : 1;
+                pkt.nSdiSpeedLimit = gen5wCamLimit;
+                pkt.nSdiDist = camDist > 0 ? camDist : 50;
+            } else if ((st.speedInfoType == 2 || st.speedInfoType == 3 || st.cameraSafetyAlert == 2) && gen5wCamLimit > 0) {
+                // Gen5W Mobile / Box Speed Camera (speedInfoType: 2/3, cameraSafetyAlert2)
+                pkt.nSdiType = 7;
+                pkt.nSdiSpeedLimit = gen5wCamLimit;
+                pkt.nSdiDist = camDist > 0 ? camDist : 50;
             } else if (st.nextCamType > 0 && st.nextCamType < 15 && st.nextCamSpdLimit > 0 && st.nextCamDist > 0 && st.nextCamDist < 1023) {
                 // Fallback from ADAS SCC_HU_Navi_P
                 pkt.nSdiType = (st.nextCamType == 2) ? 7 : 1;
@@ -2869,7 +2903,8 @@ public class CarrotBridgeMain {
 
     public static String describeSdiType(int sdiType) {
         switch (sdiType) {
-            case 0: return "없음(0)";
+            case -1: return "없음";
+            case 0: return "신호+과속 카메라(0)";
             case 1: return "고정식 과속카메라(1)";
             case 2: return "가변형 단속카메라(2)";
             case 3: return "신호+과속 카메라(3)";
@@ -2882,6 +2917,8 @@ public class CarrotBridgeMain {
             case 21: return "급커브 주의구간(21)";
             case 22: return "과속방지턱(22)";
             case 66: return "합류도로 주의(66)";
+            case 75: return "후면 과속카메라(75)";
+            case 76: return "후면 신호+과속카메라(76)";
             default: return "기타안전구간(" + sdiType + ")";
         }
     }
@@ -2972,6 +3009,36 @@ public class CarrotBridgeMain {
         }
         if (realPkt.nTBTTurnType != 12 || realPkt.nTBTDist != 110 || !"평촌지북로".equals(realPkt.szTBTMainText) || realPkt.nGoPosDist != 2700) {
             throw new AssertionError("Real-vehicle TBT hex DisplayType/UTF-16LI/remainDis mismatch: " + realPkt.toJson());
+        }
+
+        // 1c. Test Gen5W real-vehicle speed camera encoding (fixedSpeed=0, speedInfoType=1/5, cameraSafetyAlert1/3, 4-line updateNaviWarnDist)
+        parseLogcatLine("D/ClusterService(  554): NaviCluster.updateTBTTrapInfo() fixedSpeed: 0 mobileSpeed: 0 overSpeedAlarm: 0 redlineSpeed: 0 nonSpeed: 0 warningZone: 0 curveWarning: 0 mergeWarning: 0 tollGateCurrency: 0 tollGate: 0 displayTG: 0 barGraphLevel: 0 speedLimit: 50 busSpeed: 0 speedLimitType: 0 speedLimitUnit: 1 speedInfoType: 1 warningZone2: 0 warningZone3: 0 warningZone4: 0 displayCountry: 1cameraSafetyAlert1", stReal, null);
+        parseLogcatLine("D/ClusterService(  554): NaviCluster.updateNaviWarnDist() warnDistOverDec: 290 warnDistUnderDec: 0 warnDistScale: 0", stReal, null);
+        parseLogcatLine("D/ClusterService(  554): NaviCluster.updateNaviWarnDist() unit1: 15 unit2: 15 unit3: 15", stReal, null);
+        parseLogcatLine("D/ClusterService(  554): NaviCluster.updateNaviWarnDist() popupInfo: 0 popupDistOverDec: 65535 popupDistUnderDec: 15", stReal, null);
+        parseLogcatLine("D/ClusterService(  554): NaviCluster.updateNaviWarnDist() popupDistScale: 15", stReal, null);
+        // Subsequent updateTBTTrapInfo must not wipe camWarnDistM while speedInfoType/cameraSafetyAlert is active
+        parseLogcatLine("D/ClusterService(  554): NaviCluster.updateTBTTrapInfo() fixedSpeed: 0 mobileSpeed: 0 overSpeedAlarm: 0 redlineSpeed: 0 nonSpeed: 0 warningZone: 0 curveWarning: 0 mergeWarning: 0 tollGateCurrency: 0 tollGate: 0 displayTG: 0 barGraphLevel: 0 speedLimit: 50 busSpeed: 0 speedLimitType: 0 speedLimitUnit: 1 speedInfoType: 1 warningZone2: 0 warningZone3: 0 warningZone4: 0 displayCountry: 1cameraSafetyAlert1", stReal, null);
+        CarrotPacket cam1Pkt = buildCarrotPacket(stReal);
+        if (cam1Pkt.nSdiType != 1 || cam1Pkt.nSdiSpeedLimit != 50 || cam1Pkt.nSdiDist != 290) {
+            throw new AssertionError("Gen5W 50km/h fixed camera mismatch: " + cam1Pkt.toJson());
+        }
+
+        // Gen5W 70km/h Signal + Speed camera (speedInfoType=5, cameraSafetyAlert3)
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateTBTTrapInfo() fixedSpeed: 0 mobileSpeed: 0 overSpeedAlarm: 1 redlineSpeed: 0 nonSpeed: 0 warningZone: 0 curveWarning: 0 mergeWarning: 0 tollGateCurrency: 0 tollGate: 0 displayTG: 0 barGraphLevel: 0 speedLimit: 70 busSpeed: 0 speedLimitType: 0 speedLimitUnit: 1 speedInfoType: 5 warningZone2: 0 warningZone3: 0 warningZone4: 0 displayCountry: 1cameraSafetyAlert3", stReal, null);
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateNaviWarnDist() warnDistOverDec: 160 warnDistUnderDec: 0 warnDistScale: 0", stReal, null);
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateNaviWarnDist() unit1: 15 unit2: 15 unit3: 15", stReal, null);
+        CarrotPacket cam4Pkt = buildCarrotPacket(stReal);
+        if (cam4Pkt.nSdiType != 0 || cam4Pkt.nSdiSpeedLimit != 70 || cam4Pkt.nSdiDist != 160) {
+            throw new AssertionError("Gen5W 70km/h signal+speed camera mismatch: " + cam4Pkt.toJson());
+        }
+
+        // Passing the camera (speedInfoType=0, cameraSafetyAlert0, warnDistOverDec=65535)
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateTBTTrapInfo() fixedSpeed: 0 mobileSpeed: 0 overSpeedAlarm: 3 redlineSpeed: 0 nonSpeed: 0 warningZone: 0 curveWarning: 0 mergeWarning: 0 tollGateCurrency: 0 tollGate: 0 displayTG: 0 barGraphLevel: 0 speedLimit: 0 busSpeed: 0 speedLimitType: 3 speedLimitUnit: 3 speedInfoType: 0 warningZone2: 0 warningZone3: 0 warningZone4: 0 displayCountry: 1cameraSafetyAlert0", stReal, null);
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateNaviWarnDist() warnDistOverDec: 65535 warnDistUnderDec: 15 warnDistScale: 15", stReal, null);
+        CarrotPacket camClearPkt = buildCarrotPacket(stReal);
+        if (camClearPkt.nSdiType != -1 || camClearPkt.nSdiSpeedLimit != 0 || camClearPkt.nSdiDist != -1) {
+            throw new AssertionError("Gen5W camera clear mismatch: " + camClearPkt.toJson());
         }
 
         // 2. Test Section Control + Average Speed
