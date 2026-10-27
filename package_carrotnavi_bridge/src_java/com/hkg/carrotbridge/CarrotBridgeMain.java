@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.1.4";
+    public static final String BRIDGE_VERSION = "1.1.5";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -121,6 +121,7 @@ public class CarrotBridgeMain {
         public int displayTypeCode = 8;
         public double tbtDirectionDeg = 0.0;
         public int tbtDistM = 0;
+        public int remainTurnDistM = 0;
         public int tbtBarGraph = -1;
 
         public int sccNextTurnType1 = 0;
@@ -361,20 +362,45 @@ public class CarrotBridgeMain {
                 if (kv.containsKey("offRouteStatus")) st.offRouteStatus = kv.get("offRouteStatus");
                 if (kv.containsKey("naviValidity")) st.naviValidity = kv.get("naviValidity");
                 if (kv.containsKey("nextTurnType1")) st.sccNextTurnType1 = kv.get("nextTurnType1");
-                if (kv.containsKey("nextTurnDist1")) st.sccNextTurnDist1 = kv.get("nextTurnDist1");
+                if (kv.containsKey("nextTurnDist1")) {
+                    int d1 = kv.get("nextTurnDist1");
+                    st.sccNextTurnDist1 = (d1 < 0 || d1 >= 4095) ? 0 : d1;
+                }
                 if (kv.containsKey("nextTurnType2")) st.sccNextTurnType2 = kv.get("nextTurnType2");
-                if (kv.containsKey("nextTurnDist2")) st.sccNextTurnDist2 = kv.get("nextTurnDist2");
+                if (kv.containsKey("nextTurnDist2")) {
+                    int d2 = kv.get("nextTurnDist2");
+                    st.sccNextTurnDist2 = (d2 < 0 || d2 >= 4095) ? 0 : d2;
+                }
                 if (kv.containsKey("curLinkCntLane")) st.numLanes = kv.get("curLinkCntLane");
                 if (kv.containsKey("curRoadClass")) {
                     st.curRoadClass = kv.get("curRoadClass");
                     updateRoadCateFromClassLocked(st, st.curRoadClass);
                 }
-                if (kv.containsKey("nextCamType")) st.nextCamType = kv.get("nextCamType");
-                if (kv.containsKey("nextCamDist")) st.nextCamDist = kv.get("nextCamDist");
-                if (kv.containsKey("nextCamSpdLimit")) st.nextCamSpdLimit = normalizeTrapSpeed(kv.get("nextCamSpdLimit"));
-                if (kv.containsKey("rangeCamInfo")) st.rangeCamInfo = kv.get("rangeCamInfo");
-                if (kv.containsKey("rangeCamDist")) st.rangeCamDist = kv.get("rangeCamDist");
-                if (kv.containsKey("rangeCamSpdLimit")) st.rangeCamSpdLimit = normalizeTrapSpeed(kv.get("rangeCamSpdLimit"));
+                // Filter out all-1s bitfield invalid sentinels (nextCamType=15, nextCamDist=1023, nextCamSpdLimit=15, rangeCamInfo=7, rangeCamDist=65535)
+                if (kv.containsKey("nextCamType")) {
+                    int ct = kv.get("nextCamType");
+                    st.nextCamType = (ct < 0 || ct >= 15) ? 0 : ct;
+                }
+                if (kv.containsKey("nextCamDist")) {
+                    int cd = kv.get("nextCamDist");
+                    st.nextCamDist = (cd < 0 || cd >= 1023) ? 0 : cd;
+                }
+                if (kv.containsKey("nextCamSpdLimit")) {
+                    int cs = kv.get("nextCamSpdLimit");
+                    st.nextCamSpdLimit = (cs == 15) ? 0 : normalizeTrapSpeed(cs);
+                }
+                if (kv.containsKey("rangeCamInfo")) {
+                    int ri = kv.get("rangeCamInfo");
+                    st.rangeCamInfo = (ri < 0 || ri >= 7) ? 0 : ri;
+                }
+                if (kv.containsKey("rangeCamDist")) {
+                    int rd = kv.get("rangeCamDist");
+                    st.rangeCamDist = (rd < 0 || rd >= 65535) ? 0 : rd;
+                }
+                if (kv.containsKey("rangeCamSpdLimit")) {
+                    int rs = kv.get("rangeCamSpdLimit");
+                    st.rangeCamSpdLimit = (rs == 15) ? 0 : normalizeTrapSpeed(rs);
+                }
                 if (kv.containsKey("rangeCamAvgMovingSpd")) st.rangeCamAvgMovingSpd = kv.get("rangeCamAvgMovingSpd");
             }
             // 3. NaviCluster.updateSTD_POS_P_Info()
@@ -396,30 +422,30 @@ public class CarrotBridgeMain {
                 st.camWarnDistM = convertDistToMeters(overDec, underDec, scale, false);
                 st.lastCamWarnDistMs = System.currentTimeMillis();
             }
-            // 5. NaviCluster.updateRemainDis()
+            // 5. NaviCluster.updateRemainDis() (Bar-graph countdown distance to next turn: scale_unit 0=m, 1=km)
             else if (line.contains("updateRemainDis()")) {
                 interestingForTrace = true;
                 Map<String, Integer> kv = extractIntMap(line);
                 int rem = kv.containsKey("remained_distance") ? kv.get("remained_distance") : 0;
                 int under = kv.containsKey("under_decimal") ? kv.get("under_decimal") : 0;
-                int unit = kv.containsKey("scale_unit") ? kv.get("scale_unit") : 1;
-                if (rem >= 0 && rem < 65535 && unit != 0 && unit != 15) {
-                    st.remainDistM = convertDistToMeters(rem, under, unit, true);
+                int unit = kv.containsKey("scale_unit") ? kv.get("scale_unit") : 0;
+                if (rem >= 0 && rem < 65535 && unit >= 0 && unit < 15) {
+                    st.remainTurnDistM = convertDistToMeters(rem, under, unit, false);
                 }
             }
-            // 6. NaviCluster.updateTBTSubInfo2C()
+            // 6. NaviCluster.updateTBTSubInfo2C() (unit: 0=m, 1=km, 15=invalid)
             else if (line.contains("updateTBTSubInfo2C()")) {
                 interestingForTrace = true;
                 Map<String, Integer> kv = extractIntMap(line);
-                int u1 = kv.containsKey("distToPoint1_unit") ? kv.get("distToPoint1_unit") : 0;
+                int u1 = kv.containsKey("distToPoint1_unit") ? kv.get("distToPoint1_unit") : 15;
                 int i1 = kv.containsKey("distToPoint1_I") ? kv.get("distToPoint1_I") : 0;
                 int f1 = kv.containsKey("distToPoint1_F") ? kv.get("distToPoint1_F") : 0;
-                st.subInfo2Dist1M = (u1 == 0 || u1 == 15 || i1 >= 65535) ? 0 : convertDistToMeters(i1, f1, u1, true);
+                st.subInfo2Dist1M = (u1 < 0 || u1 >= 15 || i1 >= 65535) ? 0 : convertDistToMeters(i1, f1, u1, false);
 
-                int u2 = kv.containsKey("distToPoint2_unit") ? kv.get("distToPoint2_unit") : 0;
+                int u2 = kv.containsKey("distToPoint2_unit") ? kv.get("distToPoint2_unit") : 15;
                 int i2 = kv.containsKey("distToPoint2_I") ? kv.get("distToPoint2_I") : 0;
                 int f2 = kv.containsKey("distToPoint2_F") ? kv.get("distToPoint2_F") : 0;
-                st.subInfo2Dist2M = (u2 == 0 || u2 == 15 || i2 >= 65535) ? 0 : convertDistToMeters(i2, f2, u2, true);
+                st.subInfo2Dist2M = (u2 < 0 || u2 >= 15 || i2 >= 65535) ? 0 : convertDistToMeters(i2, f2, u2, false);
             }
             // 7. NaviCluster.updateSLIFNaviInformation()
             else if (line.contains("updateSLIFNaviInformation()")) {
@@ -451,13 +477,13 @@ public class CarrotBridgeMain {
                     }
                 }
             }
-            // 9. NavigationCluster: updateTBTSubInfo() distance: 12.4 unit: 2
+            // 9. NavigationCluster: updateTBTSubInfo() distance: 2.7 unit: 1 (0=m, 1=km, 15=invalid)
             else if (line.contains("updateTBTSubInfo()")) {
                 interestingForTrace = true;
                 double distVal = extractDoubleAfter(line, "distance:");
-                int unit = extractIntAfter(line, "unit:", 0);
-                if (distVal >= 0.0 && unit > 0 && unit != 15) {
-                    st.remainDistM = convertFloatDistToMeters(distVal, unit, true);
+                int unit = extractIntAfter(line, "unit:", 15);
+                if (distVal >= 0.0 && unit >= 0 && unit < 15) {
+                    st.remainDistM = convertFloatDistToMeters(distVal, unit, false);
                 }
             }
             // 10. ClusterService: updateTPCrossroadName()::crossroadname is ...
@@ -466,7 +492,10 @@ public class CarrotBridgeMain {
                 int idx = line.indexOf("crossroadname is ");
                 if (idx >= 0) {
                     String rawName = line.substring(idx + "crossroadname is ".length()).trim();
-                    st.crossroadName = decodeMnsoftTpString(rawName);
+                    String decoded = decodeMnsoftTpString(rawName);
+                    if (!decoded.isEmpty() && (!decoded.contains("\uFFFD") || st.crossroadName.isEmpty())) {
+                        st.crossroadName = decoded;
+                    }
                 }
             }
             else if (line.contains("updateTPCrossroadName::sendClearTP()")) {
@@ -489,6 +518,7 @@ public class CarrotBridgeMain {
                 } else if (line.contains("bGuid=false")) {
                     st.bGuid = false;
                     st.tbtDistM = 0;
+                    st.remainTurnDistM = 0;
                     st.sccNextTurnDist1 = 0;
                     st.sccNextTurnType1 = 0;
                     st.subInfo2Dist1M = 0;
@@ -541,9 +571,18 @@ public class CarrotBridgeMain {
             } else {
                 st.tbtBarGraph = (int) parseLeadingDouble(val.replace("%", ""), -1);
             }
+        } else if (line.contains("sendCluster_H_U_Navi_T_TurnName() UTF-16LI =")) {
+            String raw = substringAfter(line, "UTF-16LI =").trim();
+            String cleaned = cleanDecodedString(raw);
+            if (!cleaned.isEmpty()) {
+                st.crossroadName = cleaned;
+            }
         } else if (line.contains("[TP Crossroad Name - 0x4F(0xF0)] Crossroad Name =")) {
             String raw = substringAfter(line, "Crossroad Name =").trim();
-            st.crossroadName = decodeMnsoftTpString(raw);
+            String decoded = decodeMnsoftTpString(raw);
+            if (!decoded.isEmpty() && (!decoded.contains("\uFFFD") || st.crossroadName.isEmpty())) {
+                st.crossroadName = decoded;
+            }
         } else if (line.contains("[IL TBT Sub Info - 0x4D] Distance To Destination =")) {
             String val = substringAfter(line, "Distance To Destination =").trim();
             int d = parseDistanceWithUnitText(val);
@@ -684,13 +723,16 @@ public class CarrotBridgeMain {
                     }
                 } else if ("SCC".equals(section)) {
                     if (line.contains("RangeCamInfo")) {
-                        st.rangeCamInfo = extractKeyInt(line, "RangeCamInfo\\s*=\\s*(-?\\d+)", st.rangeCamInfo);
+                        int ri = extractKeyInt(line, "RangeCamInfo\\s*=\\s*(-?\\d+)", st.rangeCamInfo);
+                        st.rangeCamInfo = (ri < 0 || ri >= 7) ? 0 : ri;
                     }
                     if (line.contains("RangeCamDist")) {
-                        st.rangeCamDist = extractKeyInt(line, "RangeCamDist\\s*=\\s*(-?\\d+)", st.rangeCamDist);
+                        int rd = extractKeyInt(line, "RangeCamDist\\s*=\\s*(-?\\d+)", st.rangeCamDist);
+                        st.rangeCamDist = (rd < 0 || rd >= 65535) ? 0 : rd;
                     }
                     if (line.contains("RangeCamSpdLimit")) {
-                        st.rangeCamSpdLimit = normalizeTrapSpeed(extractKeyInt(line, "RangeCamSpdLimit\\s*=\\s*(-?\\d+)", st.rangeCamSpdLimit));
+                        int rs = extractKeyInt(line, "RangeCamSpdLimit\\s*=\\s*(-?\\d+)", st.rangeCamSpdLimit);
+                        st.rangeCamSpdLimit = (rs == 15) ? 0 : normalizeTrapSpeed(rs);
                     }
                     if (line.contains("RangeCamAvgMovingSpd")) {
                         st.rangeCamAvgMovingSpd = extractKeyInt(line, "RangeCamAvgMovingSpd\\s*=\\s*(-?\\d+)", st.rangeCamAvgMovingSpd);
@@ -738,7 +780,7 @@ public class CarrotBridgeMain {
 
             // 1. Determine camera distance (prefer updateNaviWarnDist overDec, fallback to nextCamDist, fallback to barGraph)
             int camDist = st.camWarnDistM;
-            if (camDist <= 0 && st.nextCamDist > 0 && st.nextCamDist < 4095) {
+            if (camDist <= 0 && st.nextCamDist > 0 && st.nextCamDist < 1023) {
                 camDist = st.nextCamDist;
             }
             if (camDist <= 0 && st.trapBarGraph > 0 && st.trapBarGraph <= 100) {
@@ -748,7 +790,7 @@ public class CarrotBridgeMain {
             boolean isSchoolZone = (st.warningZone == 2 || st.warningZone2 == 2);
             boolean isSpeedBump = (st.warningZone == 8 || st.warningZone == 15 || st.warningZone == 128
                     || st.warningZone2 == 8 || st.warningZone2 == 15 || st.warningZone2 == 128);
-            boolean isSectionActive = (st.rangeCamInfo > 0 && st.rangeCamDist > 0 && st.rangeCamDist < 65535)
+            boolean isSectionActive = (st.rangeCamInfo > 0 && st.rangeCamInfo < 7 && st.rangeCamDist > 0 && st.rangeCamDist < 65535)
                     || (st.speedInfoType == 4 && st.fixedSpeed > 0);
             boolean isRearCamera = (st.nonSpeed == 7 || st.nonSpeed == 64 || st.nonSpeed == 31);
 
@@ -784,7 +826,7 @@ public class CarrotBridgeMain {
                 pkt.nSdiType = 7;
                 pkt.nSdiSpeedLimit = st.mobileSpeed;
                 pkt.nSdiDist = Math.max(camDist, 50);
-            } else if (st.nextCamType > 0 && st.nextCamSpdLimit > 0 && st.nextCamDist > 0 && st.nextCamDist < 4095) {
+            } else if (st.nextCamType > 0 && st.nextCamType < 15 && st.nextCamSpdLimit > 0 && st.nextCamDist > 0 && st.nextCamDist < 1023) {
                 // Fallback from ADAS SCC_HU_Navi_P
                 pkt.nSdiType = (st.nextCamType == 2) ? 7 : 1;
                 pkt.nSdiSpeedLimit = st.nextCamSpdLimit;
@@ -824,7 +866,8 @@ public class CarrotBridgeMain {
             if (guiding && st.offRouteStatus == 0) {
                 int primaryTurn = mapHkmcToCarrotTurnType(st.displayTypeCode, st.tbtDirectionDeg, st.sccNextTurnType1, st.displayTG, st.tollGateFee);
                 int primaryDist = st.tbtDistM > 0 ? st.tbtDistM
-                        : (st.sccNextTurnDist1 > 0 && st.sccNextTurnDist1 < 4095 ? st.sccNextTurnDist1 : st.turnListDist1M);
+                        : (st.remainTurnDistM > 0 ? st.remainTurnDistM
+                        : (st.sccNextTurnDist1 > 0 && st.sccNextTurnDist1 < 4095 ? st.sccNextTurnDist1 : st.turnListDist1M));
 
                 pkt.nTBTTurnType = primaryTurn;
                 pkt.nTBTDist = Math.max(0, primaryDist);
@@ -1141,9 +1184,9 @@ public class CarrotBridgeMain {
     // =========================================================================
 
     private static int normalizeTrapSpeed(int val) {
-        if (val <= 0 || val >= 254) return 0;
-        // In dumpsys, Fixed Speed = 6 means 60 km/h (1..15 -> 10..150 km/h)
-        if (val >= 1 && val <= 15) return val * 10;
+        if (val <= 0 || val == 15 || val >= 254) return 0;
+        // In dumpsys / SCC_HU_Navi_P, Fixed Speed = 6 means 60 km/h (1..14 -> 10..140 km/h; 15 is 0xF invalid)
+        if (val >= 1 && val <= 14) return val * 10;
         return val;
     }
 
@@ -1273,8 +1316,13 @@ public class CarrotBridgeMain {
     }
 
     private static int parseIntSafe(String s, int def) {
+        if (s == null) return def;
         try {
-            return Integer.parseInt(s.trim());
+            String t = s.trim();
+            if (t.startsWith("0x") || t.startsWith("0X")) {
+                return Integer.parseInt(t.substring(2), 16);
+            }
+            return Integer.parseInt(t);
         } catch (Exception e) {
             return def;
         }
@@ -1536,7 +1584,7 @@ public class CarrotBridgeMain {
                             lastEngWakeMs = now;
                         }
                         String out = execCommandCapture(new String[]{
-                                "/system/bin/dumpsys", "activity", "service", "com.hkmc.micom.ClusterService"
+                                "/system/bin/dumpsys", "cluster"
                         }, 150);
                         if (!out.isEmpty()) {
                             parseDumpsysCluster(out, navState);
@@ -2089,9 +2137,22 @@ public class CarrotBridgeMain {
                         uiHandler = handlerCls.getConstructor(looperCls).newInstance(myLooper);
 
                         System.out.println("[CarrotBridge] StatusDashboardOverlay UI Looper initialized.");
-                        looperCls.getMethod("loop").invoke(null);
+                        Method loopMethod = looperCls.getMethod("loop");
+                        // Immortal Looper recovery loop: if any framework callback inside Looper.loop() throws an
+                        // uncaught exception, log the cause and immediately resume pumping the MessageQueue so the
+                        // UI thread never terminates and the overlay never freezes on screen.
+                        while (true) {
+                            try {
+                                loopMethod.invoke(null);
+                                break;
+                            } catch (Throwable loopErr) {
+                                Throwable cause = (loopErr.getCause() != null) ? loopErr.getCause() : loopErr;
+                                System.out.println("[CarrotBridge] UI Looper caught exception (resuming loop): " + cause);
+                            }
+                        }
                     } catch (Throwable t) {
-                        System.out.println("[CarrotBridge] StatusDashboardOverlay init skipped: " + t.getMessage());
+                        Throwable cause = (t.getCause() != null) ? t.getCause() : t;
+                        System.out.println("[CarrotBridge] StatusDashboardOverlay init skipped: " + cause);
                     }
                 }
             }, "CarrotStatusUiThread");
@@ -2232,6 +2293,7 @@ public class CarrotBridgeMain {
             llCls.getMethod("setOrientation", int.class).invoke(root, 1); // VERTICAL
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(root, 26, 20, 26, 20);
             setRoundedBg(root, 0xF20F172A, 0xFF38BDF8, 3, 18f);
+            disableViewEffects(root, true);
 
             // 1. Header Row (Horizontal)
             Object headerRow = llCtor.newInstance(sysContext);
@@ -2447,6 +2509,19 @@ public class CarrotBridgeMain {
                         wmLpCls.getMethod("setTitle", CharSequence.class).invoke(wmLp, "CarrotNaviStatusOverlay");
                         addViewMethod.invoke(windowManager, candidateRoot, wmLp);
 
+                        // Disable ViewRootImpl sound effects (mMediaDisabled = true) so ViewRootImpl.playSoundEffect()
+                        // never queries AudioManager -> Settings.System.getInt -> ActivityManagerService.getContentProvider("settings"),
+                        // which throws SecurityException("Unable to find app for caller ...") in standalone app_process.
+                        try {
+                            Object vri = viewCls.getMethod("getViewRootImpl").invoke(candidateRoot);
+                            if (vri != null) {
+                                java.lang.reflect.Field fMedia = vri.getClass().getDeclaredField("mMediaDisabled");
+                                fMedia.setAccessible(true);
+                                fMedia.setBoolean(vri, true);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+
                         rootOverlayView = candidateRoot;
                         leftColTextView = tree[1];
                         rightColTextView = tree[2];
@@ -2473,20 +2548,28 @@ public class CarrotBridgeMain {
         }
 
         private static void hideOnUiThread() {
+            Object oldRoot = rootOverlayView;
+            rootOverlayView = null;
+            leftColTextView = null;
+            rightColTextView = null;
+            footerStatusTextView = null;
+            isVisible = false;
             try {
                 removeCallbacksFromUi(REFRESH_TASK);
-                if (isVisible && rootOverlayView != null && windowManager != null) {
+                if (oldRoot != null && windowManager != null) {
                     Class<?> viewCls = Class.forName("android.view.View");
                     Class<?> vmCls = Class.forName("android.view.ViewManager");
-                    vmCls.getMethod("removeView", viewCls).invoke(windowManager, rootOverlayView);
+                    try {
+                        viewCls.getMethod("setVisibility", int.class).invoke(oldRoot, 8); // View.GONE
+                    } catch (Throwable ignored) {
+                    }
+                    try {
+                        vmCls.getMethod("removeView", viewCls).invoke(windowManager, oldRoot);
+                    } catch (Throwable t) {
+                        windowManager.getClass().getMethod("removeViewImmediate", viewCls).invoke(windowManager, oldRoot);
+                    }
                 }
             } catch (Throwable ignored) {
-            } finally {
-                rootOverlayView = null;
-                leftColTextView = null;
-                rightColTextView = null;
-                footerStatusTextView = null;
-                isVisible = false;
             }
         }
 
@@ -2568,6 +2651,7 @@ public class CarrotBridgeMain {
 
         private static void triggerManualUpdateFromUi() {
             actionBannerMsg = "⏳ GitHub 최신 버전(GRT47/HKG_5W_CarrotNavi) 확인 중...";
+            postToUi(REFRESH_TASK);
             new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -2576,14 +2660,17 @@ public class CarrotBridgeMain {
                     if (rc == 0) {
                         lastAutoUpdateStatus = "최신 버전 유지 중 (v" + BRIDGE_VERSION + ", 확인: " + nowStr + ")";
                         actionBannerMsg = "✅ 현재 최신 버전(v" + BRIDGE_VERSION + ")입니다. (" + nowStr + ")";
+                        postToUi(REFRESH_TASK);
                     } else if (rc == 10) {
                         lastAutoUpdateStatus = "새 버전 적용 완료 -> 데몬 재시작 중 (" + nowStr + ")";
                         actionBannerMsg = "🎉 업데이트 적용 완료! 브릿지 데몬을 재시작합니다...";
+                        postToUi(REFRESH_TASK);
                         try { Thread.sleep(1500L); } catch (InterruptedException ignored) {}
                         System.exit(0); // Watchdog in bridge-daemon.sh immediately restarts updated JAR
                     } else {
                         lastAutoUpdateStatus = "업데이트 확인 실패 (LTE 연결 확인 필요, " + nowStr + ")";
                         actionBannerMsg = "⚠️ GitHub 연결 실패 (LTE/데이터 연결 상태를 확인해주세요)";
+                        postToUi(REFRESH_TASK);
                     }
                 }
             }, "ManualUpdateTrigger").start();
@@ -2591,6 +2678,7 @@ public class CarrotBridgeMain {
 
         private static void triggerManualDumpFromUi() {
             actionBannerMsg = "⏳ USB 및 로컬 경로로 TBT 정밀 덤프 저장 중...";
+            postToUi(REFRESH_TASK);
             new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -2605,57 +2693,38 @@ public class CarrotBridgeMain {
                         if (usbDir.exists()) {
                             actionBannerMsg = "✅ USB(/storage/usb0/HKG_TBT_Dump) 및 로컬 덤프 저장 완료! (" + nowStr + ")";
                         } else {
-                            actionBannerMsg = "✅ 로컬(/data/local/tmp/hkg_tbt_dump) 덤프 완료! (USB 꽃으면 자동 복사됨)";
+                            actionBannerMsg = "✅ 로컬(/data/local/tmp/hkg_tbt_dump) 덤프 완료! (USB 꽂으면 자동 복사됨)";
                         }
                     } catch (Throwable t) {
                         actionBannerMsg = "⚠️ 덤프 실행 중 오류: " + t.getMessage();
                     }
+                    postToUi(REFRESH_TASK);
                 }
             }, "ManualDumpTrigger").start();
         }
 
         private static void openHotspotSettingsFromUi() {
             actionBannerMsg = "⏳ 순정 Wi-Fi 핫스팟 설정 화면을 여는 중...";
-            hide();
+            hideOnUiThread();
             new Thread(new Runnable() {
                 @Override
                 public void run() {
                     try {
                         execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.subscription", "true"}, 10);
                         execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.apn", "Public"}, 10);
-                        boolean startedInProc = false;
-                        if (sysContext != null) {
-                            try {
-                                Class<?> intentCls = Class.forName("android.content.Intent");
-                                Object intent = intentCls.getConstructor().newInstance();
-                                intentCls.getMethod("setClassName", String.class, String.class)
-                                        .invoke(intent, "com.hkmc.wifisettings", "com.hkmc.wifisettings.WifiHotspot");
-                                intentCls.getMethod("setAction", String.class)
-                                        .invoke(intent, "android.intent.action.MAIN");
-                                intentCls.getMethod("addCategory", String.class)
-                                        .invoke(intent, "android.intent.category.LAUNCHER");
-                                intentCls.getMethod("addFlags", int.class)
-                                        .invoke(intent, 0x10010000); // FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_NO_ANIMATION
-                                sysContext.getClass().getMethod("startActivity", intentCls).invoke(sysContext, intent);
-                                startedInProc = true;
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                        if (!startedInProc) {
-                            String out = execCommandCapture(new String[]{
+                        String out = execCommandCapture(new String[]{
+                                "/system/bin/am", "start",
+                                "-a", "android.intent.action.MAIN",
+                                "-c", "android.intent.category.LAUNCHER",
+                                "-f", "0x10010000",
+                                "-n", "com.hkmc.wifisettings/com.hkmc.wifisettings.WifiHotspot"
+                        }, 20);
+                        if (out.contains("Error") || out.contains("Exception") || out.contains("does not exist")) {
+                            execCommandCapture(new String[]{
                                     "/system/bin/am", "start",
-                                    "-a", "android.intent.action.MAIN",
-                                    "-c", "android.intent.category.LAUNCHER",
-                                    "-f", "0x10010000",
-                                    "-n", "com.hkmc.wifisettings/com.hkmc.wifisettings.WifiHotspot"
+                                    "-f", "0x10000000",
+                                    "-n", "com.hkmc.system.app.engineering/.module.WifiInfo"
                             }, 20);
-                            if (out.contains("Error") || out.contains("Exception")) {
-                                execCommandCapture(new String[]{
-                                        "/system/bin/am", "start",
-                                        "-f", "0x10000000",
-                                        "-n", "com.hkmc.system.app.engineering/.module.WifiInfo"
-                                }, 20);
-                            }
                         }
                     } catch (Throwable ignored) {
                     }
@@ -2665,7 +2734,7 @@ public class CarrotBridgeMain {
 
         private static void openEngineeringWifiFromUi() {
             actionBannerMsg = "⏳ 엔지니어링 WiFi 설정 화면을 여는 중...";
-            hide();
+            hideOnUiThread();
             new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -2683,6 +2752,7 @@ public class CarrotBridgeMain {
 
         private static void triggerHotspotCheckFromUi() {
             actionBannerMsg = "⏳ Wi-Fi 핫스팟(Public APN) 상태 점검 및 활성화 중...";
+            postToUi(REFRESH_TASK);
             new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -2693,8 +2763,22 @@ public class CarrotBridgeMain {
                         actionBannerMsg = "✅ Wi-Fi 핫스팟(APN=Public) 활성화 명령 전송 완료!";
                     } catch (Throwable ignored) {
                     }
+                    postToUi(REFRESH_TASK);
                 }
             }, "ManualHotspotTrigger").start();
+        }
+
+        private static void disableViewEffects(Object view, boolean hideAccessibility) {
+            try {
+                Class<?> viewCls = Class.forName("android.view.View");
+                viewCls.getMethod("setSoundEffectsEnabled", boolean.class).invoke(view, false);
+                viewCls.getMethod("setHapticFeedbackEnabled", boolean.class).invoke(view, false);
+                if (hideAccessibility) {
+                    // 4 = IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                    viewCls.getMethod("setImportantForAccessibility", int.class).invoke(view, 4);
+                }
+            } catch (Throwable ignored) {
+            }
         }
 
         private static void setTextViewStyle(Object tv, String text, float sizeSp, int color, boolean bold) throws Exception {
@@ -2725,23 +2809,51 @@ public class CarrotBridgeMain {
             mlpCls.getMethod("setMargins", int.class, int.class, int.class, int.class).invoke(marginLp, l, t, r, b);
         }
 
+        /**
+         * Uses View.OnTouchListener returning Boolean.TRUE so View.dispatchTouchEvent() returns immediately
+         * without ever entering View.onTouchEvent() -> View.performClick() -> View.playSoundEffect(0) ->
+         * AudioManager.querySoundEffectsEnabled() -> Settings.System.getInt() -> ActivityManagerService.getContentProvider("settings"),
+         * which throws SecurityException("Unable to find app for caller ...") in a standalone app_process.
+         */
         private static void attachClickListener(Object view, final Runnable action) throws Exception {
-            Class<?> listenerCls = Class.forName("android.view.View$OnClickListener");
+            disableViewEffects(view, false);
+            Class<?> touchListenerCls = Class.forName("android.view.View$OnTouchListener");
             Class<?> viewCls = Class.forName("android.view.View");
+            viewCls.getMethod("setClickable", boolean.class).invoke(view, true);
             Object proxy = Proxy.newProxyInstance(
-                    listenerCls.getClassLoader(),
-                    new Class<?>[]{listenerCls},
+                    touchListenerCls.getClassLoader(),
+                    new Class<?>[]{touchListenerCls},
                     new InvocationHandler() {
                         @Override
                         public Object invoke(Object proxyObj, Method method, Object[] args) {
-                            if ("onClick".equals(method.getName())) {
-                                action.run();
+                            String mName = method.getName();
+                            if ("equals".equals(mName)) {
+                                return Boolean.valueOf(args != null && args.length == 1 && proxyObj == args[0]);
                             }
-                            return null;
+                            if ("hashCode".equals(mName)) {
+                                return Integer.valueOf(System.identityHashCode(proxyObj));
+                            }
+                            if ("toString".equals(mName)) {
+                                return "CarrotTouchListener";
+                            }
+                            if ("onTouch".equals(mName) && args != null && args.length >= 2 && args[1] != null) {
+                                try {
+                                    Object motionEvent = args[1];
+                                    int act = ((Integer) motionEvent.getClass().getMethod("getAction").invoke(motionEvent)).intValue() & 0xFF;
+                                    if (act == 1) { // MotionEvent.ACTION_UP = 1
+                                        shownAtMs = System.currentTimeMillis();
+                                        action.run();
+                                    }
+                                } catch (Throwable t) {
+                                    System.out.println("[CarrotBridge] Button touch error: " + t);
+                                }
+                                return Boolean.TRUE;
+                            }
+                            return Boolean.TRUE;
                         }
                     }
             );
-            viewCls.getMethod("setOnClickListener", listenerCls).invoke(view, proxy);
+            viewCls.getMethod("setOnTouchListener", touchListenerCls).invoke(view, proxy);
         }
     }
 
@@ -2812,7 +2924,7 @@ public class CarrotBridgeMain {
         parseLogcatLine("D/ClusterService(  612): NaviCluster.updateTBTTrapInfo() fixedSpeed: 60 mobileSpeed: 0 overSpeedAlarm: 1 redlineSpeed: 0 nonSpeed: 0 warningZone: 2 curveWarning: 0 mergeWarning: 0 tollGateCurrency: 0 tollGate: 0 displayTG: 0 barGraphLevel: 62 speedLimit: 60 busSpeed: 0 speedLimitType: 1 speedLimitUnit: 1 speedInfoType: 1 warningZone2: 0 warningZone3: 0 warningZone4: 0 displayCountry: 1cameraSafetyAlert1", st, null);
         parseLogcatLine("D/ClusterService(  612): NaviCluster.updateNaviWarnDist() overDec: 320 underDec: 0 scale: 0", st, null);
         parseLogcatLine("D/ClusterService(  612): NaviCluster.updateSCC_HU_Navi_P() msgGroupNum1: 1 setDestStatus: 1 offRouteStatus: 0 nextTurnType1: 13 naviValidity: 1 nextTurnDist1: 250 curLinkCntLane: 6 curRoadClass: 4 nextTurnType2: 18 nextTurnDist2: 120 rangeCamInfo: 0 rangeCamDist: 0 rangeCamSpdLimit: 0 rangeCamAvgMovingSpd: 0", st, null);
-        parseLogcatLine("D/ClusterService(  612): NaviCluster.updateTBTSubInfo2C() distToPoint1_unit: 1 distToPoint1_F: 0 distToPoint1_I: 120 distToPoint2_unit: 0 distToPoint2_F: 0 distToPoint2_I: 0", st, null);
+        parseLogcatLine("D/ClusterService(  612): NaviCluster.updateTBTSubInfo2C() distToPoint1_unit: 0 distToPoint1_F: 0 distToPoint1_I: 120 distToPoint2_unit: 15 distToPoint2_F: 0 distToPoint2_I: 0", st, null);
 
         // Simulate com.mnsoft.navi's byte-swapped UTF-16LE string for "강남역사거리"
         String origCross = "강남역사거리";
@@ -2844,6 +2956,22 @@ public class CarrotBridgeMain {
         }
         if (pkt.nGoPosDist != 12400 || pkt.nGoPosTime != 1440) {
             throw new AssertionError("Destination remain mismatch: " + pkt.toJson());
+        }
+
+        // 1b. Test all-1s bitfield invalid sentinels in updateSCC_HU_Navi_P and hex DisplayType=0xd + UTF-16LI crossroad name
+        NavState stReal = new NavState();
+        parseLogcatLine("D/ClusterService(  594): NaviCluster.updateSCC_HU_Navi_P() msgGroupNum1: 2 setDestStatus: 1 offRouteStatus: 0 nextTurnType1: 12 naviValidity: 0 nextTurnDist1: 120 curLinkCntLane: 4 curRoadClass: 4 nextCamType: 15 nextCamDist: 1023 nextCamSpdLimit: 15 rangeCamInfo: 7 rangeCamDist: 65535 rangeCamSpdLimit: 15 rangeCamAvgMovingSpd: 0", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0xd", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Direction = 270.0", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] sendCluster_H_U_Navi_T_TurnName() UTF-16LI = 평촌지북로", stReal, null);
+        parseLogcatLine("D/NavigationCluster( 1235): updateTBTSubInfo() distance: 2.7 unit: 1 arrivalTimeType: 2 hour: 5 min: 45", stReal, null);
+        parseLogcatLine("D/ClusterService(  594): NaviCluster.updateRemainDis() remained_distance: 110 under_decimal: 0 scale_unit: 0 bar_graph_level: 85", stReal, null);
+        CarrotPacket realPkt = buildCarrotPacket(stReal);
+        if (realPkt.nSdiType != -1 || realPkt.nSdiSpeedLimit != 0) {
+            throw new AssertionError("All-1s SCC sentinel should not produce phantom camera: " + realPkt.toJson());
+        }
+        if (realPkt.nTBTTurnType != 12 || realPkt.nTBTDist != 110 || !"평촌지북로".equals(realPkt.szTBTMainText) || realPkt.nGoPosDist != 2700) {
+            throw new AssertionError("Real-vehicle TBT hex DisplayType/UTF-16LI/remainDis mismatch: " + realPkt.toJson());
         }
 
         // 2. Test Section Control + Average Speed

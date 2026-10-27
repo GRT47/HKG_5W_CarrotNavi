@@ -1,5 +1,5 @@
 [nemesis]
-version=1.1.4
+version=1.1.5
 id=carrotnavi.bridge
 name=CarrotNavi 7706 Bridge
 types=application,service

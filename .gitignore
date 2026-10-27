@@ -64,6 +64,7 @@ wifiinfo_dump*/
 dump_wifiinfo/
 engineering_wifiinfo/
 NEMESIS-logs/
+log/
 *.xlsx
 *.html
 

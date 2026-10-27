@@ -12,7 +12,7 @@ mkdir -p "$LOCAL_DUMP_DIR" 2>/dev/null
 am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 >/dev/null 2>&1
 
 # 1. Capture live snapshots to local dump dir
-dumpsys activity service com.hkmc.micom.ClusterService > "$LOCAL_DUMP_DIR/dumpsys_cluster_latest.txt" 2>&1
+dumpsys cluster > "$LOCAL_DUMP_DIR/dumpsys_cluster_latest.txt" 2>&1
 logcat -d -v time ClusterService:D NavigationCluster:D Java_Layer:I BrdCast:D CarrotBridge:I *:S > "$LOCAL_DUMP_DIR/logcat_navi_recent.txt" 2>&1
 getprop > "$LOCAL_DUMP_DIR/getprop.txt" 2>&1
 ip addr > "$LOCAL_DUMP_DIR/ip_addr.txt" 2>&1
