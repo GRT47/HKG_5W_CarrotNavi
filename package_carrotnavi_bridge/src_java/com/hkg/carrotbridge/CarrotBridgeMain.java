@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.1";
+    public static final String BRIDGE_VERSION = "1.2.2";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -1438,10 +1438,32 @@ public class CarrotBridgeMain {
     private static volatile String discoveredCarrotIp = "";
     private static volatile long discoveredCarrotTimeMs = 0L;
     private static volatile double carrotVEgoKph = 0.0;
+    private static volatile boolean commaTxEnabled = true;
     private static volatile CarrotPacket latestSentPacket = null;
     private static volatile String latestTargetsStr = "[]";
     private static volatile String lastAutoUpdateStatus = "내비 켜질 때 1회 자동 확인 (대기 중)";
     private static volatile long lastWarmWakeUpdateMs = System.currentTimeMillis();
+
+    public static boolean loadCommaTxEnabledConfig(String installDir) {
+        try {
+            File conf = new File(installDir, "config/comma_tx_enabled.conf");
+            if (conf.isFile()) {
+                BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(conf), UTF8));
+                try {
+                    String s = br.readLine();
+                    if (s != null) {
+                        s = s.trim();
+                        if ("0".equals(s) || "false".equalsIgnoreCase(s)) return false;
+                        if ("1".equals(s) || "true".equalsIgnoreCase(s)) return true;
+                    }
+                } finally {
+                    br.close();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return true;
+    }
 
     public static boolean isWarmWakeNaviOnLine(String line) {
         if (line == null || line.isEmpty()) return false;
@@ -1504,6 +1526,7 @@ public class CarrotBridgeMain {
         final File showUiTriggerFile = new File("/data/local/tmp/carrotbridge_show_ui");
 
         System.out.println("[CarrotBridge] Starting daemon v" + BRIDGE_VERSION + " (installDir=" + installDir + ")");
+        commaTxEnabled = loadCommaTxEnabledConfig(installDir);
         enableMnsoftClusterLogging();
         StatusDashboardOverlay.init(installDir, navState);
 
@@ -1521,6 +1544,11 @@ public class CarrotBridgeMain {
                         while (true) {
                             DatagramPacket pkt = new DatagramPacket(buf, buf.length);
                             sock.receive(pkt);
+                            if (!commaTxEnabled) {
+                                discoveredCarrotIp = "";
+                                discoveredCarrotTimeMs = 0L;
+                                continue;
+                            }
                             String msg = new String(pkt.getData(), pkt.getOffset(), pkt.getLength(), UTF8);
                             String senderIp = pkt.getAddress().getHostAddress();
                             if (senderIp != null && !senderIp.startsWith("127.") && !senderIp.equals("192.168.0.1")) {
@@ -1691,25 +1719,31 @@ public class CarrotBridgeMain {
             CarrotPacket pkt = buildCarrotPacket(navState);
             latestSentPacket = pkt;
             String json = pkt.toJson();
-            byte[] payload = json.getBytes(UTF8);
 
             Set<String> targets = new LinkedHashSet<String>();
-            if (!discoveredCarrotIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L) {
-                targets.add(discoveredCarrotIp);
-            }
-            targets.addAll(arpPeers);
-            if (targets.isEmpty() || (pkt.carrotIndex % 5 == 0)) {
-                targets.add("192.168.0.255");
-            }
-            latestTargetsStr = targets.toString();
-
-            for (String ip : targets) {
-                try {
-                    InetAddress addr = InetAddress.getByName(ip);
-                    DatagramPacket dp = new DatagramPacket(payload, payload.length, addr, CARROT_TARGET_PORT);
-                    txSock.send(dp);
-                } catch (Exception ignored) {
+            if (commaTxEnabled) {
+                byte[] payload = json.getBytes(UTF8);
+                if (!discoveredCarrotIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L) {
+                    targets.add(discoveredCarrotIp);
                 }
+                targets.addAll(arpPeers);
+                if (targets.isEmpty() || (pkt.carrotIndex % 5 == 0)) {
+                    targets.add("192.168.0.255");
+                }
+                latestTargetsStr = targets.toString();
+
+                for (String ip : targets) {
+                    try {
+                        InetAddress addr = InetAddress.getByName(ip);
+                        DatagramPacket dp = new DatagramPacket(payload, payload.length, addr, CARROT_TARGET_PORT);
+                        txSock.send(dp);
+                    } catch (Exception ignored) {
+                    }
+                }
+            } else {
+                discoveredCarrotIp = "";
+                discoveredCarrotTimeMs = 0L;
+                latestTargetsStr = "[전송 중지됨 (OFF)]";
             }
 
             if (now - lastStatusWriteMs > 2000L) {
@@ -2196,6 +2230,7 @@ public class CarrotBridgeMain {
         private static volatile Object leftColTextView = null;
         private static volatile Object autoHotspotCheckTextView = null;
         private static volatile Object rightColTextView = null;
+        private static volatile Object commaTxCheckTextView = null;
         private static volatile Object footerStatusTextView = null;
         private static volatile boolean isVisible = false;
         private static volatile long shownAtMs = 0L;
@@ -2450,7 +2485,7 @@ public class CarrotBridgeMain {
             Object leftTv = tvCtor.newInstance(sysContext);
             setTextViewStyle(leftTv, "", 15f, 0xFFE2E8F0, false);
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftTv, 0, 8, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftTv, llLpCtor3.newInstance(MATCH_PARENT, WRAP_CONTENT, 1.0f));
 
             // Interactive Checkbox for Boot Auto-Hotspot (ON/OFF)
             Object autoHsCheckTv = tvCtor.newInstance(sysContext);
@@ -2484,7 +2519,22 @@ public class CarrotBridgeMain {
             Object rightTv = tvCtor.newInstance(sysContext);
             setTextViewStyle(rightTv, "", 15f, 0xFFE2E8F0, false);
             viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightTv, 0, 8, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightTv, llLpCtor3.newInstance(MATCH_PARENT, WRAP_CONTENT, 1.0f));
+
+            // Interactive Checkbox for Comma Device Connection & Data Transmission (ON/OFF)
+            Object commaTxCheckTv = tvCtor.newInstance(sysContext);
+            styleCommaTxCheckbox(commaTxCheckTv, commaTxEnabled);
+            tvSetGravity.invoke(commaTxCheckTv, 17); // CENTER
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(commaTxCheckTv, 12, 8, 12, 8);
+            attachClickListener(commaTxCheckTv, new Runnable() {
+                @Override
+                public void run() {
+                    toggleCommaTxFromUi();
+                }
+            });
+            Object commaTxCheckLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(commaTxCheckLp, 0, 10, 0, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, commaTxCheckTv, commaTxCheckLp);
 
             Object rightCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.15f);
             setMargins(rightCardLp, 8, 0, 0, 0);
@@ -2587,7 +2637,7 @@ public class CarrotBridgeMain {
             tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
-            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv, autoHsCheckTv};
+            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv, autoHsCheckTv, commaTxCheckTv};
         }
 
         private static void showOnUiThread() {
@@ -2649,6 +2699,7 @@ public class CarrotBridgeMain {
                         footerStatusTextView = tree[3];
                         headerSysInfoTextView = tree.length > 4 ? tree[4] : null;
                         autoHotspotCheckTextView = tree.length > 5 ? tree[5] : null;
+                        commaTxCheckTextView = tree.length > 6 ? tree[6] : null;
                         isVisible = true;
                         shownAtMs = System.currentTimeMillis();
                         System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
@@ -2677,6 +2728,7 @@ public class CarrotBridgeMain {
             leftColTextView = null;
             autoHotspotCheckTextView = null;
             rightColTextView = null;
+            commaTxCheckTextView = null;
             footerStatusTextView = null;
             isVisible = false;
             try {
@@ -2721,10 +2773,15 @@ public class CarrotBridgeMain {
                         ? "활성 (Auto=ON, APN=" + apnProp + ")"
                         : "수동/비활성 (Auto=" + autoProp + ")";
 
-                boolean commaAlive = !discoveredCarrotIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
-                String commaStr = commaAlive
-                        ? ("연결됨 (" + discoveredCarrotIp + " | 차속: " + String.format(Locale.US, "%.1f", carrotVEgoKph) + " km/h)")
-                        : (discoveredCarrotIp.isEmpty() ? "브로드캐스트 송출 중 (192.168.0.255:7706)" : "최근 IP: " + discoveredCarrotIp + " (대기 중)");
+                boolean commaAlive = commaTxEnabled && !discoveredCarrotIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
+                String commaStr;
+                if (!commaTxEnabled) {
+                    commaStr = "연결 및 데이터 전송 중지됨 (사용자 OFF)";
+                } else if (commaAlive) {
+                    commaStr = "연결됨 (" + discoveredCarrotIp + " | 차속: " + String.format(Locale.US, "%.1f", carrotVEgoKph) + " km/h)";
+                } else {
+                    commaStr = discoveredCarrotIp.isEmpty() ? "브로드캐스트 송출 중 (192.168.0.255:7706)" : "최근 IP: " + discoveredCarrotIp + " (대기 중)";
+                }
 
                 String autoUpdText = lastAutoUpdateStatus;
                 try {
@@ -2739,9 +2796,12 @@ public class CarrotBridgeMain {
                 }
 
                 long pktIdx = pkt != null ? pkt.carrotIndex : 0L;
+                String daemonStr = commaTxEnabled
+                        ? ("정상 가동 중 (UDP 7706 @ 5Hz, #" + pktIdx + ")")
+                        : "전송 일시정지 (콤마 데이터 전송 OFF)";
                 StringBuilder leftSb = new StringBuilder(512);
                 leftSb.append("• 패키지 버전 : v").append(BRIDGE_VERSION).append(" (HKG_5W_CarrotNavi)\n");
-                leftSb.append("• 브릿지 데몬 : 정상 가동 중 (UDP 7706 @ 5Hz, #").append(pktIdx).append(")\n");
+                leftSb.append("• 브릿지 데몬 : ").append(daemonStr).append("\n");
                 leftSb.append("• Wi-Fi 핫스팟 : ").append(hotspotStr).append("\n");
                 leftSb.append("• 콤마(캐럿) 기기 : ").append(commaStr).append("\n");
                 leftSb.append("• 패킷 타겟 IP : ").append(latestTargetsStr).append("\n");
@@ -2781,6 +2841,9 @@ public class CarrotBridgeMain {
                 }
                 if (autoHotspotCheckTextView != null) {
                     styleAutoHotspotCheckbox(autoHotspotCheckTextView, isBootAutoHotspotEnabled());
+                }
+                if (commaTxCheckTextView != null) {
+                    styleCommaTxCheckbox(commaTxCheckTextView, commaTxEnabled);
                 }
                 setText.invoke(leftColTextView, leftSb.toString());
                 setText.invoke(rightColTextView, rightSb.toString());
@@ -2845,6 +2908,35 @@ public class CarrotBridgeMain {
                     postToUi(REFRESH_TASK);
                 }
             }, "ToggleBootAutoHotspot").start();
+        }
+
+        private static void styleCommaTxCheckbox(Object view, boolean enabled) throws Exception {
+            if (enabled) {
+                setTextViewStyle(view, "☑ 콤마(캐럿) 기기 데이터 전송 및 연결 : ON (터치하여 변경)", 14.5f, 0xFFFFFFFF, true);
+                setRoundedBg(view, 0xFF065F46, 0xFF34D399, 2, 10f);
+            } else {
+                setTextViewStyle(view, "☐ 콤마(캐럿) 기기 데이터 전송 및 연결 : OFF (터치하여 변경)", 14.5f, 0xFFCBD5E1, true);
+                setRoundedBg(view, 0xFF334155, 0xFF64748B, 2, 10f);
+            }
+        }
+
+        private static void toggleCommaTxFromUi() {
+            final boolean nextState = !commaTxEnabled;
+            commaTxEnabled = nextState;
+            if (!nextState) {
+                discoveredCarrotIp = "";
+                discoveredCarrotTimeMs = 0L;
+                latestTargetsStr = "[전송 중지됨 (OFF)]";
+            }
+            try {
+                File conf = new File(installDir, "config/comma_tx_enabled.conf");
+                writeBytesAtomic(conf, (nextState ? "1\n" : "0\n").getBytes(UTF8));
+            } catch (Throwable ignored) {
+            }
+            actionBannerMsg = nextState
+                    ? "✅ 콤마(캐럿) 기기 데이터 전송 및 연결이 [ON]으로 재개되었습니다."
+                    : "ℹ️ 콤마(캐럿) 기기 데이터 전송 및 연결이 [OFF]로 중지되었습니다.";
+            postToUi(REFRESH_TASK);
         }
 
         private static String updateSystemResourceBadge(long nowMs) {
