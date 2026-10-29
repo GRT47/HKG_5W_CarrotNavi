@@ -55,7 +55,8 @@ am startservice -n com.hkmc.wifisettings/.service.HotspotService >/dev/null 2>&1
 # 4. Wake up com.mnsoft.navi [Cluster] plain-text TBT logger (intArray[14] == 0 -> gq=false)
 am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 >/dev/null 2>&1
 
-# 5. Request Status Dashboard UI to open as soon as NEMESIS svcmgr starts bridge-daemon.sh
+# 5. Clear any stale PID files from previous boots/installs and request Status Dashboard UI to open immediately
+rm -f /data/local/tmp/carrotbridge_svc.pid /data/local/tmp/carrotbridge_java.pid >/dev/null 2>&1
 echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
 
 exit 0

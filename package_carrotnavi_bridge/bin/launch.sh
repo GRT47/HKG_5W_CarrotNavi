@@ -16,15 +16,18 @@ SVC_PID_FILE="/data/local/tmp/carrotbridge_svc.pid"
 # 1. Immediately signal the Status Dashboard Overlay to appear on screen
 echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
 
-# 2. Ensure carrot-7706-bridge background service is running (only if not already running via svcmgr)
+# 2. Ensure carrot-7706-bridge background service is running (verify /proc/<pid>/cmdline to avoid stale boot PID collision)
 svc_alive=0
 if [ -f "$SVC_PID_FILE" ]; then
     svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
     if [ -n "$svc_pid" ] && kill -0 "$svc_pid" 2>/dev/null; then
-        svc_alive=1
+        if grep -q "bridge-daemon.sh" "/proc/$svc_pid/cmdline" 2>/dev/null; then
+            svc_alive=1
+        fi
     fi
 fi
 if [ "$svc_alive" = "0" ]; then
+    rm -f "$SVC_PID_FILE" 2>/dev/null
     /system/bin/sh "$INSTALL_DIR/svc/bridge-daemon.sh" </dev/null >>/data/local/tmp/carrotbridge_svc.log 2>&1 &
 fi
 

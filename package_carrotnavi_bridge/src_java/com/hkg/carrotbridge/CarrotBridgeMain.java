@@ -58,7 +58,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.2";
+    public static final String BRIDGE_VERSION = "1.2.3";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -2157,13 +2157,42 @@ public class CarrotBridgeMain {
                     : ("최신 버전 유지 중 (v" + remoteVersion + ", 내비ON 확인: " + nowStr + ")");
             lastAutoUpdateStatus = doneMsg;
             try { writeBytesAtomic(statusNoteFile, (doneMsg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
+            healStaleServicePidFile(installDir);
             return updatedCount > 0 ? 10 : 0; // 10 signals caller to restart daemon
         } catch (Exception e) {
             System.out.println("[AutoUpdate] Error: " + e.getMessage());
             String errMsg = "내비 켜질 때 1회 자동 확인 (최근 확인 실패: " + nowStr + ")";
             lastAutoUpdateStatus = errMsg;
             try { writeBytesAtomic(statusNoteFile, (errMsg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
+            healStaleServicePidFile(installDir);
             return 1;
+        }
+    }
+
+    private static void healStaleServicePidFile(String installDir) {
+        try {
+            File svcPidFile = new File("/data/local/tmp/carrotbridge_svc.pid");
+            if (!svcPidFile.isFile()) return;
+            String pidStr = new String(readAllBytes(new FileInputStream(svcPidFile)), UTF8).trim();
+            if (pidStr.isEmpty()) return;
+            File cmdlineFile = new File("/proc/" + pidStr + "/cmdline");
+            boolean isReallyBridgeDaemon = false;
+            if (cmdlineFile.isFile()) {
+                String cmdline = new String(readAllBytes(new FileInputStream(cmdlineFile)), UTF8);
+                if (cmdline.contains("bridge-daemon.sh")) {
+                    isReallyBridgeDaemon = true;
+                }
+            }
+            if (!isReallyBridgeDaemon) {
+                System.out.println("[AutoUpdate] Removing stale carrotbridge_svc.pid (" + pidStr + ") and starting bridge-daemon.sh");
+                svcPidFile.delete();
+                new File("/data/local/tmp/carrotbridge_java.pid").delete();
+                File daemonScript = new File(installDir, "svc/bridge-daemon.sh");
+                if (daemonScript.isFile()) {
+                    new ProcessBuilder("/system/bin/sh", daemonScript.getAbsolutePath()).start();
+                }
+            }
+        } catch (Throwable ignored) {
         }
     }
 

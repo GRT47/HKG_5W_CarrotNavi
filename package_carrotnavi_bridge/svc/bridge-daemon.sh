@@ -17,7 +17,9 @@ JAVA_PID_FILE="/data/local/tmp/carrotbridge_java.pid"
 if [ -f "$SVC_PID_FILE" ]; then
     old_svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
     if [ -n "$old_svc_pid" ] && [ "$old_svc_pid" != "$$" ] && kill -0 "$old_svc_pid" 2>/dev/null; then
-        exit 0
+        if grep -q "bridge-daemon.sh" "/proc/$old_svc_pid/cmdline" 2>/dev/null; then
+            exit 0
+        fi
     fi
 fi
 echo "$$" > "$SVC_PID_FILE" 2>/dev/null
@@ -108,8 +110,10 @@ start_bridge_java() {
     if [ -f "$JAVA_PID_FILE" ]; then
         saved_jpid="$(cat "$JAVA_PID_FILE" 2>/dev/null)"
         if [ -n "$saved_jpid" ] && kill -0 "$saved_jpid" 2>/dev/null; then
-            BRIDGE_PID="$saved_jpid"
-            return 0
+            if grep -q "com.hkg.carrotbridge.CarrotBridgeMain" "/proc/$saved_jpid/cmdline" 2>/dev/null; then
+                BRIDGE_PID="$saved_jpid"
+                return 0
+            fi
         fi
     fi
     kill_bridge_java
@@ -155,10 +159,11 @@ log_info "Service started (pid=$$)"
 
 HOTSPOT_CONF="$INSTALL_DIR/config/hotspot_auto.conf"
 if [ -f "$HOTSPOT_CONF" ]; then
-    conf_val="$(cat "$HOTSPOT_CONF" 2>/dev/null | tr -d '\r\n ')"
-    if [ "$conf_val" = "0" ] || [ "$conf_val" = "1" ]; then
-        setprop persist.sys.hotspot.auto "$conf_val"
-    fi
+    raw_conf="$(cat "$HOTSPOT_CONF" 2>/dev/null)"
+    case "$raw_conf" in
+        *0*) setprop persist.sys.hotspot.auto 0 ;;
+        *1*) setprop persist.sys.hotspot.auto 1 ;;
+    esac
 elif [ -z "$(getprop persist.sys.hotspot.auto)" ]; then
     setprop persist.sys.hotspot.auto 1
     mkdir -p "$INSTALL_DIR/config" 2>/dev/null
@@ -204,11 +209,14 @@ while true; do
 
     # 1. Auto-Hotspot maintenance (respects dashboard checkbox config/hotspot_auto.conf and persist.sys.hotspot.auto)
     if [ -f "$HOTSPOT_CONF" ]; then
-        conf_val="$(cat "$HOTSPOT_CONF" 2>/dev/null | tr -d '\r\n ')"
-        if [ "$conf_val" = "0" ] || [ "$conf_val" = "1" ]; then
-            if [ "$(getprop persist.sys.hotspot.auto)" != "$conf_val" ]; then
-                setprop persist.sys.hotspot.auto "$conf_val"
-            fi
+        raw_conf="$(cat "$HOTSPOT_CONF" 2>/dev/null)"
+        conf_val=""
+        case "$raw_conf" in
+            *0*) conf_val="0" ;;
+            *1*) conf_val="1" ;;
+        esac
+        if [ -n "$conf_val" ] && [ "$(getprop persist.sys.hotspot.auto)" != "$conf_val" ]; then
+            setprop persist.sys.hotspot.auto "$conf_val"
         fi
     fi
     auto_mode="$(getprop persist.sys.hotspot.auto)"
