@@ -29,7 +29,7 @@ if [ "$(getprop persist.sys.usb.config)" != "adb" ]; then
 fi
 ENG_PREF="/data/data/com.hkmc.system.app.engineering/shared_prefs/com.hkmc.system.app.engineering_preferences.xml"
 if [ -f "$ENG_PREF" ]; then
-    sed -i 's/<boolean name="adb_tcp_setting" value="true" \/>/<boolean name="adb_tcp_setting" value="false" \/>/g' "$ENG_PREF" 2>/dev/null
+    /system/bin/busybox sed -i 's/<boolean name="adb_tcp_setting" value="true" \/>/<boolean name="adb_tcp_setting" value="false" \/>/g' "$ENG_PREF" 2>/dev/null
 fi
 ip addr flush dev eth0 >/dev/null 2>&1
 ip link set eth0 down >/dev/null 2>&1

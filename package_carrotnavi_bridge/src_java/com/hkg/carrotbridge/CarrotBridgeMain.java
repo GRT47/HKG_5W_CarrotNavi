@@ -24,6 +24,7 @@ import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
 import java.util.LinkedHashMap;
@@ -32,6 +33,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.net.ssl.SSLContext;
@@ -58,7 +60,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.3";
+    public static final String BRIDGE_VERSION = "1.2.4";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -144,6 +146,7 @@ public class CarrotBridgeMain {
         // Destination remaining distance & time
         public int remainDistM = 0;
         public int remainTimeSec = 0;
+        public int subInfoTimeType = 0;
 
         // GPS & Current Road
         public double lat = 0.0;
@@ -433,15 +436,19 @@ public class CarrotBridgeMain {
                     }
                 }
             }
-            // 5. NaviCluster.updateRemainDis() (Bar-graph countdown distance to next turn: scale_unit 0=m, 1=km)
+            // 5. NaviCluster.updateRemainDis() (Bar-graph countdown distance when bar_graph_level is present; otherwise 0x4F camera/tollgate distance)
             else if (line.contains("updateRemainDis()")) {
                 interestingForTrace = true;
                 Map<String, Integer> kv = extractIntMap(line);
-                int rem = kv.containsKey("remained_distance") ? kv.get("remained_distance") : 0;
+                int rem = kv.containsKey("remained_distance") ? kv.get("remained_distance") : 65535;
                 int under = kv.containsKey("under_decimal") ? kv.get("under_decimal") : 0;
-                int unit = kv.containsKey("scale_unit") ? kv.get("scale_unit") : 0;
+                int unit = kv.containsKey("scale_unit") ? kv.get("scale_unit") : 15;
                 if (rem >= 0 && rem < 65535 && unit >= 0 && unit < 15) {
-                    st.remainTurnDistM = convertDistToMeters(rem, under, unit, false);
+                    if (line.contains("bar_graph_level")) {
+                        st.remainTurnDistM = convertDistToMeters(rem, under, unit, false);
+                    }
+                } else {
+                    st.remainTurnDistM = 0;
                 }
             }
             // 6. NaviCluster.updateTBTSubInfo2C() (unit: 0=m, 1=km, 15=invalid)
@@ -499,16 +506,27 @@ public class CarrotBridgeMain {
                     st.remainDistM = 0;
                     st.remainTimeSec = 0;
                 }
+                int arrivalType = extractIntAfter(line, "arrivalTimeType:", -1);
+                int hh = extractIntAfter(line, "hour:", -1);
+                int mm = extractIntAfter(line, "min:", -1);
+                if (arrivalType > 0 && hh >= 0 && mm >= 0) {
+                    st.subInfoTimeType = arrivalType;
+                    applySubInfoTimeLocked(st, arrivalType, hh, mm);
+                }
             }
             // 10. ClusterService: updateTPCrossroadName()::crossroadname is ...
-            else if (line.contains("updateTPCrossroadName()::crossroadname is ")) {
+            else if (line.contains("updateTPCrossroadName()::crossroadname is")) {
                 interestingForTrace = true;
-                int idx = line.indexOf("crossroadname is ");
+                int idx = line.indexOf("crossroadname is");
                 if (idx >= 0) {
-                    String rawName = line.substring(idx + "crossroadname is ".length()).trim();
-                    String decoded = decodeMnsoftTpString(rawName);
-                    if (!decoded.isEmpty() && (!decoded.contains("\uFFFD") || st.crossroadName.isEmpty())) {
-                        st.crossroadName = decoded;
+                    String rawName = line.substring(idx + "crossroadname is".length()).trim();
+                    if (rawName.isEmpty()) {
+                        st.crossroadName = "";
+                    } else {
+                        String decoded = decodeMnsoftTpString(rawName);
+                        if (!decoded.isEmpty() && (!decoded.contains("\uFFFD") || st.crossroadName.isEmpty())) {
+                            st.crossroadName = decoded;
+                        }
                     }
                 }
             }
@@ -574,7 +592,8 @@ public class CarrotBridgeMain {
             applyDisplayTypeStringLocked(st, val);
         } else if (line.contains("[IL TBT Info - 0x4E] Direction =")) {
             String val = substringAfter(line, "Direction =").trim();
-            st.tbtDirectionDeg = parseLeadingDouble(val, st.tbtDirectionDeg);
+            double deg = parseLeadingDouble(val, -1.0);
+            st.tbtDirectionDeg = (deg >= 0.0 && deg <= 360.0) ? deg : -1.0;
         } else if (line.contains("[IL TBT Info - 0x4E] Distance =")) {
             String val = substringAfter(line, "Distance =").trim();
             st.tbtDistM = parseDistanceWithUnitText(val);
@@ -588,14 +607,16 @@ public class CarrotBridgeMain {
         } else if (line.contains("sendCluster_H_U_Navi_T_TurnName() UTF-16LI =")) {
             String raw = substringAfter(line, "UTF-16LI =").trim();
             String cleaned = cleanDecodedString(raw);
-            if (!cleaned.isEmpty()) {
-                st.crossroadName = cleaned;
-            }
+            st.crossroadName = cleaned;
         } else if (line.contains("[TP Crossroad Name - 0x4F(0xF0)] Crossroad Name =")) {
             String raw = substringAfter(line, "Crossroad Name =").trim();
-            String decoded = decodeMnsoftTpString(raw);
-            if (!decoded.isEmpty() && (!decoded.contains("\uFFFD") || st.crossroadName.isEmpty())) {
-                st.crossroadName = decoded;
+            if (raw.isEmpty()) {
+                st.crossroadName = "";
+            } else {
+                String decoded = decodeMnsoftTpString(raw);
+                if (!decoded.isEmpty() && (!decoded.contains("\uFFFD") || st.crossroadName.isEmpty())) {
+                    st.crossroadName = decoded;
+                }
             }
         } else if (line.contains("[IL TBT Sub Info - 0x4D] Distance To Destination =")) {
             String val = substringAfter(line, "Distance To Destination =").trim();
@@ -605,6 +626,18 @@ public class CarrotBridgeMain {
             } else {
                 int d = parseDistanceWithUnitText(val);
                 if (d >= 0) st.remainDistM = d;
+            }
+        } else if (line.contains("[IL TBT Sub Info - 0x4D] TimeType =")) {
+            String val = substringAfter(line, "TimeType =").trim();
+            int tt = parseIntSafe(val, -1);
+            if (tt >= 0) st.subInfoTimeType = tt;
+        } else if (line.contains("[IL TBT Sub Info - 0x4D] Time =")) {
+            String val = substringAfter(line, "Time =").trim();
+            int colon = val.indexOf(':');
+            if (colon > 0) {
+                int hh = parseIntSafe(val.substring(0, colon).trim(), -1);
+                int mm = parseIntSafe(val.substring(colon + 1).trim(), -1);
+                applySubInfoTimeLocked(st, st.subInfoTimeType, hh, mm);
             }
         } else if (line.contains("[IL TBT Sub Info - 0x4D] Compass =")) {
             String val = substringAfter(line, "Compass =").trim();
@@ -702,7 +735,8 @@ public class CarrotBridgeMain {
                         applyDisplayTypeStringLocked(st, dt);
                     } else if (line.startsWith("Direction")) {
                         String dir = substringAfter(line, "=").trim();
-                        st.tbtDirectionDeg = parseLeadingDouble(dir, st.tbtDirectionDeg);
+                        double deg = parseLeadingDouble(dir, -1.0);
+                        st.tbtDirectionDeg = (deg >= 0.0 && deg <= 360.0) ? deg : -1.0;
                     } else if (line.startsWith("Distance")) {
                         String dist = substringAfter(line, "=").trim();
                         st.tbtDistM = parseDistanceWithUnitText(dist);
@@ -716,13 +750,25 @@ public class CarrotBridgeMain {
                     }
                 } else if ("SUB1".equals(section)) {
                     if (line.startsWith("distance")) {
-                        String d = substringAfter(line, "=").split("\\|")[0].trim();
+                        String[] parts = line.split("\\|");
+                        String d = substringAfter(parts[0], "=").trim();
                         int distM = parseDistanceWithUnitText(d);
                         if (distM >= 0) st.remainDistM = distM;
+                        if (parts.length > 1 && parts[1].contains("time")) {
+                            String ttStr = substringAfter(parts[1], "=").trim().toUpperCase(Locale.US);
+                            if (ttStr.contains("ESTIMATE") || ttStr.contains("ARRIVAL")) st.subInfoTimeType = 1;
+                            else if (ttStr.contains("NECESSARY")) st.subInfoTimeType = 2;
+                            else if (ttStr.contains("NONE") || ttStr.contains("INVALID")) st.subInfoTimeType = 0;
+                        }
                     }
                     if (line.contains("minutes")) {
+                        int hrs = extractKeyInt(line, "hours\\s*=\\s*(-?\\d+)", -1);
                         int mins = extractKeyInt(line, "minutes\\s*=\\s*(-?\\d+)", -1);
-                        if (mins >= 0 && mins < 10000) st.remainTimeSec = mins * 60;
+                        if (hrs >= 0 && mins >= 0) {
+                            applySubInfoTimeLocked(st, st.subInfoTimeType > 0 ? st.subInfoTimeType : 2, hrs, mins);
+                        } else if (mins >= 0 && mins < 10000) {
+                            st.remainTimeSec = mins * 60;
+                        }
                     }
                     if (line.startsWith("CompassDegree")) {
                         double deg = parseLeadingDouble(substringAfter(line, "=").trim(), -1.0);
@@ -901,7 +947,8 @@ public class CarrotBridgeMain {
                 int primaryTurn = mapHkmcToCarrotTurnType(st.displayTypeCode, st.tbtDirectionDeg, st.sccNextTurnType1, st.displayTG, st.tollGateFee);
                 int primaryDist = st.tbtDistM > 0 ? st.tbtDistM
                         : (st.remainTurnDistM > 0 ? st.remainTurnDistM
-                        : (st.sccNextTurnDist1 > 0 && st.sccNextTurnDist1 < 4095 ? st.sccNextTurnDist1 : st.turnListDist1M));
+                        : (st.sccNextTurnDist1 > 0 && st.sccNextTurnDist1 < 4095 ? st.sccNextTurnDist1
+                        : (st.subInfo2Dist2M > 0 && st.subInfo2Dist1M > 0 ? st.subInfo2Dist1M : st.turnListDist1M)));
 
                 pkt.nTBTTurnType = primaryTurn;
                 pkt.nTBTDist = Math.max(0, primaryDist);
@@ -912,8 +959,9 @@ public class CarrotBridgeMain {
                 int nextTurn = st.sccNextTurnType2 > 0
                         ? mapSccTurnTypeToCarrot(st.sccNextTurnType2)
                         : (st.turnListType2 > 0 ? mapHkmcToCarrotTurnType(st.turnListType2, 0.0, 0, 0, 0) : -1);
-                int nextDist = st.subInfo2Dist1M > 0 ? st.subInfo2Dist1M
-                        : (st.sccNextTurnDist2 > 0 && st.sccNextTurnDist2 < 4095 ? st.sccNextTurnDist2 : st.turnListDist2M);
+                int nextDist = st.subInfo2Dist2M > 0 ? st.subInfo2Dist2M
+                        : ((st.subInfo2Dist1M > 0 && st.subInfo2Dist1M != primaryDist) ? st.subInfo2Dist1M
+                        : (st.sccNextTurnDist2 > 0 && st.sccNextTurnDist2 < 4095 ? st.sccNextTurnDist2 : st.turnListDist2M));
                 if (nextDist > 0 && nextTurn < 0) {
                     nextTurn = 51; // straight/notification if distance is known
                 }
@@ -966,13 +1014,14 @@ public class CarrotBridgeMain {
                 return 201; // ARRIVED / NEAR DESTINATION
             case 2:
             case 11:
+            case 67:
                 if (sccTurnType1 > 0 && sccTurnType1 != 11) {
                     int sccMapped = mapSccTurnTypeToCarrot(sccTurnType1);
                     if (sccMapped > 0) return sccMapped;
                 }
                 return 51; // FOLLOW STREET (straight)
             case 12:
-                return directionDeg > 180.0 ? 7 : 6; // CHANGE LANE left/right
+                return (directionDeg > 180.0 && directionDeg < 360.0) ? 7 : 6; // CHANGE LANE left/right
             case 13:
             case 14:
             case 15:
@@ -1006,7 +1055,7 @@ public class CarrotBridgeMain {
                 return 102; // EXIT LEFT / SERVICE ROAD LEFT / RAMP LEFT
             case 25:
             case 26:
-                return directionDeg > 180.0 ? 7 : 6; // FORK-2 / FORK-3
+                return (directionDeg > 180.0 && directionDeg < 360.0) ? 7 : 6; // FORK-2 / FORK-3
             case 27:
             case 28:
             case 29:
@@ -1054,6 +1103,13 @@ public class CarrotBridgeMain {
             st.displayTypeCode = numeric;
             return;
         }
+        if (numeric == 0x43 || numeric > 46) {
+            // In Gen5W com.mnsoft.navi [IL TBT Info - 0x4E], DisplayType = 0x43 (67) is emitted during
+            // straight road-following guidance (>300m before the next turn). Map to 11 (FOLLOW STREET / 직진).
+            st.displayTypeCode = 11;
+            st.displayTypeName = "직진 주행";
+            return;
+        }
         if (u.contains("NO ROUTE GUIDANCE") || u.contains("COMPASS")) st.displayTypeCode = 8;
         else if (u.contains("RECALC ROUTE")) st.displayTypeCode = 10;
         else if (u.contains("CALC ROUTE")) st.displayTypeCode = 9;
@@ -1079,6 +1135,35 @@ public class CarrotBridgeMain {
         else if (u.contains("TURN")) st.displayTypeCode = 13;
         else if (u.contains("NO SYMBOL")) st.displayTypeCode = 0;
         else if (u.contains("NO INFO")) st.displayTypeCode = 1;
+    }
+
+    /**
+     * Converts TBT SubInfo time fields (0x4D) to remaining duration in seconds (nGoPosTime).
+     * timeType == 2 (NECESSARY TIME): hh:mm is remaining duration (hh * 3600 + mm * 60).
+     * timeType == 1 (ESTIMATE TIME OF ARRIVAL): hh:mm is clock arrival time in Asia/Seoul (KST).
+     */
+    private static void applySubInfoTimeLocked(NavState st, int timeType, int hh, int mm) {
+        if (hh < 0 || hh >= 24 || mm < 0 || mm >= 60) {
+            return;
+        }
+        if (timeType == 2) {
+            st.remainTimeSec = (hh * 3600) + (mm * 60);
+        } else if (timeType == 1) {
+            Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("Asia/Seoul"));
+            int nowH = cal.get(Calendar.HOUR_OF_DAY);
+            int nowM = cal.get(Calendar.MINUTE);
+            int diffMin = (hh * 60 + mm) - (nowH * 60 + nowM);
+            if (diffMin < 0 && diffMin >= -720 && hh < 12 && nowH >= 12) {
+                diffMin += 720;
+            } else if (diffMin < 0) {
+                diffMin += 1440;
+            }
+            if (diffMin == 0 && st.remainDistM > 0) {
+                st.remainTimeSec = 60;
+            } else if (diffMin > 0 && diffMin <= 720) {
+                st.remainTimeSec = diffMin * 60;
+            }
+        }
     }
 
     // =========================================================================
@@ -1443,6 +1528,48 @@ public class CarrotBridgeMain {
     private static volatile String latestTargetsStr = "[]";
     private static volatile String lastAutoUpdateStatus = "내비 켜질 때 1회 자동 확인 (대기 중)";
     private static volatile long lastWarmWakeUpdateMs = System.currentTimeMillis();
+    private static final Object AUTO_UPDATE_LOCK = new Object();
+    private static volatile boolean autoUpdateInProgress = false;
+
+    public static void triggerBackgroundAutoUpdate(final String installDir, final long delayMs, final boolean fromUi) {
+        synchronized (AUTO_UPDATE_LOCK) {
+            if (autoUpdateInProgress) {
+                return;
+            }
+            autoUpdateInProgress = true;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (delayMs > 0L) {
+                        try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
+                    }
+                    String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+                    int rc = runAutoUpdate("GRT47", "HKG_5W_CarrotNavi", "main", installDir, false);
+                    if (rc == 0) {
+                        lastAutoUpdateStatus = "최신 버전 유지 중 (v" + BRIDGE_VERSION + ", 확인: " + nowStr + ")";
+                        if (fromUi) {
+                            StatusDashboardOverlay.notifyUpdateResult(0, nowStr);
+                        }
+                    } else if (rc == 10) {
+                        lastAutoUpdateStatus = "새 버전 적용 완료 -> 데몬 재시작 중 (" + nowStr + ")";
+                        if (fromUi) {
+                            StatusDashboardOverlay.notifyUpdateResult(10, nowStr);
+                        }
+                        try { Thread.sleep(1200L); } catch (InterruptedException ignored) {}
+                        System.exit(0); // Watchdog in bridge-daemon.sh immediately restarts updated JAR
+                    } else if (fromUi) {
+                        StatusDashboardOverlay.notifyUpdateResult(rc, nowStr);
+                    }
+                } finally {
+                    synchronized (AUTO_UPDATE_LOCK) {
+                        autoUpdateInProgress = false;
+                    }
+                }
+            }
+        }, "CarrotAutoUpdater").start();
+    }
 
     public static boolean loadCommaTxEnabledConfig(String installDir) {
         try {
@@ -1524,6 +1651,7 @@ public class CarrotBridgeMain {
         final File traceFile = new File(dumpDir, "tbt_live_trace.log");
         final File statusFile = new File("/data/local/tmp/carrotbridge_status.json");
         final File showUiTriggerFile = new File("/data/local/tmp/carrotbridge_show_ui");
+        final File checkUpdateTriggerFile = new File("/data/local/tmp/carrotbridge_check_update");
 
         System.out.println("[CarrotBridge] Starting daemon v" + BRIDGE_VERSION + " (installDir=" + installDir + ")");
         commaTxEnabled = loadCommaTxEnabledConfig(installDir);
@@ -1597,21 +1725,7 @@ public class CarrotBridgeMain {
                                 } else if (isWarmWakeNaviOnLine(line) && (nowMs - lastWarmWakeUpdateMs) > 60000L && !navState.isGuidanceActive()) {
                                     lastWarmWakeUpdateMs = nowMs;
                                     System.out.println("[CarrotBridge] Warm Wakeup / ACC ON detected -> running one-time GitHub Auto-Update check");
-                                    new Thread(new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            try { Thread.sleep(8000L); } catch (InterruptedException ignored) {}
-                                            String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
-                                            int rc = runAutoUpdate("GRT47", "HKG_5W_CarrotNavi", "main", installDir, false);
-                                            if (rc == 0) {
-                                                lastAutoUpdateStatus = "시동/내비 ON 확인 완료 (최신 v" + BRIDGE_VERSION + ", " + nowStr + ")";
-                                            } else if (rc == 10) {
-                                                lastAutoUpdateStatus = "시동/내비 ON 새 버전 적용 -> 재시작 (" + nowStr + ")";
-                                                try { Thread.sleep(1000L); } catch (InterruptedException ignored) {}
-                                                System.exit(0);
-                                            }
-                                        }
-                                    }, "WarmWakeAutoUpdater").start();
+                                    triggerBackgroundAutoUpdate(installDir, 8000L, false);
                                 }
                             }
                             parseLogcatLine(line, navState, traceFile);
@@ -1676,7 +1790,7 @@ public class CarrotBridgeMain {
                             lastEngWakeMs = now;
                         }
                         String out = execCommandCapture(new String[]{
-                                "/system/bin/dumpsys", "cluster"
+                                "/system/bin/dumpsys", "com.hkmc.micom.cluster"
                         }, 150);
                         if (!out.isEmpty()) {
                             parseDumpsysCluster(out, navState);
@@ -1709,6 +1823,10 @@ public class CarrotBridgeMain {
             if (showUiTriggerFile.exists()) {
                 showUiTriggerFile.delete();
                 StatusDashboardOverlay.show();
+            }
+            if (checkUpdateTriggerFile.exists()) {
+                checkUpdateTriggerFile.delete();
+                triggerBackgroundAutoUpdate(installDir, 0L, false);
             }
 
             if (now - lastArpScanMs > 5000L) {
@@ -3149,28 +3267,18 @@ public class CarrotBridgeMain {
         private static void triggerManualUpdateFromUi() {
             actionBannerMsg = "⏳ GitHub 최신 버전(GRT47/HKG_5W_CarrotNavi) 확인 중...";
             postToUi(REFRESH_TASK);
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
-                    int rc = runAutoUpdate("GRT47", "HKG_5W_CarrotNavi", "main", installDir, false);
-                    if (rc == 0) {
-                        lastAutoUpdateStatus = "최신 버전 유지 중 (v" + BRIDGE_VERSION + ", 확인: " + nowStr + ")";
-                        actionBannerMsg = "✅ 현재 최신 버전(v" + BRIDGE_VERSION + ")입니다. (" + nowStr + ")";
-                        postToUi(REFRESH_TASK);
-                    } else if (rc == 10) {
-                        lastAutoUpdateStatus = "새 버전 적용 완료 -> 데몬 재시작 중 (" + nowStr + ")";
-                        actionBannerMsg = "🎉 업데이트 적용 완료! 브릿지 데몬을 재시작합니다...";
-                        postToUi(REFRESH_TASK);
-                        try { Thread.sleep(1500L); } catch (InterruptedException ignored) {}
-                        System.exit(0); // Watchdog in bridge-daemon.sh immediately restarts updated JAR
-                    } else {
-                        lastAutoUpdateStatus = "업데이트 확인 실패 (LTE 연결 확인 필요, " + nowStr + ")";
-                        actionBannerMsg = "⚠️ GitHub 연결 실패 (LTE/데이터 연결 상태를 확인해주세요)";
-                        postToUi(REFRESH_TASK);
-                    }
-                }
-            }, "ManualUpdateTrigger").start();
+            triggerBackgroundAutoUpdate(installDir, 0L, true);
+        }
+
+        public static void notifyUpdateResult(int rc, String nowStr) {
+            if (rc == 0) {
+                actionBannerMsg = "✅ 현재 최신 버전(v" + BRIDGE_VERSION + ")입니다. (" + nowStr + ")";
+            } else if (rc == 10) {
+                actionBannerMsg = "🎉 업데이트 적용 완료! 브릿지 데몬을 재시작합니다...";
+            } else {
+                actionBannerMsg = "⚠️ GitHub 연결 실패 (LTE/데이터 연결 상태를 확인해주세요)";
+            }
+            postToUi(REFRESH_TASK);
         }
 
         private static void triggerManualDumpFromUi() {
@@ -3388,6 +3496,7 @@ public class CarrotBridgeMain {
 
     public static String describeTurnType(int turnType) {
         switch (turnType) {
+            case -1:
             case 0: return "안내없음";
             case 11: return "직진";
             case 12: return "좌회전";
@@ -3399,7 +3508,7 @@ public class CarrotBridgeMain {
             case 19: return "4시방향 급우회전";
             case 43: return "우측 고가/지하차도 진입";
             case 44: return "좌측 고가/지하차도 진입";
-            case 51: return "전방 주의/안내";
+            case 51: return "직진/도로안내";
             case 75: return "고속도로 첫 출구";
             case 101: return "우측 출구(IC/JC)";
             case 102: return "좌측 출구(IC/JC)";
@@ -3502,6 +3611,26 @@ public class CarrotBridgeMain {
         CarrotPacket camClearPkt = buildCarrotPacket(stReal);
         if (camClearPkt.nSdiType != -1 || camClearPkt.nSdiSpeedLimit != 0 || camClearPkt.nSdiDist != -1) {
             throw new AssertionError("Gen5W camera clear mismatch: " + camClearPkt.toJson());
+        }
+
+        // 1d. Test Gen5W DisplayType=0x43 (straight road-following after completing a turn) + Direction=1912.5 invalid sentinel
+        //     + empty UTF-16LI crossroad clear + updateTBTSubInfo2C distToPoint1=2.0km / distToPoint2=280m + SubInfo TimeType=2 (00:15)
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateSCC_HU_Navi_P() msgGroupNum1: 2 setDestStatus: 1 offRouteStatus: 0 nextTurnType1: 0 naviValidity: 0 nextTurnDist1: 4095 curLinkCntLane: 4 curRoadClass: 4 nextTurnType2: 0 nextTurnDist2: 4095", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0x43", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Direction = 1912.5", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Distance = 2.0 km", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] sendCluster_H_U_Navi_T_TurnName() UTF-16LI = ", stReal, null);
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateRemainDis() remained_distance: 65535 scale_unit: 15 under_decimal: 15 nv_display_TG: 0", stReal, null);
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateTBTSubInfo2C() distToPoint1_unit: 1 distToPoint1_F: 0 distToPoint1_I: 2 distToPoint2_unit: 0 distToPoint2_F: 0 distToPoint2_I: 280 distToPoint3_unit: 0 distToPoint3_F: 0 distToPoint3_I: 20", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Sub Info - 0x4D] Distance To Destination = 2.3km", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Sub Info - 0x4D] TimeType = 2", stReal, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Sub Info - 0x4D] Time = 00:15", stReal, null);
+        CarrotPacket straightPkt = buildCarrotPacket(stReal);
+        if (straightPkt.nTBTTurnType != 51 || straightPkt.nTBTDist != 2000 || !"직진 주행".equals(straightPkt.szTBTMainText)) {
+            throw new AssertionError("DisplayType=0x43 straight guidance mismatch: " + straightPkt.toJson());
+        }
+        if (straightPkt.nTBTDistNext != 280 || straightPkt.nGoPosDist != 2300 || straightPkt.nGoPosTime != 900) {
+            throw new AssertionError("SubInfo2 distToPoint2 / SubInfo TimeType=2 mismatch: " + straightPkt.toJson());
         }
 
         // 2. Test Section Control + Average Speed

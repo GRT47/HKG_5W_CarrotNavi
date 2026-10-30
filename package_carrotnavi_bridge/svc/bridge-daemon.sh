@@ -14,12 +14,28 @@ mkdir -p /data/dalvik-cache 2>/dev/null
 SVC_PID_FILE="/data/local/tmp/carrotbridge_svc.pid"
 JAVA_PID_FILE="/data/local/tmp/carrotbridge_java.pid"
 
+is_pid_matching() {
+    _chk_pid="$1"
+    _chk_pat="$2"
+    if [ -z "$_chk_pid" ] || ! kill -0 "$_chk_pid" 2>/dev/null; then
+        return 1
+    fi
+    _cmdline="$(/system/bin/busybox tr '\0' ' ' < "/proc/$_chk_pid/cmdline" 2>/dev/null)"
+    case "$_cmdline" in
+        *"$_chk_pat"*)
+            return 0
+            ;;
+    esac
+    if [ -f "/proc/$_chk_pid/maps" ] && grep -q "$_chk_pat" "/proc/$_chk_pid/maps" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 if [ -f "$SVC_PID_FILE" ]; then
     old_svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
-    if [ -n "$old_svc_pid" ] && [ "$old_svc_pid" != "$$" ] && kill -0 "$old_svc_pid" 2>/dev/null; then
-        if grep -q "bridge-daemon.sh" "/proc/$old_svc_pid/cmdline" 2>/dev/null; then
-            exit 0
-        fi
+    if [ -n "$old_svc_pid" ] && [ "$old_svc_pid" != "$$" ] && is_pid_matching "$old_svc_pid" "bridge-daemon.sh"; then
+        exit 0
     fi
 fi
 echo "$$" > "$SVC_PID_FILE" 2>/dev/null
@@ -38,8 +54,14 @@ kill_bridge_java() {
         kill "$BRIDGE_PID" >/dev/null 2>&1
         BRIDGE_PID=""
     fi
+    if [ -f "$JAVA_PID_FILE" ]; then
+        _old_jpid="$(cat "$JAVA_PID_FILE" 2>/dev/null)"
+        if is_pid_matching "$_old_jpid" "CarrotBridgeMain" || is_pid_matching "$_old_jpid" "carrotbridge.jar"; then
+            kill "$_old_jpid" >/dev/null 2>&1
+        fi
+        rm -f "$JAVA_PID_FILE" 2>/dev/null
+    fi
     /system/bin/busybox pkill -f "com.hkg.carrotbridge.CarrotBridgeMain daemon" >/dev/null 2>&1
-    pkill -f "com.hkg.carrotbridge.CarrotBridgeMain daemon" >/dev/null 2>&1
 }
 
 disable_adb_tcp() {
@@ -50,7 +72,7 @@ disable_adb_tcp() {
         fi
     fi
     if [ -f "$ENG_PREF" ] && grep -q 'name="adb_tcp_setting" value="true"' "$ENG_PREF" 2>/dev/null; then
-        sed -i 's/<boolean name="adb_tcp_setting" value="true" \/>/<boolean name="adb_tcp_setting" value="false" \/>/g' "$ENG_PREF" 2>/dev/null
+        /system/bin/busybox sed -i 's/<boolean name="adb_tcp_setting" value="true" \/>/<boolean name="adb_tcp_setting" value="false" \/>/g' "$ENG_PREF" 2>/dev/null
     fi
     if ip addr show dev eth0 2>/dev/null | grep -q "192.168.0."; then
         ip addr flush dev eth0 >/dev/null 2>&1
@@ -109,11 +131,9 @@ start_bridge_java() {
     fi
     if [ -f "$JAVA_PID_FILE" ]; then
         saved_jpid="$(cat "$JAVA_PID_FILE" 2>/dev/null)"
-        if [ -n "$saved_jpid" ] && kill -0 "$saved_jpid" 2>/dev/null; then
-            if grep -q "com.hkg.carrotbridge.CarrotBridgeMain" "/proc/$saved_jpid/cmdline" 2>/dev/null; then
-                BRIDGE_PID="$saved_jpid"
-                return 0
-            fi
+        if is_pid_matching "$saved_jpid" "CarrotBridgeMain" || is_pid_matching "$saved_jpid" "carrotbridge.jar"; then
+            BRIDGE_PID="$saved_jpid"
+            return 0
         fi
     fi
     kill_bridge_java
@@ -137,13 +157,11 @@ check_bridge_java_watchdog() {
 }
 
 run_github_update_check() {
-    log_info "Running GitHub Auto-Update check (GRT47/HKG_5W_CarrotNavi)..."
-    CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" 2>&1
-    rc="$?"
-    if [ "$rc" = "10" ]; then
-        log_info "GitHub update applied -> restarting CarrotBridgeMain daemon"
-        kill_bridge_java
-        start_bridge_java
+    log_info "Triggering GitHub Auto-Update check (GRT47/HKG_5W_CarrotNavi)..."
+    if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
+        echo 1 > /data/local/tmp/carrotbridge_check_update 2>/dev/null
+    else
+        CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" 2>&1
     fi
 }
 

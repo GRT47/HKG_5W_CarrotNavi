@@ -16,14 +16,17 @@ SVC_PID_FILE="/data/local/tmp/carrotbridge_svc.pid"
 # 1. Immediately signal the Status Dashboard Overlay to appear on screen
 echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
 
-# 2. Ensure carrot-7706-bridge background service is running (verify /proc/<pid>/cmdline to avoid stale boot PID collision)
+# 2. Ensure carrot-7706-bridge background service is running (use busybox tr to handle NUL bytes in /proc/<pid>/cmdline)
 svc_alive=0
 if [ -f "$SVC_PID_FILE" ]; then
     svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
     if [ -n "$svc_pid" ] && kill -0 "$svc_pid" 2>/dev/null; then
-        if grep -q "bridge-daemon.sh" "/proc/$svc_pid/cmdline" 2>/dev/null; then
-            svc_alive=1
-        fi
+        svc_cmdline="$(/system/bin/busybox tr '\0' ' ' < "/proc/$svc_pid/cmdline" 2>/dev/null)"
+        case "$svc_cmdline" in
+            *bridge-daemon.sh*)
+                svc_alive=1
+                ;;
+        esac
     fi
 fi
 if [ "$svc_alive" = "0" ]; then
@@ -31,7 +34,7 @@ if [ "$svc_alive" = "0" ]; then
     /system/bin/sh "$INSTALL_DIR/svc/bridge-daemon.sh" </dev/null >>/data/local/tmp/carrotbridge_svc.log 2>&1 &
 fi
 
-# 3. Run Hotspot assertion, TBT logger wakeup, and GitHub Auto-Update check asynchronously in background
+# 3. Run Hotspot assertion, TBT logger wakeup, and signal the running daemon to check GitHub Auto-Update (avoids concurrent dexopt SIGABRT)
 (
     if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
         setprop wifi.hotspot.subscription true
@@ -59,12 +62,7 @@ fi
         /system/bin/sh "$INSTALL_DIR/scripts/tbt-dump.sh" >/dev/null 2>&1 &
     fi
 
-    if [ -f "$INSTALL_DIR/bin/carrotbridge.jar" ]; then
-        CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" >> /data/local/tmp/carrotbridge_updater.log 2>&1
-        if [ "$?" = "10" ]; then
-            /system/bin/busybox pkill -f "com.hkg.carrotbridge.CarrotBridgeMain daemon" >/dev/null 2>&1
-        fi
-    fi
+    echo 1 > /data/local/tmp/carrotbridge_check_update 2>/dev/null
 ) </dev/null >/dev/null 2>&1 &
 
 exit 0
