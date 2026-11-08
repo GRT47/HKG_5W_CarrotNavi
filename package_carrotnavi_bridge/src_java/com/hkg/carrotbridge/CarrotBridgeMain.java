@@ -60,7 +60,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.5";
+    public static final String BRIDGE_VERSION = "1.2.6";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -383,19 +383,25 @@ public class CarrotBridgeMain {
                 interestingForTrace = true;
                 Map<String, Integer> kv = extractIntMap(line);
                 if (kv.containsKey("setDestStatus")) st.setDestStatus = kv.get("setDestStatus");
-                if (kv.containsKey("offRouteStatus")) st.offRouteStatus = kv.get("offRouteStatus");
+                // Gen5W real vehicles emit offRouteStatus=7 (3-bit all-1s invalid) for the whole drive; treat as "unknown" (0).
+                if (kv.containsKey("offRouteStatus")) st.offRouteStatus = normalizeOffRouteStatus(kv.get("offRouteStatus"));
                 if (kv.containsKey("naviValidity")) st.naviValidity = kv.get("naviValidity");
-                if (kv.containsKey("nextTurnType1")) st.sccNextTurnType1 = kv.get("nextTurnType1");
+                // nextTurnType1/2 = 31 is the 5-bit all-1s invalid sentinel (NOT a U-turn).
+                if (kv.containsKey("nextTurnType1")) st.sccNextTurnType1 = normalizeSccTurnType(kv.get("nextTurnType1"));
                 if (kv.containsKey("nextTurnDist1")) {
                     int d1 = kv.get("nextTurnDist1");
                     st.sccNextTurnDist1 = (d1 < 0 || d1 >= 4095) ? 0 : d1;
                 }
-                if (kv.containsKey("nextTurnType2")) st.sccNextTurnType2 = kv.get("nextTurnType2");
+                if (kv.containsKey("nextTurnType2")) st.sccNextTurnType2 = normalizeSccTurnType(kv.get("nextTurnType2"));
                 if (kv.containsKey("nextTurnDist2")) {
                     int d2 = kv.get("nextTurnDist2");
                     st.sccNextTurnDist2 = (d2 < 0 || d2 >= 4095) ? 0 : d2;
                 }
-                if (kv.containsKey("curLinkCntLane")) st.numLanes = kv.get("curLinkCntLane");
+                // curLinkCntLane = 15 is the 4-bit all-1s invalid sentinel; keep the last valid lane count.
+                if (kv.containsKey("curLinkCntLane")) {
+                    int lanes = kv.get("curLinkCntLane");
+                    if (lanes > 0 && lanes <= 12) st.numLanes = lanes;
+                }
                 if (kv.containsKey("curRoadClass")) {
                     st.curRoadClass = kv.get("curRoadClass");
                     updateRoadCateFromClassLocked(st, st.curRoadClass);
@@ -928,7 +934,8 @@ public class CarrotBridgeMain {
                         st.setDestStatus = extractKeyInt(line, "SetDestStatus\\s*=\\s*(-?\\d+)", st.setDestStatus);
                     }
                     if (line.contains("OffRouteStatus")) {
-                        st.offRouteStatus = extractKeyInt(line, "OffRouteStatus\\s*=\\s*(-?\\d+)", st.offRouteStatus);
+                        st.offRouteStatus = normalizeOffRouteStatus(
+                                extractKeyInt(line, "OffRouteStatus\\s*=\\s*(-?\\d+)", st.offRouteStatus));
                     }
                 }
 
@@ -1105,7 +1112,8 @@ public class CarrotBridgeMain {
 
             // 4. TBT (Route Guidance) mapping
             boolean guiding = st.isGuidanceActive();
-            if (guiding && st.offRouteStatus == 0) {
+            // Only an explicit OFF ROUTE (1) suppresses TBT; invalid/unknown values are normalized to 0 at parse time.
+            if (guiding && st.offRouteStatus != 1) {
                 int primaryTurn = mapHkmcToCarrotTurnType(st.displayTypeCode, st.tbtDirectionDeg, st.sccNextTurnType1, st.displayTG, st.tollGateFee);
                 int primaryDist = st.tbtDistM > 0 ? st.tbtDistM
                         : (st.remainTurnDistM > 0 ? st.remainTurnDistM
@@ -1199,7 +1207,9 @@ public class CarrotBridgeMain {
                     int sccMapped = mapSccTurnTypeToCarrot(sccTurnType1);
                     if (sccMapped > 0) return sccMapped;
                 }
-                return 13;
+                // Direction invalid (-1, e.g. 1912.5 sentinel) or near-straight (340..20 deg): never guess a right turn,
+                // which would make CarrotPilot slow down to turn speed. Send a plain straight notification instead.
+                return 51;
             case 17:
             case 19:
             case 20:
@@ -1250,9 +1260,20 @@ public class CarrotBridgeMain {
             case 17: return 101; // Exit right
             case 18: return 102; // Exit left
             case 19: return 19;  // Sharp right
-            case 31: return 14;  // U-turn
+            // 31 is the all-1s invalid sentinel, NOT a U-turn: mapping it to 14 makes CarrotPilot
+            // target 1 km/h (xTurnInfo=7) from 1000 m out on a straight road.
             default: return -1;
         }
+    }
+
+    /** SCC_HU_Navi_P nextTurnType: 0 = none, 31 (5-bit all-1s) = invalid. Both normalize to 0. */
+    static int normalizeSccTurnType(int t) {
+        return (t <= 0 || t >= 31) ? 0 : t;
+    }
+
+    /** SCC_HU_Navi_P offRouteStatus: 7 (3-bit all-1s) = invalid -> 0 (unknown / not off-route). */
+    static int normalizeOffRouteStatus(int v) {
+        return (v < 0 || v >= 7) ? 0 : v;
     }
 
     private static void applyDisplayTypeStringLocked(NavState st, String raw) {
@@ -3793,6 +3814,66 @@ public class CarrotBridgeMain {
         }
         if (straightPkt.nTBTDistNext != 280 || straightPkt.nGoPosDist != 2300 || straightPkt.nGoPosTime != 900) {
             throw new AssertionError("SubInfo2 distToPoint2 / SubInfo TimeType=2 mismatch: " + straightPkt.toJson());
+        }
+
+        // 1e. Regression: verbatim Gen5W real-vehicle lines (2026-10-27 drive). SCC_HU_Navi_P is all-1s for the whole drive
+        //     (offRouteStatus=7, nextTurnType1/2=31, curLinkCntLane=15). Previously this (a) blocked ALL TBT output via
+        //     offRouteStatus!=0 and (b) once unblocked, mapped nextTurnType=31 to U-turn (14) on straight roads.
+        NavState stDrive = new NavState();
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateSCC_HU_Navi_P() msgGroupNum1: 7 setDestStatus: 3 offRouteStatus: 7 nextTurnType1: 31 naviValidity: 7 nextTurnDist1: 4095 nextTurnDist2: 4095 curLinkCntLane: 15 curRoadClass: 15 curLinkClass: 15 nextTurnType2: 31 msgGroupNum2: 7 nextCamType: 15 nextCamDist: 1023 nextCamSpdLimit: 15 rangeCamInfo: 7 rangeCamDist: 65535 rangeCamSpdLimit: 15 rangeCamAvgMovingSpd: 255 msgGroupNum3: 7 msgGroupNum4: 7 msgGroupNum5: 7 frontPosUpdate: 3 msgGroupNum6: 7 curTrafLength: 16383 nextTrafDistance: 16383 nextPosTraffic: 15 curPosTraffic: 15", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0x43", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Direction = 1912.5", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Distance = 400.0 m", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] BarGraphLevel = Invalid", stDrive, null);
+        parseLogcatLine("D/NavigationCluster( 1235): updateTBTSubInfo() distance: 2.7 unit: 1", stDrive, null);
+        CarrotPacket driveStraight = buildCarrotPacket(stDrive);
+        if (driveStraight.nTBTTurnType != 51 || driveStraight.nTBTDist != 400 || driveStraight.nGoPosDist != 2700) {
+            throw new AssertionError("Real drive: straight 0x43 must be 51/400m with offRouteStatus=7 / nextTurnType1=31: " + driveStraight.toJson());
+        }
+        if (driveStraight.nTBTTurnTypeNext == 14) {
+            throw new AssertionError("Real drive: nextTurnType2=31 sentinel must not become U-turn: " + driveStraight.toJson());
+        }
+        if (driveStraight.nTBTNextRoadWidth != 9) {
+            throw new AssertionError("Real drive: curLinkCntLane=15 sentinel must not set road width: " + driveStraight.toJson());
+        }
+
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0xd", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Direction = 90.0", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Distance = 300.0 m", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] BarGraphLevel = 90%", stDrive, null);
+        parseLogcatLine("D/ClusterService(  555): updateTPCrossroadName()::crossroadname is 2순환로", stDrive, null);
+        CarrotPacket driveRight = buildCarrotPacket(stDrive);
+        if (driveRight.nTBTTurnType != 13 || driveRight.nTBTDist != 300 || !"2순환로".equals(driveRight.szTBTMainText)) {
+            throw new AssertionError("Real drive: right turn 0xd/90deg mismatch: " + driveRight.toJson());
+        }
+
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Direction = 270.0", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Distance = 260.0 m", stDrive, null);
+        CarrotPacket driveLeft = buildCarrotPacket(stDrive);
+        if (driveLeft.nTBTTurnType != 12 || driveLeft.nTBTDist != 260) {
+            throw new AssertionError("Real drive: left turn 0xd/270deg mismatch: " + driveLeft.toJson());
+        }
+
+        // TURN display with invalid direction must not default to a right turn (nor to U-turn via the 31 sentinel)
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] Direction = 1912.5", stDrive, null);
+        CarrotPacket driveBadDir = buildCarrotPacket(stDrive);
+        if (driveBadDir.nTBTTurnType != 51) {
+            throw new AssertionError("Real drive: TURN with invalid direction must be 51: " + driveBadDir.toJson());
+        }
+
+        // An explicit OFF ROUTE (1) must still suppress TBT; returning to on-route (0) restores it
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateSCC_HU_Navi_P() msgGroupNum1: 2 setDestStatus: 1 offRouteStatus: 1 nextTurnType1: 31 nextTurnType2: 31", stDrive, null);
+        if (buildCarrotPacket(stDrive).nTBTTurnType != -1) {
+            throw new AssertionError("offRouteStatus=1 must suppress TBT");
+        }
+        parseLogcatLine("D/ClusterService(  555): NaviCluster.updateSCC_HU_Navi_P() msgGroupNum1: 2 setDestStatus: 1 offRouteStatus: 0 nextTurnType1: 31 nextTurnType2: 31", stDrive, null);
+        parseLogcatLine("I/Java_Layer( 1235): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0x3", stDrive, null);
+        CarrotPacket driveArrive = buildCarrotPacket(stDrive);
+        if (driveArrive.nTBTTurnType != 201) {
+            throw new AssertionError("Real drive: ARRIVED 0x3 must be 201: " + driveArrive.toJson());
+        }
+        if (mapSccTurnTypeToCarrot(31) != -1 || normalizeSccTurnType(31) != 0 || normalizeOffRouteStatus(7) != 0) {
+            throw new AssertionError("SCC all-1s sentinel normalization mismatch");
         }
 
         // 2. Test Section Control + Average Speed (SCC_HU_Navi_P)
