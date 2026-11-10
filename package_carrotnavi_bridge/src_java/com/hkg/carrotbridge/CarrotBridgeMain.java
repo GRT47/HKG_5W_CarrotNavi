@@ -60,7 +60,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.6";
+    public static final String BRIDGE_VERSION = "1.2.7";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -2556,17 +2556,14 @@ public class CarrotBridgeMain {
         private static volatile Object windowManager = null;
         private static volatile Object sysContext = null;
         private static volatile Object rootOverlayView = null;
-        private static volatile Object headerSysInfoTextView = null;
-        private static volatile Object leftColTextView = null;
-        private static volatile Object autoHotspotCheckTextView = null;
-        private static volatile Object rightColTextView = null;
-        private static volatile Object commaTxCheckTextView = null;
-        private static volatile Object footerStatusTextView = null;
+        // Created when the user opens WiFi(Client) settings: bridge-daemon.sh skips auto-hotspot maintenance while it
+        // exists (AP and STA cannot run concurrently on this Broadcom firmware). Deleted by the daemon on every boot.
+        private static final String HOTSPOT_PAUSE_FILE = "/data/local/tmp/carrotbridge_hotspot_pause";
         private static volatile boolean isVisible = false;
         private static volatile long shownAtMs = 0L;
-        private static volatile String actionBannerMsg = "MAP 버튼 3연타로 열기/닫기 | 60초 후 자동 닫힘";
+        private static volatile String actionBannerMsg = "";
         private static volatile long lastSysBadgeMs = 0L;
-        private static volatile String cachedSysBadgeText = "🌡️ CPU: --°C  |  💾 RAM: --/--MB";
+        private static volatile String cachedSysBadgeText = "CPU --   RAM --";
         private static volatile long lastCpuTotalTicks = 0L;
         private static volatile long lastCpuIdleTicks = 0L;
         private static volatile int lastCpuLoadPct = 0;
@@ -2731,243 +2728,769 @@ public class CarrotBridgeMain {
             }
         }
 
-        private static Object[] buildDashboardViewTree() throws Exception {
-            Class<?> ctxCls = Class.forName("android.content.Context");
-            Class<?> viewCls = Class.forName("android.view.View");
-            Class<?> vgCls = Class.forName("android.view.ViewGroup");
-            Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
-            Class<?> llCls = Class.forName("android.widget.LinearLayout");
-            Class<?> llLpCls = Class.forName("android.widget.LinearLayout$LayoutParams");
+        // =====================================================================================
+        // FULL-SCREEN DASHBOARD  (Gen5W 10.25" panel: 1920x720 px @ 240 dpi = 1280x480 dp)
+        // Layout mirrors the HTML design canvas "CarrotNavi 대시보드 시안" 1:1 in dp / sp.
+        // =====================================================================================
+
+        private static final int C_BG = 0xFF0B1120;
+        private static final int C_CARD = 0xFF111A2C;
+        private static final int C_INSET = 0xFF0D1526;
+        private static final int C_CHIP = 0xFF121B2E;
+        private static final int C_BTN = 0xFF172036;
+        private static final int C_BORDER = 0xFF22304A;
+        private static final int C_BORDER_STRONG = 0xFF2A3A57;
+        private static final int C_DIVIDER = 0xFF1C2840;
+        private static final int C_TRACK = 0xFF1F2A40;
+        private static final int C_TEXT = 0xFFE6EDF7;
+        private static final int C_TEXT_2 = 0xFFCBD5E1;
+        private static final int C_MUTED = 0xFF94A3B8;
+        private static final int C_FAINT = 0xFF64748B;
+        private static final int C_ACCENT = 0xFFF97316;
+        private static final int C_ON_ACCENT = 0xFF1A0E05;
+        private static final int C_INFO = 0xFF38BDF8;
+        private static final int C_INFO_TEXT = 0xFF7DD3FC;
+        private static final int C_OK = 0xFF34D399;
+        private static final int C_WARN = 0xFFFBBF24;
+        private static final int C_SIGN_RED = 0xFFDC2626;
+        private static final int C_OFF = 0xFF334155;
+        private static final int C_WHITE = 0xFFFFFFFF;
+        private static final int C_VIOLET = 0xFFC4B5FD;
+
+        private static final float MATCH = -1f;
+        private static final float WRAP = -2f;
+        private static final int G_CENTER = 17;
+        private static final int G_CV = 16;
+        private static final int G_LEFT_CV = 0x13;
+        private static final int G_RIGHT_CV = 0x15;
+
+        /** Views of the dashboard that change on refresh (null while hidden). */
+        private static final class Dash {
+            Object root;
+            Object versionPill, bridgeDot, bridgeText, commaDot, commaText, modeChipText, sysText, countdownText;
+            Object guideBadge, guideBlock, emptyBlock, turnIcon, turnDist, turnUnit, turnName, crossroad;
+            Object barFill, barRest, nextText, destText;
+            Object limitText, roadTypeText, speedText;
+            Object camBlock, camIcon, camTitle, camLimit, camDist, camBarFill, camBarRest;
+            Object secBlock, secLimit, secRemain, secRemainUnit, secAvg;
+            Object noEnfBlock;
+            Object ipText, commaValue, targetsText, radioText;
+            Object segAp, segWifi, segOff;
+            Object txTrack;
+            Object messageText;
+            String turnIconKey = "";
+            String camIconKey = "";
+        }
+
+        private static volatile Dash dash = null;
+
+        /** Small reflection layout kit (the bridge is compiled without android.jar). */
+        private static final class U {
+            final Object ctx;
+            final float density;
+            final Class<?> tvCls;
+            final Constructor<?> llCtor, tvCtor, viewCtor, llLp3;
+            final Method addView, setPadding, setOrientation, llSetGravity, tvSetGravity;
+
+            U(Object ctx) throws Exception {
+                this.ctx = ctx;
+                Class<?> ctxCls = Class.forName("android.content.Context");
+                Class<?> viewCls = Class.forName("android.view.View");
+                Class<?> vgCls = Class.forName("android.view.ViewGroup");
+                Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
+                Class<?> llCls = Class.forName("android.widget.LinearLayout");
+                Class<?> llLpCls = Class.forName("android.widget.LinearLayout$LayoutParams");
+                tvCls = Class.forName("android.widget.TextView");
+                llCtor = llCls.getConstructor(ctxCls);
+                tvCtor = tvCls.getConstructor(ctxCls);
+                viewCtor = viewCls.getConstructor(ctxCls);
+                llLp3 = llLpCls.getConstructor(int.class, int.class, float.class);
+                addView = vgCls.getMethod("addView", viewCls, vgLpCls);
+                setPadding = viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class);
+                setOrientation = llCls.getMethod("setOrientation", int.class);
+                llSetGravity = llCls.getMethod("setGravity", int.class);
+                tvSetGravity = tvCls.getMethod("setGravity", int.class);
+                float den = 1.5f;
+                try {
+                    Object res = ctx.getClass().getMethod("getResources").invoke(ctx);
+                    Object dm = res.getClass().getMethod("getDisplayMetrics").invoke(res);
+                    den = dm.getClass().getField("density").getFloat(dm);
+                } catch (Throwable ignored) {
+                }
+                density = den > 0.5f ? den : 1.5f;
+            }
+
+            int dp(float v) {
+                return Math.round(v * density);
+            }
+
+            int size(float v) {
+                return v < 0f ? (int) v : dp(v);
+            }
+
+            Object ll(int orientation, int gravity) throws Exception {
+                Object l = llCtor.newInstance(ctx);
+                setOrientation.invoke(l, orientation);
+                llSetGravity.invoke(l, gravity);
+                return l;
+            }
+
+            Object text(String s, float sp, int color, boolean bold) throws Exception {
+                Object t = tvCtor.newInstance(ctx);
+                setTextViewStyle(t, s, sp, color, bold);
+                tvCls.getMethod("setIncludeFontPadding", boolean.class).invoke(t, false);
+                return t;
+            }
+
+            Object singleLine(Object tv) throws Exception {
+                tvCls.getMethod("setSingleLine", boolean.class).invoke(tv, true);
+                Class<?> truncCls = Class.forName("android.text.TextUtils$TruncateAt");
+                tvCls.getMethod("setEllipsize", truncCls).invoke(tv, truncCls.getField("END").get(null));
+                return tv;
+            }
+
+            Object gravity(Object tv, int g) throws Exception {
+                tvSetGravity.invoke(tv, g);
+                return tv;
+            }
+
+            Object view() throws Exception {
+                return viewCtor.newInstance(ctx);
+            }
+
+            /** w/h: dp, or MATCH / WRAP. Margins in dp. */
+            Object add(Object parent, Object child, float w, float h, float weight,
+                       float ml, float mt, float mr, float mb) throws Exception {
+                Object lp = llLp3.newInstance(size(w), size(h), weight);
+                setMargins(lp, dp(ml), dp(mt), dp(mr), dp(mb));
+                addView.invoke(parent, child, lp);
+                return child;
+            }
+
+            Object add(Object parent, Object child, float w, float h) throws Exception {
+                return add(parent, child, w, h, 0f, 0f, 0f, 0f, 0f);
+            }
+
+            Object pad(Object v, float l, float t, float r, float b) throws Exception {
+                setPadding.invoke(v, dp(l), dp(t), dp(r), dp(b));
+                return v;
+            }
+
+            Object bg(Object v, int fill, int stroke, float strokeDp, float radiusDp) throws Exception {
+                setRoundedBg(v, fill, stroke, strokeDp > 0f ? Math.max(1, dp(strokeDp)) : 0, dp(radiusDp));
+                return v;
+            }
+
+            Object icon(String key, int color, float strokeW) throws Exception {
+                Object v = view();
+                setIconDrawable(v, key, color, strokeW);
+                return v;
+            }
+
+            Object card() throws Exception {
+                Object c = ll(1, 0);
+                bg(c, C_CARD, C_BORDER, 1f, 16f);
+                pad(c, 18f, 16f, 18f, 16f);
+                return c;
+            }
+
+            Object inset(int orientation) throws Exception {
+                Object c = ll(orientation, orientation == 0 ? G_CV : 0);
+                bg(c, C_INSET, C_INSET, 0f, 12f);
+                return c;
+            }
+
+            /** Vertical-flex filler (CSS margin-top: auto). */
+            void vSpacer(Object parent) throws Exception {
+                add(parent, view(), MATCH, 0f, 1f, 0f, 0f, 0f, 0f);
+            }
+        }
+
+        // ---- Line icons: 24x24 stroke paths drawn with ShapeDrawable(PathShape) (no VectorDrawable on API 19) ----
+
+        private static String iconSpec(String key) {
+            if ("right".equals(key)) return "M7 21 L7 12 Q7 8 11 8 L19 8 M15 4 L19 8 L15 12";
+            if ("left".equals(key)) return "M17 21 L17 12 Q17 8 13 8 L5 8 M9 4 L5 8 L9 12";
+            if ("slight_right".equals(key)) return "M8 21 L8 14 Q8 11 10 9 L16 3 M10 3 L16 3 L16 9";
+            if ("slight_left".equals(key)) return "M16 21 L16 14 Q16 11 14 9 L8 3 M14 3 L8 3 L8 9";
+            if ("uturn".equals(key)) return "M16 21 L16 9 Q16 4 11.5 4 Q7 4 7 9 L7 14 M3 11 L7 15 L11 11";
+            if ("roundabout".equals(key)) return "O 12 10 5 M12 22 L12 15 M17 10 L21 10 M19 8 L21 10 L19 12";
+            if ("flag".equals(key)) return "M5 21 L5 4 L16 4 L14 8 L16 12 L5 12";
+            if ("toll".equals(key)) return "M4 20 L20 20 M6 20 L6 9 M18 20 L18 9 M4 9 L20 9 M9 13 L15 13";
+            if ("nav".equals(key)) return "M12 2 L19 21 L12 17 L5 21 Z";
+            if ("wifi".equals(key)) return "M2.5 9 Q12 0.5 21.5 9 M5.5 12.5 Q12 6.8 18.5 12.5 M8.5 16 Q12 13 15.5 16 O 12 19.5 1";
+            if ("wifi_small".equals(key)) return "M5 12.5 Q12 6 19 12.5 M8.5 16 Q12 13 15.5 16 O 12 19.5 1";
+            if ("hotspot".equals(key)) return "O 12 12 2 M7.8 7.8 Q5.3 12 7.8 16.2 M16.2 7.8 Q18.7 12 16.2 16.2 M5 5 Q0.8 12 5 19 M19 5 Q23.2 12 19 19";
+            if ("sliders".equals(key)) return "M4 7 L14 7 M18 7 L20 7 M4 17 L8 17 M12 17 L20 17 O 16 7 2 O 10 17 2";
+            if ("refresh".equals(key)) return "M20 12 Q20 20 12 20 Q4 20 4 12 Q4 4 12 4 Q15.5 4 17.7 6.3 M20 4 L20 9 L15 9";
+            if ("download".equals(key)) return "M12 4 L12 15 M7 10 L12 15 L17 10 M5 20 L19 20";
+            if ("close".equals(key)) return "M6 6 L18 18 M18 6 L6 18";
+            if ("camera".equals(key)) return "M5 7 L15 7 Q17 7 17 9 L17 15 Q17 17 15 17 L5 17 Q3 17 3 15 L3 9 Q3 7 5 7 Z M17 10 L21 8 L21 16 L17 14";
+            if ("section".equals(key)) return "M4 18 L20 18 M4 14 L4 22 M20 14 L20 22 M8 10 L12 4 L16 10";
+            if ("bump".equals(key)) return "M2 18 L7 18 Q12 8 17 18 L22 18";
+            return "M12 21 L12 4 M6 10 L12 4 L18 10"; // straight
+        }
+
+        static final String[] ICON_KEYS = {"right", "left", "slight_right", "slight_left", "uturn", "roundabout", "flag",
+                "toll", "nav", "wifi", "wifi_small", "hotspot", "sliders", "refresh", "download", "close", "camera",
+                "section", "bump", "straight"};
+
+        /**
+         * Parses an icon spec into {Character cmd, float[] args} entries (absolute coords on a 24x24 grid).
+         * M x y | L x y | Q cx cy x y | O cx cy r (circle) | Z. A command letter may be glued to its
+         * first number ("M7") or stand alone ("O 12 10 5"). Throws on a wrong argument count.
+         */
+        static List<Object[]> parseIconSpec(String spec) {
+            List<Object[]> out = new ArrayList<Object[]>();
+            String[] t = spec.trim().split("\\s+");
+            int i = 0;
+            while (i < t.length) {
+                String tok = t[i];
+                char c = tok.charAt(0);
+                List<Float> nums = new ArrayList<Float>();
+                if (tok.length() > 1) nums.add(Float.valueOf(tok.substring(1)));
+                i++;
+                while (i < t.length && !Character.isLetter(t[i].charAt(0))) {
+                    nums.add(Float.valueOf(t[i]));
+                    i++;
+                }
+                int need = c == 'M' || c == 'L' ? 2 : c == 'Q' ? 4 : c == 'O' ? 3 : c == 'Z' ? 0 : -1;
+                if (need < 0 || nums.size() != need) {
+                    throw new IllegalArgumentException("Bad icon command '" + c + "' with " + nums.size() + " args in: " + spec);
+                }
+                float[] n = new float[need];
+                for (int k = 0; k < need; k++) n[k] = nums.get(k).floatValue();
+                out.add(new Object[]{Character.valueOf(c), n});
+            }
+            return out;
+        }
+
+        private static void setIconDrawable(Object view, String key, int color, float strokeW) throws Exception {
+            Class<?> pathCls = Class.forName("android.graphics.Path");
+            Object path = pathCls.getConstructor().newInstance();
+            Method moveTo = pathCls.getMethod("moveTo", float.class, float.class);
+            Method lineTo = pathCls.getMethod("lineTo", float.class, float.class);
+            Method quadTo = pathCls.getMethod("quadTo", float.class, float.class, float.class, float.class);
+            Method close = pathCls.getMethod("close");
+            Class<?> dirCls = Class.forName("android.graphics.Path$Direction");
+            Object cw = dirCls.getField("CW").get(null);
+            Method addCircle = pathCls.getMethod("addCircle", float.class, float.class, float.class, dirCls);
+
+            for (Object[] cmd : parseIconSpec(iconSpec(key))) {
+                char c = ((Character) cmd[0]).charValue();
+                float[] n = (float[]) cmd[1];
+                if (c == 'M') moveTo.invoke(path, n[0], n[1]);
+                else if (c == 'L') lineTo.invoke(path, n[0], n[1]);
+                else if (c == 'Q') quadTo.invoke(path, n[0], n[1], n[2], n[3]);
+                else if (c == 'O') addCircle.invoke(path, n[0], n[1], n[2], cw);
+                else if (c == 'Z') close.invoke(path);
+            }
+
+            Class<?> pathShapeCls = Class.forName("android.graphics.drawable.shapes.PathShape");
+            Object shape = pathShapeCls.getConstructor(pathCls, float.class, float.class).newInstance(path, 24f, 24f);
+            Class<?> shapeCls = Class.forName("android.graphics.drawable.shapes.Shape");
+            Class<?> sdCls = Class.forName("android.graphics.drawable.ShapeDrawable");
+            Object sd = sdCls.getConstructor(shapeCls).newInstance(shape);
+            Object paint = sdCls.getMethod("getPaint").invoke(sd);
+            Class<?> paintCls = Class.forName("android.graphics.Paint");
+            paintCls.getMethod("setAntiAlias", boolean.class).invoke(paint, true);
+            paintCls.getMethod("setColor", int.class).invoke(paint, color);
+            Class<?> styleCls = Class.forName("android.graphics.Paint$Style");
+            paintCls.getMethod("setStyle", styleCls).invoke(paint, styleCls.getField("STROKE").get(null));
+            paintCls.getMethod("setStrokeWidth", float.class).invoke(paint, strokeW);
+            Class<?> capCls = Class.forName("android.graphics.Paint$Cap");
+            paintCls.getMethod("setStrokeCap", capCls).invoke(paint, capCls.getField("ROUND").get(null));
+            Class<?> joinCls = Class.forName("android.graphics.Paint$Join");
+            paintCls.getMethod("setStrokeJoin", joinCls).invoke(paint, joinCls.getField("ROUND").get(null));
+            Class<?> drawableCls = Class.forName("android.graphics.drawable.Drawable");
+            Class.forName("android.view.View").getMethod("setBackgroundDrawable", drawableCls).invoke(view, sd);
+        }
+
+        static String turnIconKey(int t) {
+            switch (t) {
+                case 12: case 16: return "left";
+                case 13: case 19: return "right";
+                case 14: return "uturn";
+                case 6: case 43: case 73: case 74: case 101: case 104: case 111: case 114: case 117: case 123: case 124:
+                    return "slight_right";
+                case 7: case 17: case 44: case 75: case 76: case 102: case 105: case 112: case 115: case 118:
+                    return "slight_left";
+                case 153: case 154: case 249: return "toll";
+                case 201: return "flag";
+                default:
+                    if (t >= 131 && t <= 142) return "roundabout";
+                    return "straight";
+            }
+        }
+
+        static String fmtDistNum(int m) {
+            if (m >= 1000) return String.format(Locale.US, "%.1f", m / 1000.0);
+            return String.valueOf(Math.max(0, m));
+        }
+
+        static String fmtDistUnit(int m) {
+            return m >= 1000 ? "km" : "m";
+        }
+
+        static String fmtDist(int m) {
+            return fmtDistNum(m) + " " + fmtDistUnit(m);
+        }
+
+        /** Drops leading emoji / symbols from legacy banner messages ("✅ 완료" -> "완료"). */
+        static String stripLeadingSymbols(String s) {
+            if (s == null) return "";
+            int i = 0;
+            while (i < s.length() && !Character.isLetterOrDigit(s.charAt(i))) i++;
+            return s.substring(i).trim();
+        }
+
+        /** HKMC raw DisplayType names such as "0xd" are not useful as a crossroad label. */
+        static String cleanGuideText(String s) {
+            if (s == null) return "";
+            String t = s.trim();
+            if (t.matches("(?i)0x[0-9a-f]+")) return "";
+            return t;
+        }
+
+        private static String readWlanIpv4() {
+            try {
+                java.net.NetworkInterface ni = java.net.NetworkInterface.getByName("wlan0");
+                if (ni == null) return "";
+                java.util.Enumeration<java.net.InetAddress> addrs = ni.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    java.net.InetAddress a = addrs.nextElement();
+                    if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) {
+                        return a.getHostAddress();
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            return "";
+        }
+
+        private static boolean isSoftApMode(String wlanIp) {
+            if ("softap".equals(getSystemProperty("tcc.wifi.firmware.mode", ""))
+                    && "ok".equals(getSystemProperty("wlan.driver.status", ""))) {
+                return true;
+            }
+            return "192.168.0.1".equals(wlanIp);
+        }
+
+        /** "ap" | "wifi" | "off" from config/hotspot_auto.conf + config/wifi_auto.conf. */
+        private static String currentBootWirelessMode() {
+            if (isBootAutoHotspotEnabled()) return "ap";
+            if (isBootAutoWifiEnabled()) return "wifi";
+            return "off";
+        }
+
+        private static void setVisible(Object v, boolean on) throws Exception {
+            Class.forName("android.view.View").getMethod("setVisibility", int.class).invoke(v, on ? 0 : 8);
+        }
+
+        private static void setTextIfChanged(Object tv, String s) throws Exception {
             Class<?> tvCls = Class.forName("android.widget.TextView");
+            Object cur = tvCls.getMethod("getText").invoke(tv);
+            if (cur == null || !cur.toString().equals(s)) {
+                tvCls.getMethod("setText", CharSequence.class).invoke(tv, s);
+            }
+        }
 
-            Constructor<?> llCtor = llCls.getConstructor(ctxCls);
-            Constructor<?> tvCtor = tvCls.getConstructor(ctxCls);
-            Constructor<?> llLpCtor2 = llLpCls.getConstructor(int.class, int.class);
-            Constructor<?> llLpCtor3 = llLpCls.getConstructor(int.class, int.class, float.class);
-            Method tvSetGravity = tvCls.getMethod("setGravity", int.class);
+        private static void setTextColor(Object tv, int color) throws Exception {
+            Class.forName("android.widget.TextView").getMethod("setTextColor", int.class).invoke(tv, color);
+        }
 
-            final int MATCH_PARENT = -1;
-            final int WRAP_CONTENT = -2;
+        private static void setBold(Object tv, boolean bold) throws Exception {
+            Class<?> tfCls = Class.forName("android.graphics.Typeface");
+            Object tf = tfCls.getField(bold ? "DEFAULT_BOLD" : "DEFAULT").get(null);
+            Class.forName("android.widget.TextView").getMethod("setTypeface", tfCls, int.class).invoke(tv, tf, bold ? 1 : 0);
+        }
 
-            // Root card container (vertical LinearLayout)
-            Object root = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(root, 1); // VERTICAL
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(root, 26, 20, 26, 20);
-            setRoundedBg(root, 0xF20F172A, 0xFF38BDF8, 3, 18f);
+        private static void setLayoutGravity(Object linearLayout, int g) throws Exception {
+            Class.forName("android.widget.LinearLayout").getMethod("setGravity", int.class).invoke(linearLayout, g);
+        }
+
+        private static void setWeight(Object view, float w) throws Exception {
+            Class<?> viewCls = Class.forName("android.view.View");
+            Object lp = viewCls.getMethod("getLayoutParams").invoke(view);
+            if (lp == null) return;
+            java.lang.reflect.Field f = lp.getClass().getField("weight");
+            if (f.getFloat(lp) != w) {
+                f.setFloat(lp, w);
+                viewCls.getMethod("setLayoutParams", Class.forName("android.view.ViewGroup$LayoutParams")).invoke(view, lp);
+            }
+        }
+
+        /** Two-child weighted bar: fill weight = pct, rest weight = 100 - pct. */
+        private static void setBar(Object fill, Object rest, int pct) throws Exception {
+            int p = Math.max(0, Math.min(100, pct));
+            setWeight(fill, p);
+            setWeight(rest, 100 - p);
+            setVisible(fill, p > 0);
+        }
+
+        private static Object[] makeChip(U u, Object parent, String iconKey, int iconColor, boolean last) throws Exception {
+            Object chip = u.ll(0, G_CV);
+            u.bg(chip, C_CHIP, C_BORDER, 1f, 15f);
+            u.pad(chip, 12f, 0f, 12f, 0f);
+            Object lead;
+            if (iconKey != null) {
+                lead = u.icon(iconKey, iconColor, 2f);
+                u.add(chip, lead, 15f, 15f);
+            } else {
+                lead = u.view();
+                u.bg(lead, C_OK, C_OK, 0f, 4f);
+                u.add(chip, lead, 8f, 8f);
+            }
+            Object text = u.text("", 13f, C_TEXT, false);
+            u.add(chip, text, WRAP, WRAP, 0f, 7f, 0f, 0f, 0f);
+            u.add(parent, chip, WRAP, 30f, 0f, 0f, 0f, last ? 0f : 8f, 0f);
+            return new Object[]{lead, text};
+        }
+
+        private static Object[] makeBar(U u, Object parent, float heightDp, int fillColor, float marginTop) throws Exception {
+            Object track = u.ll(0, 0);
+            u.bg(track, C_TRACK, C_TRACK, 0f, heightDp / 2f);
+            Object fill = u.view();
+            u.bg(fill, fillColor, fillColor, 0f, heightDp / 2f);
+            Object rest = u.view();
+            u.add(track, fill, 0f, MATCH, 0f, 0f, 0f, 0f, 0f);
+            u.add(track, rest, 0f, MATCH, 100f, 0f, 0f, 0f, 0f);
+            u.add(parent, track, MATCH, heightDp, 0f, 0f, marginTop, 0f, 0f);
+            return new Object[]{fill, rest};
+        }
+
+        private static Object makeKvRow(U u, Object parent, String label, float marginTop) throws Exception {
+            Object row = u.ll(0, G_CV);
+            u.add(row, u.text(label, 14f, C_MUTED, false), WRAP, WRAP);
+            Object value = u.singleLine(u.gravity(u.text("-", 14f, C_TEXT, false), G_RIGHT_CV));
+            u.add(row, value, 0f, WRAP, 1f, 10f, 0f, 0f, 0f);
+            u.add(parent, row, MATCH, WRAP, 0f, 0f, marginTop, 0f, 0f);
+            return value;
+        }
+
+        private static Object makeSegment(U u, Object parent, String label, boolean first, Runnable action) throws Exception {
+            Object seg = u.gravity(u.text(label, 14f, C_TEXT_2, false), G_CENTER);
+            attachClickListener(seg, action);
+            u.add(parent, seg, 0f, 40f, 1f, first ? 0f : 4f, 0f, 0f, 0f);
+            return seg;
+        }
+
+        private static void styleSegment(U u, Object seg, boolean active) throws Exception {
+            if (active) {
+                u.bg(seg, C_ACCENT, C_ACCENT, 0f, 9f);
+                setTextColor(seg, C_ON_ACCENT);
+            } else {
+                u.bg(seg, C_INSET, C_INSET, 0f, 9f);
+                setTextColor(seg, C_TEXT_2);
+            }
+            setBold(seg, active);
+        }
+
+        private static void makeActionButton(U u, Object parent, String iconKey, int iconColor, String label,
+                                             boolean first, Runnable action) throws Exception {
+            Object btn = u.ll(0, G_CENTER);
+            u.bg(btn, C_BTN, C_BORDER_STRONG, 1f, 14f);
+            u.add(btn, u.icon(iconKey, iconColor, 2f), 20f, 20f);
+            u.add(btn, u.text(label, 15f, C_TEXT, true), WRAP, WRAP, 0f, 8f, 0f, 0f, 0f);
+            attachClickListener(btn, action);
+            u.add(parent, btn, 0f, 50f, 1f, first ? 0f : 10f, 0f, 0f, 0f);
+        }
+
+        private static Object buildDashboard(final Dash d) throws Exception {
+            final U u = new U(sysContext);
+
+            Object root = u.ll(1, 0);
+            Class.forName("android.view.View").getMethod("setBackgroundColor", int.class).invoke(root, C_BG);
             disableViewEffects(root, true);
+            d.root = root;
 
-            // 1. Header Row (Horizontal)
-            Object headerRow = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(headerRow, 0); // HORIZONTAL
-            llCls.getMethod("setGravity", int.class).invoke(headerRow, 16);    // CENTER_VERTICAL
+            // ---------------- Top bar (56dp) ----------------
+            Object top = u.ll(0, G_CV);
+            u.pad(top, 20f, 0f, 16f, 0f);
+            u.add(root, top, MATCH, 56f);
 
-            Object titleTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(titleTv, "🥕 HKG 5W CarrotNavi — 상태 대시보드 (v" + BRIDGE_VERSION + ")", 20.5f, 0xFF38BDF8, true);
-            Object titleLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, titleTv, titleLp);
+            Object logo = u.ll(0, G_CENTER);
+            u.bg(logo, C_ACCENT, C_ACCENT, 0f, 9f);
+            u.add(logo, u.icon("nav", C_ON_ACCENT, 2.4f), 18f, 18f);
+            u.add(top, logo, 32f, 32f);
+            u.add(top, u.text("CarrotNavi Bridge", 18f, C_TEXT, true), WRAP, WRAP, 0f, 10f, 0f, 0f, 0f);
+            d.versionPill = u.text("v" + BRIDGE_VERSION, 12f, C_MUTED, false);
+            u.bg(d.versionPill, C_BG, C_BORDER_STRONG, 1f, 11f);
+            u.pad(d.versionPill, 9f, 3f, 9f, 3f);
+            u.add(top, d.versionPill, WRAP, WRAP, 0f, 10f, 0f, 0f, 0f);
 
-            // System CPU Temp & RAM Usage Badge (between Header Title and Close Button)
-            Object sysInfoTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(sysInfoTv, updateSystemResourceBadge(System.currentTimeMillis()), 14.5f, 0xFFA7F3D0, true);
-            tvSetGravity.invoke(sysInfoTv, 17); // CENTER
-            setRoundedBg(sysInfoTv, 0xFF1E293B, 0xFF475569, 1, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(sysInfoTv, 14, 8, 14, 8);
-            Object sysInfoLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-            setMargins(sysInfoLp, 8, 0, 12, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, sysInfoTv, sysInfoLp);
+            Object chips = u.ll(0, G_CV);
+            u.add(top, chips, 0f, WRAP, 1f, 16f, 0f, 12f, 0f);
+            Object[] bridgeChip = makeChip(u, chips, null, 0, false);
+            d.bridgeDot = bridgeChip[0];
+            d.bridgeText = bridgeChip[1];
+            Object[] commaChip = makeChip(u, chips, null, 0, false);
+            d.commaDot = commaChip[0];
+            d.commaText = commaChip[1];
+            Object[] modeChip = makeChip(u, chips, "wifi_small", C_INFO, true);
+            d.modeChipText = modeChip[1];
 
-            // Note: Use TextView instead of Button because HKMC firmware removed Button's default drawable (#0x1080100 popup_btn_default.xml)
-            Object closeBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(closeBtn, "  ✖ 닫기 (MAP 3연타)  ", 15.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(closeBtn, 17); // CENTER
-            setRoundedBg(closeBtn, 0xFFDC2626, 0xFFF87171, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(closeBtn, 18, 9, 18, 9);
+            d.sysText = u.text("", 13f, C_MUTED, false);
+            u.add(top, d.sysText, WRAP, WRAP, 0f, 0f, 0f, 14f, 0f);
+            d.countdownText = u.text("", 13f, C_TEXT_2, true);
+            u.add(top, d.countdownText, WRAP, WRAP, 0f, 0f, 0f, 14f, 0f);
+            Object closeBtn = u.ll(0, G_CENTER);
+            u.bg(closeBtn, C_BTN, C_BORDER_STRONG, 1f, 12f);
+            u.add(closeBtn, u.icon("close", C_TEXT, 2.2f), 20f, 20f);
             attachClickListener(closeBtn, new Runnable() {
                 @Override
                 public void run() {
                     hide();
                 }
             });
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, closeBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, headerRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            u.add(top, closeBtn, 44f, 44f);
 
-            // Divider
-            Object div1 = viewCls.getConstructor(ctxCls).newInstance(sysContext);
-            viewCls.getMethod("setBackgroundColor", int.class).invoke(div1, 0xFF334155);
-            Object divLp1 = llLpCtor2.newInstance(MATCH_PARENT, 2);
-            setMargins(divLp1, 0, 10, 0, 12);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, div1, divLp1);
+            Object divider = u.view();
+            Class.forName("android.view.View").getMethod("setBackgroundColor", int.class).invoke(divider, C_DIVIDER);
+            u.add(root, divider, MATCH, 1f);
 
-            // 2. Two-Column Body Row
-            Object bodyRow = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(bodyRow, 0); // HORIZONTAL
+            // ---------------- Body: 3 cards (1.45 : 1 : 1.12) ----------------
+            Object body = u.ll(0, 0);
+            u.pad(body, 20f, 14f, 20f, 0f);
+            u.add(root, body, MATCH, 0f, 1f, 0f, 0f, 0f, 0f);
 
-            // Left Column Card
-            Object leftCard = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(leftCard, 1);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftCard, 16, 12, 16, 12);
-            setRoundedBg(leftCard, 0xFF1E293B, 0xFF475569, 1, 12f);
+            // Card 1: route guidance
+            Object card1 = u.card();
+            u.add(body, card1, 0f, MATCH, 1.45f, 0f, 0f, 14f, 0f);
+            Object c1Head = u.ll(0, G_CV);
+            u.add(c1Head, u.text("경로 안내", 13f, C_MUTED, true), 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
+            d.guideBadge = u.text("대기", 12f, C_TEXT_2, true);
+            u.pad(d.guideBadge, 10f, 3f, 10f, 3f);
+            u.add(c1Head, d.guideBadge, WRAP, WRAP);
+            u.add(card1, c1Head, MATCH, WRAP);
 
-            Object leftHdr = tvCtor.newInstance(sysContext);
-            setTextViewStyle(leftHdr, "[ 패키지 버전 및 통신/핫스팟 상태 ]", 16.5f, 0xFF34D399, true);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            d.guideBlock = u.ll(1, 0);
+            u.add(card1, d.guideBlock, MATCH, 0f, 1f, 0f, 12f, 0f, 0f);
+            Object mainRow = u.ll(0, G_CV);
+            Object tile = u.ll(0, G_CENTER);
+            u.bg(tile, C_ACCENT, C_ACCENT, 0f, 22f);
+            d.turnIcon = u.icon("straight", C_ON_ACCENT, 2.6f);
+            u.add(tile, d.turnIcon, 68f, 68f);
+            u.add(mainRow, tile, 112f, 112f);
+            Object turnCol = u.ll(1, 0);
+            Object distRow = u.ll(0, 0x53); // BOTTOM | LEFT (baseline aligned by default)
+            d.turnDist = u.text("-", 64f, C_TEXT, true);
+            u.add(distRow, d.turnDist, WRAP, WRAP);
+            d.turnUnit = u.text("", 26f, C_TEXT_2, false);
+            u.add(distRow, d.turnUnit, WRAP, WRAP, 0f, 6f, 0f, 0f, 0f);
+            u.add(turnCol, distRow, MATCH, WRAP);
+            d.turnName = u.singleLine(u.text("", 24f, C_TEXT, true));
+            u.add(turnCol, d.turnName, MATCH, WRAP, 0f, 0f, 8f, 0f, 0f);
+            d.crossroad = u.singleLine(u.text("", 16f, C_MUTED, false));
+            u.add(turnCol, d.crossroad, MATCH, WRAP, 0f, 0f, 4f, 0f, 0f);
+            u.add(mainRow, turnCol, 0f, WRAP, 1f, 20f, 0f, 0f, 0f);
+            u.add(d.guideBlock, mainRow, MATCH, WRAP);
+            Object[] bar = makeBar(u, d.guideBlock, 8f, C_ACCENT, 12f);
+            d.barFill = bar[0];
+            d.barRest = bar[1];
+            u.vSpacer(d.guideBlock);
+            Object miniRow = u.ll(0, 0);
+            Object nextBox = u.inset(1);
+            u.pad(nextBox, 12f, 10f, 12f, 10f);
+            u.add(nextBox, u.text("다음 안내", 12f, C_MUTED, false), WRAP, WRAP);
+            d.nextText = u.singleLine(u.text("-", 16f, C_TEXT, false));
+            u.add(nextBox, d.nextText, MATCH, WRAP, 0f, 0f, 4f, 0f, 0f);
+            u.add(miniRow, nextBox, 0f, WRAP, 1f, 0f, 0f, 5f, 0f);
+            Object destBox = u.inset(1);
+            u.pad(destBox, 12f, 10f, 12f, 10f);
+            u.add(destBox, u.text("목적지까지", 12f, C_MUTED, false), WRAP, WRAP);
+            d.destText = u.singleLine(u.text("-", 16f, C_TEXT, false));
+            u.add(destBox, d.destText, MATCH, WRAP, 0f, 0f, 4f, 0f, 0f);
+            u.add(miniRow, destBox, 0f, WRAP, 1f, 5f, 0f, 0f, 0f);
+            u.add(d.guideBlock, miniRow, MATCH, WRAP);
 
-            Object leftTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(leftTv, "", 15f, 0xFFE2E8F0, false);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftTv, 0, 8, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftTv, llLpCtor3.newInstance(MATCH_PARENT, WRAP_CONTENT, 1.0f));
+            d.emptyBlock = u.ll(1, G_CENTER);
+            Object emptyTile = u.ll(0, G_CENTER);
+            u.bg(emptyTile, C_BTN, C_BTN, 0f, 20f);
+            u.add(emptyTile, u.icon("flag", C_MUTED, 2f), 36f, 36f);
+            u.add(d.emptyBlock, emptyTile, 72f, 72f);
+            u.add(d.emptyBlock, u.text("경로 안내 없음", 20f, C_TEXT, true), WRAP, WRAP, 0f, 0f, 12f, 0f, 0f);
+            u.add(d.emptyBlock, u.gravity(u.text("순정 내비에서 목적지를 설정하면 회전 안내가 표시됩니다.\n지금은 카메라와 제한속도만 전송합니다.",
+                    14f, C_MUTED, false), G_CENTER), WRAP, WRAP, 0f, 0f, 8f, 0f, 0f);
+            u.add(card1, d.emptyBlock, MATCH, 0f, 1f, 0f, 0f, 0f, 0f);
 
-            // Interactive Checkbox for Boot Auto-Hotspot (ON/OFF)
-            Object autoHsCheckTv = tvCtor.newInstance(sysContext);
-            styleAutoHotspotCheckbox(autoHsCheckTv, isBootAutoHotspotEnabled());
-            tvSetGravity.invoke(autoHsCheckTv, 17); // CENTER
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(autoHsCheckTv, 12, 8, 12, 8);
-            attachClickListener(autoHsCheckTv, new Runnable() {
+            // Card 2: speed & enforcement
+            Object card2 = u.card();
+            u.add(body, card2, 0f, MATCH, 1f, 0f, 0f, 14f, 0f);
+            u.add(card2, u.text("속도 · 단속", 13f, C_MUTED, true), WRAP, WRAP);
+            Object speedRow = u.ll(0, G_CV);
+            d.limitText = u.gravity(u.text("--", 36f, C_BG, true), G_CENTER);
+            u.bg(d.limitText, C_WHITE, C_SIGN_RED, 10f, 48f);
+            u.add(speedRow, d.limitText, 96f, 96f);
+            Object speedCol = u.ll(1, 0);
+            d.roadTypeText = u.text("제한속도", 13f, C_MUTED, false);
+            u.add(speedCol, d.roadTypeText, WRAP, WRAP);
+            Object spdRow = u.ll(0, 0x53);
+            d.speedText = u.text("0", 34f, C_TEXT, true);
+            u.add(spdRow, d.speedText, WRAP, WRAP);
+            u.add(spdRow, u.text("km/h", 15f, C_TEXT_2, false), WRAP, WRAP, 0f, 5f, 0f, 0f, 0f);
+            u.add(speedCol, spdRow, WRAP, WRAP, 0f, 0f, 6f, 0f, 0f);
+            u.add(speedCol, u.text("현재 차속", 13f, C_MUTED, false), WRAP, WRAP, 0f, 0f, 6f, 0f, 0f);
+            u.add(speedRow, speedCol, 0f, WRAP, 1f, 18f, 0f, 0f, 0f);
+            u.add(card2, speedRow, MATCH, WRAP, 0f, 0f, 14f, 0f, 0f);
+            u.vSpacer(card2);
+
+            d.camBlock = u.inset(1);
+            u.pad(d.camBlock, 14f, 12f, 14f, 12f);
+            Object camHead = u.ll(0, G_CV);
+            d.camIcon = u.icon("camera", C_WARN, 2f);
+            u.add(camHead, d.camIcon, 18f, 18f);
+            d.camTitle = u.singleLine(u.text("", 15f, C_TEXT, false));
+            u.add(camHead, d.camTitle, 0f, WRAP, 1f, 8f, 0f, 8f, 0f);
+            d.camLimit = u.text("", 15f, C_WARN, true);
+            u.add(camHead, d.camLimit, WRAP, WRAP);
+            u.add(d.camBlock, camHead, MATCH, WRAP);
+            Object camDistRow = u.ll(0, 0x53);
+            d.camDist = u.text("", 28f, C_TEXT, true);
+            u.add(camDistRow, d.camDist, WRAP, WRAP);
+            u.add(camDistRow, u.text("m 앞", 15f, C_TEXT_2, false), WRAP, WRAP, 0f, 4f, 0f, 0f, 0f);
+            u.add(d.camBlock, camDistRow, MATCH, WRAP, 0f, 0f, 8f, 0f, 0f);
+            Object[] camBar = makeBar(u, d.camBlock, 6f, C_WARN, 8f);
+            d.camBarFill = camBar[0];
+            d.camBarRest = camBar[1];
+            u.add(card2, d.camBlock, MATCH, WRAP);
+
+            d.secBlock = u.inset(1);
+            u.pad(d.secBlock, 14f, 12f, 14f, 12f);
+            Object secHead = u.ll(0, G_CV);
+            u.add(secHead, u.icon("section", C_WARN, 2f), 18f, 18f);
+            u.add(secHead, u.text("구간단속 중", 15f, C_TEXT, false), 0f, WRAP, 1f, 8f, 0f, 8f, 0f);
+            d.secLimit = u.text("", 15f, C_WARN, true);
+            u.add(secHead, d.secLimit, WRAP, WRAP);
+            u.add(d.secBlock, secHead, MATCH, WRAP);
+            Object secStats = u.ll(0, 0);
+            Object secRemainCol = u.ll(1, 0);
+            u.add(secRemainCol, u.text("남은 거리", 12f, C_MUTED, false), WRAP, WRAP);
+            Object secRemainRow = u.ll(0, 0x53);
+            d.secRemain = u.text("-", 22f, C_TEXT, true);
+            u.add(secRemainRow, d.secRemain, WRAP, WRAP);
+            d.secRemainUnit = u.text("", 14f, C_TEXT_2, false);
+            u.add(secRemainRow, d.secRemainUnit, WRAP, WRAP, 0f, 4f, 0f, 0f, 0f);
+            u.add(secRemainCol, secRemainRow, WRAP, WRAP, 0f, 0f, 4f, 0f, 0f);
+            u.add(secStats, secRemainCol, 0f, WRAP, 1f, 0f, 0f, 8f, 0f);
+            Object secAvgCol = u.ll(1, 0);
+            u.add(secAvgCol, u.text("구간 평균", 12f, C_MUTED, false), WRAP, WRAP);
+            Object secAvgRow = u.ll(0, 0x53);
+            d.secAvg = u.text("-", 22f, C_OK, true);
+            u.add(secAvgRow, d.secAvg, WRAP, WRAP);
+            u.add(secAvgRow, u.text("km/h", 14f, C_TEXT_2, false), WRAP, WRAP, 0f, 4f, 0f, 0f, 0f);
+            u.add(secAvgCol, secAvgRow, WRAP, WRAP, 0f, 0f, 4f, 0f, 0f);
+            u.add(secStats, secAvgCol, 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
+            u.add(d.secBlock, secStats, MATCH, WRAP, 0f, 0f, 10f, 0f, 0f);
+            u.add(card2, d.secBlock, MATCH, WRAP);
+
+            d.noEnfBlock = u.inset(1);
+            u.pad(d.noEnfBlock, 14f, 14f, 14f, 14f);
+            u.add(d.noEnfBlock, u.gravity(u.text("감지된 단속 카메라 없음", 14f, C_MUTED, false), G_CENTER), MATCH, WRAP);
+            u.add(card2, d.noEnfBlock, MATCH, WRAP);
+
+            // Card 3: connection & settings
+            Object card3 = u.card();
+            u.add(body, card3, 0f, MATCH, 1.12f, 0f, 0f, 0f, 0f);
+            u.add(card3, u.text("연결 · 설정", 13f, C_MUTED, true), WRAP, WRAP);
+            d.ipText = makeKvRow(u, card3, "이 기기 IP", 10f);
+            setTextColor(d.ipText, C_INFO_TEXT);
+            setBold(d.ipText, true);
+            d.commaValue = makeKvRow(u, card3, "콤마 기기", 7f);
+            d.targetsText = makeKvRow(u, card3, "전송 대상", 7f);
+            d.radioText = makeKvRow(u, card3, "무선 상태", 7f);
+
+            u.add(card3, u.text("부팅 시 무선 모드", 13f, C_MUTED, false), WRAP, WRAP, 0f, 0f, 14f, 0f, 0f);
+            Object segGroup = u.ll(0, G_CV);
+            u.bg(segGroup, C_INSET, C_BORDER, 1f, 12f);
+            u.pad(segGroup, 4f, 4f, 4f, 4f);
+            d.segAp = makeSegment(u, segGroup, "핫스팟(AP)", true, new Runnable() {
                 @Override
                 public void run() {
-                    toggleBootAutoHotspotFromUi();
+                    setBootWirelessModeFromUi("ap");
                 }
             });
-            Object autoHsCheckLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
-            setMargins(autoHsCheckLp, 0, 10, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, autoHsCheckTv, autoHsCheckLp);
+            d.segWifi = makeSegment(u, segGroup, "WiFi(Client)", false, new Runnable() {
+                @Override
+                public void run() {
+                    setBootWirelessModeFromUi("wifi");
+                }
+            });
+            d.segOff = makeSegment(u, segGroup, "끄기(수동)", false, new Runnable() {
+                @Override
+                public void run() {
+                    setBootWirelessModeFromUi("off");
+                }
+            });
+            u.add(card3, segGroup, MATCH, WRAP, 0f, 0f, 6f, 0f, 0f);
+            u.vSpacer(card3);
 
-            Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
-            setMargins(leftCardLp, 0, 0, 8, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, leftCard, leftCardLp);
-
-            // Right Column Card
-            Object rightCard = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(rightCard, 1);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightCard, 16, 12, 16, 12);
-            setRoundedBg(rightCard, 0xFF1E293B, 0xFF475569, 1, 12f);
-
-            Object rightHdr = tvCtor.newInstance(sysContext);
-            setTextViewStyle(rightHdr, "[ 실시간 순정 내비 SDI / TBT 변환 데이터 ]", 16.5f, 0xFFFBBF24, true);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-            Object rightTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(rightTv, "", 15f, 0xFFE2E8F0, false);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightTv, 0, 8, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightTv, llLpCtor3.newInstance(MATCH_PARENT, WRAP_CONTENT, 1.0f));
-
-            // Interactive Checkbox for Comma Device Connection & Data Transmission (ON/OFF)
-            Object commaTxCheckTv = tvCtor.newInstance(sysContext);
-            styleCommaTxCheckbox(commaTxCheckTv, commaTxEnabled);
-            tvSetGravity.invoke(commaTxCheckTv, 17); // CENTER
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(commaTxCheckTv, 12, 8, 12, 8);
-            attachClickListener(commaTxCheckTv, new Runnable() {
+            Object txRow = u.ll(0, G_CV);
+            u.bg(txRow, C_INSET, C_BORDER, 1f, 12f);
+            u.pad(txRow, 14f, 0f, 12f, 0f);
+            u.add(txRow, u.text("콤마 데이터 전송", 15f, C_TEXT, false), 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
+            d.txTrack = u.ll(0, G_RIGHT_CV);
+            u.pad(d.txTrack, 3f, 3f, 3f, 3f);
+            Object knob = u.view();
+            u.bg(knob, C_WHITE, C_WHITE, 0f, 11f);
+            u.add(d.txTrack, knob, 22f, 22f);
+            u.add(txRow, d.txTrack, 50f, 28f);
+            attachClickListener(txRow, new Runnable() {
                 @Override
                 public void run() {
                     toggleCommaTxFromUi();
                 }
             });
-            Object commaTxCheckLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
-            setMargins(commaTxCheckLp, 0, 10, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, commaTxCheckTv, commaTxCheckLp);
+            u.add(card3, txRow, MATCH, 46f);
 
-            Object rightCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.15f);
-            setMargins(rightCardLp, 8, 0, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, rightCard, rightCardLp);
+            // ---------------- Status strip (30dp) ----------------
+            Object strip = u.ll(0, G_CV);
+            u.pad(strip, 22f, 0f, 22f, 0f);
+            u.add(strip, u.text("MAP 버튼 3번 누르면 열기 / 닫기", 13f, C_FAINT, false), WRAP, WRAP);
+            d.messageText = u.singleLine(u.gravity(u.text("", 13f, C_INFO_TEXT, false), G_RIGHT_CV));
+            u.add(strip, d.messageText, 0f, WRAP, 1f, 16f, 0f, 0f, 0f);
+            u.add(root, strip, MATCH, 30f);
 
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, bodyRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-            // 3. Action Buttons Row
-            Object btnRow = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(btnRow, 0); // HORIZONTAL
-            llCls.getMethod("setGravity", int.class).invoke(btnRow, 17);    // CENTER
-            Object btnRowLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
-            setMargins(btnRowLp, 0, 12, 0, 6);
-
-            // Button A: Open Hotspot Settings Screen Directly (com.hkmc.wifisettings/.WifiHotspot)
-            Object hsUiBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(hsUiBtn, "📶 핫스팟 설정 화면", 14.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(hsUiBtn, 17);
-            setRoundedBg(hsUiBtn, 0xFF7C3AED, 0xFFA78BFA, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(hsUiBtn, 10, 10, 10, 10);
-            attachClickListener(hsUiBtn, new Runnable() {
+            // ---------------- Action bar (50dp buttons) ----------------
+            Object actions = u.ll(0, G_CV);
+            u.pad(actions, 20f, 0f, 20f, 14f);
+            makeActionButton(u, actions, "hotspot", C_ACCENT, "핫스팟(AP) 설정", true, new Runnable() {
                 @Override
                 public void run() {
                     openHotspotSettingsFromUi();
                 }
             });
-            Object hsUiBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-            setMargins(hsUiBtnLp, 0, 0, 6, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, hsUiBtn, hsUiBtnLp);
-
-            // Button B: Open Engineering Mode WiFi Info Screen Directly (com.hkmc.system.app.engineering/.module.WifiInfo)
-            Object engUiBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(engUiBtn, "⚙️ 엔지니어링 WiFi", 14.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(engUiBtn, 17);
-            setRoundedBg(engUiBtn, 0xFF475569, 0xFF94A3B8, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(engUiBtn, 10, 10, 10, 10);
-            attachClickListener(engUiBtn, new Runnable() {
+            makeActionButton(u, actions, "wifi", C_INFO, "WiFi(Client) 설정", false, new Runnable() {
+                @Override
+                public void run() {
+                    openWifiClientSettingsFromUi();
+                }
+            });
+            makeActionButton(u, actions, "sliders", C_MUTED, "엔지니어링 WiFi", false, new Runnable() {
                 @Override
                 public void run() {
                     openEngineeringWifiFromUi();
                 }
             });
-            Object engUiBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 0.95f);
-            setMargins(engUiBtnLp, 6, 0, 6, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, engUiBtn, engUiBtnLp);
-
-            // Button C: Re-assert Hotspot in Background
-            Object apBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(apBtn, "📡 핫스팟 즉시 켜기", 14.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(apBtn, 17);
-            setRoundedBg(apBtn, 0xFF0284C7, 0xFF38BDF8, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(apBtn, 10, 10, 10, 10);
-            attachClickListener(apBtn, new Runnable() {
-                @Override
-                public void run() {
-                    triggerHotspotCheckFromUi();
-                }
-            });
-            Object apBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 0.95f);
-            setMargins(apBtnLp, 6, 0, 6, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, apBtn, apBtnLp);
-
-            // Button D: Check GitHub Update Now
-            Object updBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(updBtn, "🔄 GitHub 업데이트", 14.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(updBtn, 17);
-            setRoundedBg(updBtn, 0xFF2563EB, 0xFF60A5FA, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(updBtn, 10, 10, 10, 10);
-            attachClickListener(updBtn, new Runnable() {
+            makeActionButton(u, actions, "refresh", C_OK, "업데이트", false, new Runnable() {
                 @Override
                 public void run() {
                     triggerManualUpdateFromUi();
                 }
             });
-            Object updBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-            setMargins(updBtnLp, 6, 0, 6, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, updBtn, updBtnLp);
-
-            // Button E: Dump TBT to USB/Local Now
-            Object dumpBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(dumpBtn, "💾 TBT 정밀 덤프", 14.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(dumpBtn, 17);
-            setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(dumpBtn, 10, 10, 10, 10);
-            attachClickListener(dumpBtn, new Runnable() {
+            makeActionButton(u, actions, "download", C_VIOLET, "TBT 정밀 덤프", false, new Runnable() {
                 @Override
                 public void run() {
                     triggerManualDumpFromUi();
                 }
             });
-            Object dumpBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 0.95f);
-            setMargins(dumpBtnLp, 6, 0, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, dumpBtn, dumpBtnLp);
+            u.add(root, actions, MATCH, 64f);
 
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, btnRow, btnRowLp);
-
-            // 4. Footer Status Line
-            Object footerTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(footerTv, actionBannerMsg, 14.5f, 0xFF93C5FD, false);
-            tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv, autoHsCheckTv, commaTxCheckTv};
+            // Initial state for the one-shot styled parts
+            styleSegment(u, d.segAp, false);
+            styleSegment(u, d.segWifi, false);
+            styleSegment(u, d.segOff, false);
+            return root;
         }
 
         private static void showOnUiThread() {
@@ -2995,18 +3518,19 @@ public class CarrotBridgeMain {
                 // Note: 2010/2003/2002 set outAppOp=24 (OP_SYSTEM_ALERT_WINDOW), which causes AppOpsService
                 // to throw SecurityException("Bad call: specified package android under uid 0 but it is really 1000").
                 int[] candidateTypes = new int[]{2020, 2008, 2009, 2005};
-                int flags = 0x00000008 | 0x00000020 | 0x00000080; // FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL | FLAG_KEEP_SCREEN_ON
+                // FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL | FLAG_KEEP_SCREEN_ON | FLAG_LAYOUT_IN_SCREEN | FLAG_FULLSCREEN
+                int flags = 0x00000008 | 0x00000020 | 0x00000080 | 0x00000100 | 0x00000400;
                 Constructor<?> wmLpCtor = wmLpCls.getConstructor(int.class, int.class, int.class, int.class, int.class);
                 Method addViewMethod = vmCls.getMethod("addView", viewCls, vgLpCls);
 
                 for (int wtype : candidateTypes) {
-                    Object[] tree = null;
+                    Dash built = new Dash();
                     try {
                         // Build a fresh view tree per candidate so a failed addView never leaves a poisoned View in WindowManagerGlobal.mViews
-                        tree = buildDashboardViewTree();
-                        Object candidateRoot = tree[0];
-                        Object wmLp = wmLpCtor.newInstance(1220, -2, wtype, flags, -3); // -2=WRAP_CONTENT, -3=PixelFormat.TRANSLUCENT
-                        wmLpCls.getField("gravity").setInt(wmLp, 17); // Gravity.CENTER
+                        Object candidateRoot = buildDashboard(built);
+                        // Full screen: MATCH_PARENT x MATCH_PARENT, PixelFormat.TRANSLUCENT (-3)
+                        Object wmLp = wmLpCtor.newInstance(-1, -1, wtype, flags, -3);
+                        wmLpCls.getField("gravity").setInt(wmLp, 0x33); // TOP | LEFT
                         wmLpCls.getMethod("setTitle", CharSequence.class).invoke(wmLp, "CarrotNaviStatusOverlay");
                         addViewMethod.invoke(windowManager, candidateRoot, wmLp);
 
@@ -3024,23 +3548,18 @@ public class CarrotBridgeMain {
                         }
 
                         rootOverlayView = candidateRoot;
-                        leftColTextView = tree[1];
-                        rightColTextView = tree[2];
-                        footerStatusTextView = tree[3];
-                        headerSysInfoTextView = tree.length > 4 ? tree[4] : null;
-                        autoHotspotCheckTextView = tree.length > 5 ? tree[5] : null;
-                        commaTxCheckTextView = tree.length > 6 ? tree[6] : null;
+                        dash = built;
                         isVisible = true;
                         shownAtMs = System.currentTimeMillis();
-                        System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
+                        System.out.println("[CarrotBridge] StatusDashboardOverlay displayed full-screen (windowType=" + wtype + ")");
                         refreshOnUiThread();
                         break;
                     } catch (Throwable t) {
                         Throwable cause = (t.getCause() != null) ? t.getCause() : t;
                         System.out.println("[CarrotBridge] addView(wtype=" + wtype + ") failed: " + cause);
-                        if (tree != null && tree[0] != null) {
+                        if (built.root != null) {
                             try {
-                                windowManager.getClass().getMethod("removeViewImmediate", viewCls).invoke(windowManager, tree[0]);
+                                windowManager.getClass().getMethod("removeViewImmediate", viewCls).invoke(windowManager, built.root);
                             } catch (Throwable ignored) {
                             }
                         }
@@ -3054,12 +3573,7 @@ public class CarrotBridgeMain {
         private static void hideOnUiThread() {
             Object oldRoot = rootOverlayView;
             rootOverlayView = null;
-            headerSysInfoTextView = null;
-            leftColTextView = null;
-            autoHotspotCheckTextView = null;
-            rightColTextView = null;
-            commaTxCheckTextView = null;
-            footerStatusTextView = null;
+            dash = null;
             isVisible = false;
             try {
                 removeCallbacksFromUi(REFRESH_TASK);
@@ -3080,8 +3594,17 @@ public class CarrotBridgeMain {
             }
         }
 
+        private static String shortUpdateStatus(String s) {
+            if (s == null) return "";
+            if (s.contains("업데이트 완료") || s.contains("적용 완료")) return " · 업데이트됨";
+            if (s.contains("실패")) return " · 확인 실패";
+            if (s.contains("최신")) return " · 최신";
+            return "";
+        }
+
         private static void refreshOnUiThread() {
-            if (!isVisible || rootOverlayView == null) return;
+            final Dash d = dash;
+            if (!isVisible || rootOverlayView == null || d == null) return;
             long now = System.currentTimeMillis();
             long elapsedSec = (now - shownAtMs) / 1000L;
             if (elapsedSec >= 60L) {
@@ -3090,96 +3613,155 @@ public class CarrotBridgeMain {
             }
 
             try {
+                U u = new U(sysContext);
                 CarrotPacket pkt = latestSentPacket;
                 NavState st = navStateRef;
                 if (pkt == null && st != null) {
                     pkt = buildCarrotPacket(st);
                 }
+                if (pkt == null) pkt = new CarrotPacket();
 
-                String subProp = getSystemProperty("wifi.hotspot.subscription", "true");
-                String apnProp = getSystemProperty("wifi.hotspot.apn", "Public");
-                String autoProp = getSystemProperty("persist.sys.hotspot.auto", "1");
-                String hotspotStr = (!"0".equals(autoProp) && "true".equals(subProp))
-                        ? "활성 (Auto=ON, APN=" + apnProp + ")"
-                        : "수동/비활성 (Auto=" + autoProp + ")";
-
-                boolean commaAlive = commaTxEnabled && !discoveredCarrotIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
-                String commaStr;
-                if (!commaTxEnabled) {
-                    commaStr = "연결 및 데이터 전송 중지됨 (사용자 OFF)";
-                } else if (commaAlive) {
-                    commaStr = "연결됨 (" + discoveredCarrotIp + " | 차속: " + String.format(Locale.US, "%.1f", carrotVEgoKph) + " km/h)";
-                } else {
-                    commaStr = discoveredCarrotIp.isEmpty() ? "브로드캐스트 송출 중 (192.168.0.255:7706)" : "최근 IP: " + discoveredCarrotIp + " (대기 중)";
-                }
-
+                // ---------- Top bar ----------
                 String autoUpdText = lastAutoUpdateStatus;
                 try {
                     File updNote = new File(installDir, "config/last_update_status.txt");
                     if (updNote.isFile()) {
                         String fromDisk = readFirstLineQuick(updNote);
-                        if (fromDisk != null && !fromDisk.isEmpty()) {
-                            autoUpdText = fromDisk;
-                        }
+                        if (fromDisk != null && !fromDisk.isEmpty()) autoUpdText = fromDisk;
                     }
                 } catch (Throwable ignored) {
                 }
+                setTextIfChanged(d.versionPill, "v" + BRIDGE_VERSION + shortUpdateStatus(autoUpdText));
 
-                long pktIdx = pkt != null ? pkt.carrotIndex : 0L;
-                String daemonStr = commaTxEnabled
-                        ? ("정상 가동 중 (UDP 7706 @ 5Hz, #" + pktIdx + ")")
-                        : "전송 일시정지 (콤마 데이터 전송 OFF)";
-                StringBuilder leftSb = new StringBuilder(512);
-                leftSb.append("• 패키지 버전 : v").append(BRIDGE_VERSION).append(" (HKG_5W_CarrotNavi)\n");
-                leftSb.append("• 브릿지 데몬 : ").append(daemonStr).append("\n");
-                leftSb.append("• Wi-Fi 핫스팟 : ").append(hotspotStr).append("\n");
-                leftSb.append("• 콤마(캐럿) 기기 : ").append(commaStr).append("\n");
-                leftSb.append("• 패킷 타겟 IP : ").append(latestTargetsStr).append("\n");
-                leftSb.append("• 자동 업데이트 : ").append(autoUpdText);
+                setTextIfChanged(d.bridgeText, commaTxEnabled ? "브릿지 정상 · 5Hz" : "브릿지 전송 일시정지");
+                u.bg(d.bridgeDot, commaTxEnabled ? C_OK : C_FAINT, commaTxEnabled ? C_OK : C_FAINT, 0f, 4f);
 
-                StringBuilder rightSb = new StringBuilder(512);
-                if (pkt != null) {
-                    String roadKind = pkt.roadcate == 1 ? "고속/자동차전용(1)" : "일반도로(" + pkt.roadcate + ")";
-                    rightSb.append("• 도로 제한속도 : ").append(pkt.nRoadLimitSpeed).append(" km/h  [종별: ").append(roadKind)
-                            .append(" | 차속: ").append(String.format(Locale.US, "%.0f", pkt.nPosSpeed)).append(" km/h]\n");
-                    rightSb.append("• 1차 SDI(카메라) : ").append(describeSdiType(pkt.nSdiType))
-                            .append(" | 거리: ").append(pkt.nSdiDist).append("m | 단속: ").append(pkt.nSdiSpeedLimit).append(" km/h\n");
-                    if (pkt.nSdiBlockType > 0) {
-                        rightSb.append("• 구간단속/보조 : 구간단속 중 (남은거리: ").append(pkt.nSdiBlockDist)
-                                .append("m, 평균: ").append(pkt.nSdiBlockAverageSpeed).append(" km/h)\n");
-                    } else {
-                        rightSb.append("• 보조 SDI(방지턱) : ").append(describeSdiType(pkt.nSdiPlusType))
-                                .append(" | 거리: ").append(pkt.nSdiPlusDist).append("m\n");
-                    }
+                boolean commaAlive = commaTxEnabled && !discoveredCarrotIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
+                int commaColor = !commaTxEnabled ? C_FAINT : (commaAlive ? C_OK : C_WARN);
+                setTextIfChanged(d.commaText, !commaTxEnabled ? "콤마 전송 꺼짐" : (commaAlive ? "콤마 연결됨" : "콤마 찾는 중"));
+                u.bg(d.commaDot, commaColor, commaColor, 0f, 4f);
 
-                    boolean guiding = st != null && st.isGuidanceActive();
-                    rightSb.append("• 순정 내비 경로 : ").append(guiding ? "경로 안내 중 (Active)" : "미안내 (카메라/제한속도만 전송 중)").append("\n");
-                    rightSb.append("• 1차 TBT 회전 : ").append(describeTurnType(pkt.nTBTTurnType))
-                            .append(" (코드:").append(pkt.nTBTTurnType).append(") | 남은거리: ").append(pkt.nTBTDist).append("m\n");
-                    String mainTxt = (pkt.szTBTMainText == null || pkt.szTBTMainText.isEmpty()) ? "(교차로명 없음)" : pkt.szTBTMainText;
-                    rightSb.append("• 교차로/안내명 : ").append(mainTxt).append("\n");
-                    String remKm = String.format(Locale.US, "%.1f", pkt.nGoPosDist / 1000.0);
-                    int remMin = pkt.nGoPosTime / 60;
-                    rightSb.append("• 2차 TBT / 목적지 : ").append(describeTurnType(pkt.nTBTTurnTypeNext))
-                            .append(" (").append(pkt.nTBTDistNext).append("m) | 잔여: ").append(remKm).append("km (").append(remMin).append("분)");
-                }
+                String ip = readWlanIpv4();
+                boolean apMode = isSoftApMode(ip);
+                String radioName = apMode ? "핫스팟(AP)" : (ip.isEmpty() ? "무선 꺼짐" : "WiFi(Client)");
+                setTextIfChanged(d.modeChipText, ip.isEmpty() ? radioName : (radioName + " · " + ip));
 
-                Class<?> tvCls = Class.forName("android.widget.TextView");
-                Method setText = tvCls.getMethod("setText", CharSequence.class);
-                if (headerSysInfoTextView != null) {
-                    setText.invoke(headerSysInfoTextView, updateSystemResourceBadge(now));
-                }
-                if (autoHotspotCheckTextView != null) {
-                    styleAutoHotspotCheckbox(autoHotspotCheckTextView, isBootAutoHotspotEnabled());
-                }
-                if (commaTxCheckTextView != null) {
-                    styleCommaTxCheckbox(commaTxCheckTextView, commaTxEnabled);
-                }
-                setText.invoke(leftColTextView, leftSb.toString());
-                setText.invoke(rightColTextView, rightSb.toString());
+                setTextIfChanged(d.sysText, updateSystemResourceBadge(now));
                 long remainClose = Math.max(1L, 60L - elapsedSec);
-                setText.invoke(footerStatusTextView, actionBannerMsg + "  (" + remainClose + "초 후 자동 닫힘)");
-            } catch (Throwable ignored) {
+                setTextIfChanged(d.countdownText, remainClose + "초 후 닫힘");
+
+                // ---------- Card 1: route guidance ----------
+                boolean guiding = pkt.nTBTTurnType >= 0 || pkt.nGoPosDist > 0;
+                setVisible(d.guideBlock, guiding);
+                setVisible(d.emptyBlock, !guiding);
+                setTextIfChanged(d.guideBadge, guiding ? "안내 중" : "대기");
+                setTextColor(d.guideBadge, guiding ? C_ON_ACCENT : C_TEXT_2);
+                u.bg(d.guideBadge, guiding ? C_ACCENT : C_TRACK, guiding ? C_ACCENT : C_TRACK, 0f, 11f);
+                if (guiding) {
+                    String key = turnIconKey(pkt.nTBTTurnType);
+                    if (!key.equals(d.turnIconKey)) {
+                        setIconDrawable(d.turnIcon, key, C_ON_ACCENT, 2.6f);
+                        d.turnIconKey = key;
+                    }
+                    if (pkt.nTBTDist > 0) {
+                        setTextIfChanged(d.turnDist, fmtDistNum(pkt.nTBTDist));
+                        setTextIfChanged(d.turnUnit, fmtDistUnit(pkt.nTBTDist));
+                    } else {
+                        setTextIfChanged(d.turnDist, "-");
+                        setTextIfChanged(d.turnUnit, "");
+                    }
+                    setTextIfChanged(d.turnName, pkt.nTBTTurnType >= 0 ? describeTurnType(pkt.nTBTTurnType) : "경로 안내 중");
+                    setTextIfChanged(d.crossroad, cleanGuideText(pkt.szTBTMainText));
+                    int bg = st != null ? st.tbtBarGraph : -1;
+                    setBar(d.barFill, d.barRest, bg >= 0 ? bg : 0);
+                    setTextIfChanged(d.nextText, (pkt.nTBTTurnTypeNext >= 0 && pkt.nTBTDistNext > 0)
+                            ? describeTurnType(pkt.nTBTTurnTypeNext) + " · " + fmtDist(pkt.nTBTDistNext) : "-");
+                    if (pkt.nGoPosDist > 0) {
+                        String dest = String.format(Locale.US, "%.1f km", pkt.nGoPosDist / 1000.0);
+                        if (pkt.nGoPosTime > 0) dest += " · " + Math.max(1, pkt.nGoPosTime / 60) + "분";
+                        setTextIfChanged(d.destText, dest);
+                    } else {
+                        setTextIfChanged(d.destText, "-");
+                    }
+                }
+
+                // ---------- Card 2: speed & enforcement ----------
+                setTextIfChanged(d.limitText, String.valueOf(pkt.nRoadLimitSpeed));
+                setTextIfChanged(d.roadTypeText, "제한속도 · " + (pkt.roadcate == 1 ? "고속도로" : "일반도로"));
+                setTextIfChanged(d.speedText, String.valueOf(Math.round(pkt.nPosSpeed)));
+
+                boolean section = pkt.nSdiBlockType > 0;
+                int camType = pkt.nSdiType >= 0 ? pkt.nSdiType : pkt.nSdiPlusType;
+                int camLimit = pkt.nSdiType >= 0 ? pkt.nSdiSpeedLimit : pkt.nSdiPlusSpeedLimit;
+                int camDist = pkt.nSdiType >= 0 ? pkt.nSdiDist : pkt.nSdiPlusDist;
+                boolean camera = !section && camType >= 0;
+                setVisible(d.secBlock, section);
+                setVisible(d.camBlock, camera);
+                setVisible(d.noEnfBlock, !section && !camera);
+                if (section) {
+                    setTextIfChanged(d.secLimit, pkt.nSdiBlockSpeed > 0 ? pkt.nSdiBlockSpeed + " km/h" : "");
+                    if (pkt.nSdiBlockDist > 0) {
+                        setTextIfChanged(d.secRemain, fmtDistNum(pkt.nSdiBlockDist));
+                        setTextIfChanged(d.secRemainUnit, fmtDistUnit(pkt.nSdiBlockDist));
+                    } else {
+                        setTextIfChanged(d.secRemain, "-");
+                        setTextIfChanged(d.secRemainUnit, "");
+                    }
+                    int avg = pkt.nSdiBlockAverageSpeed;
+                    setTextIfChanged(d.secAvg, avg > 0 ? String.valueOf(avg) : "-");
+                    setTextColor(d.secAvg, (avg > 0 && pkt.nSdiBlockSpeed > 0 && avg > pkt.nSdiBlockSpeed) ? C_WARN : C_OK);
+                } else if (camera) {
+                    String camKey = (camType == 22) ? "bump" : "camera";
+                    if (!camKey.equals(d.camIconKey)) {
+                        setIconDrawable(d.camIcon, camKey, C_WARN, 2f);
+                        d.camIconKey = camKey;
+                    }
+                    setTextIfChanged(d.camTitle, describeSdiType(camType));
+                    setTextIfChanged(d.camLimit, camLimit > 0 ? camLimit + " km/h" : "");
+                    setTextIfChanged(d.camDist, camDist >= 0 ? String.valueOf(camDist) : "-");
+                    setBar(d.camBarFill, d.camBarRest, camDist > 0 ? Math.min(100, camDist * 100 / 600) : 0);
+                }
+
+                // ---------- Card 3: connection & settings ----------
+                setTextIfChanged(d.ipText, ip.isEmpty() ? "연결 없음" : ip + (apMode ? " (wlan0 · AP)" : " (wlan0 · WiFi)"));
+                String commaStr;
+                if (!commaTxEnabled) {
+                    commaStr = "전송 중지됨";
+                } else if (commaAlive) {
+                    commaStr = discoveredCarrotIp + " · " + String.format(Locale.US, "%.0f", carrotVEgoKph) + " km/h";
+                } else {
+                    commaStr = discoveredCarrotIp.isEmpty() ? "찾는 중 (브로드캐스트)" : discoveredCarrotIp + " (대기 중)";
+                }
+                setTextIfChanged(d.commaValue, commaStr);
+                setTextColor(d.commaValue, commaAlive ? C_TEXT : C_WARN);
+                String targets = latestTargetsStr == null ? "" : latestTargetsStr.replace("[", "").replace("]", "");
+                setTextIfChanged(d.targetsText, targets.isEmpty() ? "-" : targets);
+
+                String bootMode = currentBootWirelessMode();
+                boolean paused = new File(HOTSPOT_PAUSE_FILE).isFile() && "ap".equals(bootMode);
+                String radio;
+                if (apMode) {
+                    radio = "핫스팟 켜짐 · 기기 " + scanWlanArpPeers().size() + "대";
+                } else if (!ip.isEmpty()) {
+                    radio = "WiFi(Client) 연결됨";
+                } else {
+                    radio = "연결 없음";
+                }
+                if (paused) radio += " · 핫스팟 자동 유지 일시중지";
+                setTextIfChanged(d.radioText, radio);
+
+                styleSegment(u, d.segAp, "ap".equals(bootMode));
+                styleSegment(u, d.segWifi, "wifi".equals(bootMode));
+                styleSegment(u, d.segOff, "off".equals(bootMode));
+
+                u.bg(d.txTrack, commaTxEnabled ? C_OK : C_OFF, commaTxEnabled ? C_OK : C_OFF, 0f, 14f);
+                setLayoutGravity(d.txTrack, commaTxEnabled ? G_RIGHT_CV : G_LEFT_CV);
+
+                // ---------- Status strip ----------
+                setTextIfChanged(d.messageText, stripLeadingSymbols(actionBannerMsg));
+            } catch (Throwable t) {
+                Throwable cause = (t.getCause() != null) ? t.getCause() : t;
+                System.out.println("[CarrotBridge] Dashboard refresh error: " + cause);
             }
 
             postDelayedToUi(REFRESH_TASK, 500L);
@@ -3199,55 +3781,73 @@ public class CarrotBridgeMain {
             return !"0".equals(autoProp);
         }
 
-        private static void styleAutoHotspotCheckbox(Object view, boolean enabled) throws Exception {
-            if (enabled) {
-                setTextViewStyle(view, "☑ 부팅 시 핫스팟 자동 활성화 : ON (터치하여 변경)", 14.5f, 0xFFFFFFFF, true);
-                setRoundedBg(view, 0xFF065F46, 0xFF34D399, 2, 10f);
-            } else {
-                setTextViewStyle(view, "☐ 부팅 시 핫스팟 자동 활성화 : OFF (터치하여 변경)", 14.5f, 0xFFCBD5E1, true);
-                setRoundedBg(view, 0xFF334155, 0xFF64748B, 2, 10f);
-            }
-        }
-
-        private static void toggleBootAutoHotspotFromUi() {
-            final boolean nextState = !isBootAutoHotspotEnabled();
+        private static boolean isBootAutoWifiEnabled() {
             try {
-                File conf = new File(installDir, "config/hotspot_auto.conf");
-                writeBytesAtomic(conf, (nextState ? "1\n" : "0\n").getBytes(UTF8));
+                File conf = new File(installDir, "config/wifi_auto.conf");
+                if (conf.isFile()) {
+                    return "1".equals(readFirstLineQuick(conf));
+                }
             } catch (Throwable ignored) {
             }
-            actionBannerMsg = nextState
-                    ? "✅ 부팅 시 핫스팟 자동 활성화가 [ON]으로 설정되었습니다."
-                    : "ℹ️ 부팅 시 핫스팟 자동 활성화가 [OFF]로 해제되었습니다.";
+            return false; // default OFF (auto-hotspot is the default boot mode)
+        }
+
+        /**
+         * Boot wireless mode: "ap" (auto-hotspot) | "wifi" (auto-WiFi(Client)) | "off" (manual).
+         * The Broadcom firmware runs either softap OR sta (tcc.wifi.firmware.mode), so the modes are exclusive:
+         * - ap   : hotspot_auto=1, wifi_auto=0, switch the radio to AP now (STA off first).
+         * - wifi : hotspot_auto=0, wifi_auto=1, switch the radio to STA now (AP off first).
+         * - off  : both 0; the current radio state is left as is, nothing is enabled on the next boot.
+         * bridge-daemon.sh reads both files at boot and in its 5 s loop.
+         */
+        private static void setBootWirelessModeFromUi(final String mode) {
+            final boolean ap = "ap".equals(mode);
+            final boolean wifi = "wifi".equals(mode);
+            if (mode.equals(currentBootWirelessMode())) {
+                postToUi(REFRESH_TASK);
+                return;
+            }
+            try {
+                writeBytesAtomic(new File(installDir, "config/hotspot_auto.conf"), (ap ? "1\n" : "0\n").getBytes(UTF8));
+                writeBytesAtomic(new File(installDir, "config/wifi_auto.conf"), (wifi ? "1\n" : "0\n").getBytes(UTF8));
+                if (ap) new File(HOTSPOT_PAUSE_FILE).delete();
+            } catch (Throwable ignored) {
+            }
+            if (ap) {
+                actionBannerMsg = "부팅 시 무선 모드: 핫스팟(AP) — WiFi(Client)를 끄고 핫스팟을 켭니다";
+            } else if (wifi) {
+                actionBannerMsg = "부팅 시 무선 모드: WiFi(Client) — 핫스팟을 끄고 WiFi를 켭니다 (무선 CarPlay/AA 사용 불가)";
+            } else {
+                actionBannerMsg = "부팅 시 무선 모드: 끄기(수동) — 부팅 때 핫스팟·WiFi를 자동으로 켜지 않습니다";
+            }
             postToUi(REFRESH_TASK);
             new Thread(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        if (nextState) {
+                        if (ap) {
                             execCommandCapture(new String[]{"/system/bin/setprop", "persist.sys.hotspot.auto", "1"}, 10);
                             execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.subscription", "true"}, 10);
                             execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.apn", "Public"}, 10);
+                            // setWifiEnabled(false) first: setWifiApEnabled fails while STA is up (same as bridge-daemon.sh enable_hotspot)
+                            execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "13", "i32", "0"}, 10);
+                            try { Thread.sleep(1000L); } catch (InterruptedException ignored) {}
                             execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "29", "i32", "0", "i32", "1"}, 10);
                         } else {
                             execCommandCapture(new String[]{"/system/bin/setprop", "persist.sys.hotspot.auto", "0"}, 10);
                             execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.subscription", "false"}, 10);
+                            if (wifi) {
+                                // setWifiApEnabled(null, false) -> setWifiEnabled(true)
+                                execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "29", "i32", "0", "i32", "0"}, 10);
+                                try { Thread.sleep(1500L); } catch (InterruptedException ignored) {}
+                                execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "13", "i32", "1"}, 10);
+                            }
                         }
                     } catch (Throwable ignored) {
                     }
                     postToUi(REFRESH_TASK);
                 }
-            }, "ToggleBootAutoHotspot").start();
-        }
-
-        private static void styleCommaTxCheckbox(Object view, boolean enabled) throws Exception {
-            if (enabled) {
-                setTextViewStyle(view, "☑ 콤마(캐럿) 기기 데이터 전송 및 연결 : ON (터치하여 변경)", 14.5f, 0xFFFFFFFF, true);
-                setRoundedBg(view, 0xFF065F46, 0xFF34D399, 2, 10f);
-            } else {
-                setTextViewStyle(view, "☐ 콤마(캐럿) 기기 데이터 전송 및 연결 : OFF (터치하여 변경)", 14.5f, 0xFFCBD5E1, true);
-                setRoundedBg(view, 0xFF334155, 0xFF64748B, 2, 10f);
-            }
+            }, "SetBootWirelessMode").start();
         }
 
         private static void toggleCommaTxFromUi() {
@@ -3264,8 +3864,8 @@ public class CarrotBridgeMain {
             } catch (Throwable ignored) {
             }
             actionBannerMsg = nextState
-                    ? "✅ 콤마(캐럿) 기기 데이터 전송 및 연결이 [ON]으로 재개되었습니다."
-                    : "ℹ️ 콤마(캐럿) 기기 데이터 전송 및 연결이 [OFF]로 중지되었습니다.";
+                    ? "콤마 데이터 전송을 다시 켰습니다"
+                    : "콤마 데이터 전송을 껐습니다";
             postToUi(REFRESH_TASK);
         }
 
@@ -3279,15 +3879,15 @@ public class CarrotBridgeMain {
                 Double tempC = readCpuTemperatureCelsius();
                 String cpuPart;
                 if (tempC != null) {
-                    cpuPart = String.format(Locale.US, "🌡️ CPU: %.0f°C (%d%%)", tempC, cpuPct);
+                    cpuPart = String.format(Locale.US, "CPU %.0f°C · %d%%", tempC, cpuPct);
                 } else {
                     int freqMhz = readCpuFreqMhz();
                     cpuPart = freqMhz > 0
-                            ? ("🌡️ CPU: " + cpuPct + "% (" + freqMhz + "MHz)")
-                            : ("🌡️ CPU: " + cpuPct + "%");
+                            ? ("CPU " + cpuPct + "% · " + freqMhz + "MHz")
+                            : ("CPU " + cpuPct + "%");
                 }
                 String ramPart = readRamUsageSummary();
-                cachedSysBadgeText = "  " + cpuPart + "   |   " + ramPart + "  ";
+                cachedSysBadgeText = cpuPart + "    " + ramPart;
             } catch (Throwable ignored) {
             }
             return cachedSysBadgeText;
@@ -3397,7 +3997,7 @@ public class CarrotBridgeMain {
             BufferedReader br = null;
             try {
                 File memFile = new File("/proc/meminfo");
-                if (!memFile.exists()) return "💾 RAM: --";
+                if (!memFile.exists()) return "RAM --";
                 br = new BufferedReader(new InputStreamReader(new FileInputStream(memFile), UTF8));
                 long totalKb = 0L;
                 long freeKb = 0L;
@@ -3424,14 +4024,13 @@ public class CarrotBridgeMain {
                     long usedKb = Math.max(0L, totalKb - freeKb - buffersKb - cachedKb);
                     long totalMb = totalKb / 1024L;
                     long usedMb = usedKb / 1024L;
-                    int pct = (int) Math.round((usedKb * 100.0) / totalKb);
-                    return "💾 RAM: " + usedMb + "/" + totalMb + "MB (" + pct + "%)";
+                    return "RAM " + usedMb + " / " + totalMb + "MB";
                 }
             } catch (Throwable ignored) {
             } finally {
                 if (br != null) try { br.close(); } catch (Exception ignored) {}
             }
-            return "💾 RAM: --";
+            return "RAM --";
         }
 
         private static String readFirstLineQuick(File f) {
@@ -3538,22 +4137,36 @@ public class CarrotBridgeMain {
             }, "EngineeringWifiLauncher").start();
         }
 
-        private static void triggerHotspotCheckFromUi() {
-            actionBannerMsg = "⏳ Wi-Fi 핫스팟(Public APN) 상태 점검 및 활성화 중...";
-            postToUi(REFRESH_TASK);
+        private static void openWifiClientSettingsFromUi() {
+            actionBannerMsg = "⏳ 순정 WiFi(Client) 설정 화면을 여는 중...";
+            // While auto-hotspot is ON, bridge-daemon.sh re-enables the AP every 5 s, which would kill any WiFi(Client)
+            // connection made here. Pause that maintenance until the next boot (the daemon deletes this file at startup).
+            try {
+                writeBytesAtomic(new File(HOTSPOT_PAUSE_FILE), "1\n".getBytes(UTF8));
+            } catch (Throwable ignored) {
+            }
+            hideOnUiThread();
             new Thread(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.subscription", "true"}, 10);
-                        execCommandCapture(new String[]{"/system/bin/setprop", "wifi.hotspot.apn", "Public"}, 10);
-                        execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "29", "i32", "0", "i32", "1"}, 10);
-                        actionBannerMsg = "✅ Wi-Fi 핫스팟(APN=Public) 활성화 명령 전송 완료!";
+                        String out = execCommandCapture(new String[]{
+                                "/system/bin/am", "start",
+                                "-a", "android.intent.action.MAIN",
+                                "-f", "0x10010000",
+                                "-n", "com.hkmc.wifisettings/com.hkmc.wifisettings.WifiClientSettings"
+                        }, 20);
+                        if (out.contains("Error") || out.contains("Exception") || out.contains("does not exist")) {
+                            execCommandCapture(new String[]{
+                                    "/system/bin/am", "start",
+                                    "-f", "0x10000000",
+                                    "-n", "com.hkmc.system.app.engineering/.module.WifiInfo"
+                            }, 20);
+                        }
                     } catch (Throwable ignored) {
                     }
-                    postToUi(REFRESH_TASK);
                 }
-            }, "ManualHotspotTrigger").start();
+            }, "WifiClientSettingsLauncher").start();
         }
 
         private static void disableViewEffects(Object view, boolean hideAccessibility) {
@@ -3681,12 +4294,14 @@ public class CarrotBridgeMain {
         switch (turnType) {
             case -1:
             case 0: return "안내없음";
+            case 6: return "우측 차로 분기";
+            case 7: return "좌측 차로 분기";
             case 11: return "직진";
             case 12: return "좌회전";
             case 13: return "우회전";
             case 14: return "유턴(U-Turn)";
             case 16: return "8시방향 급좌회전";
-            case 17: return "10시방향 좌측방면";
+            case 17: return "좌측 분기";
             case 18: return "2시방향 우측방면";
             case 19: return "4시방향 급우회전";
             case 43: return "우측 고가/지하차도 진입";
@@ -3932,6 +4547,34 @@ public class CarrotBridgeMain {
         CarrotPacket secClearPkt = buildCarrotPacket(stSec);
         if (secClearPkt.nSdiType != -1 || secClearPkt.nSdiBlockType != -1 || secClearPkt.nSdiBlockAverageSpeed != 0) {
             throw new AssertionError("Gen5W section clear mismatch: " + secClearPkt.toJson());
+        }
+
+        // 2c. Full-screen dashboard pure helpers (icon paths, turn icon mapping, formatting)
+        for (String key : StatusDashboardOverlay.ICON_KEYS) {
+            List<Object[]> cmds = StatusDashboardOverlay.parseIconSpec(StatusDashboardOverlay.iconSpec(key));
+            if (cmds.isEmpty()) throw new AssertionError("Empty icon path: " + key);
+            for (Object[] c : cmds) {
+                for (float v : (float[]) c[1]) {
+                    if (v < 0f || v > 24f) throw new AssertionError("Icon '" + key + "' coordinate out of 24x24 grid: " + v);
+                }
+            }
+        }
+        if (!"right".equals(StatusDashboardOverlay.turnIconKey(13)) || !"left".equals(StatusDashboardOverlay.turnIconKey(12))
+                || !"uturn".equals(StatusDashboardOverlay.turnIconKey(14)) || !"straight".equals(StatusDashboardOverlay.turnIconKey(51))
+                || !"slight_right".equals(StatusDashboardOverlay.turnIconKey(101)) || !"slight_left".equals(StatusDashboardOverlay.turnIconKey(7))
+                || !"roundabout".equals(StatusDashboardOverlay.turnIconKey(131)) || !"flag".equals(StatusDashboardOverlay.turnIconKey(201))
+                || !"toll".equals(StatusDashboardOverlay.turnIconKey(153))) {
+            throw new AssertionError("Dashboard turn icon mapping mismatch");
+        }
+        if (!"300 m".equals(StatusDashboardOverlay.fmtDist(300)) || !"2.0 km".equals(StatusDashboardOverlay.fmtDist(2000))
+                || !"1.2 km".equals(StatusDashboardOverlay.fmtDist(1240))) {
+            throw new AssertionError("Dashboard distance format mismatch: " + StatusDashboardOverlay.fmtDist(1240));
+        }
+        if (!"완료".equals(StatusDashboardOverlay.stripLeadingSymbols("✅ 완료"))
+                || !"GitHub".equals(StatusDashboardOverlay.stripLeadingSymbols("⚠️ GitHub"))
+                || !"".equals(StatusDashboardOverlay.cleanGuideText("0xd"))
+                || !"2순환로".equals(StatusDashboardOverlay.cleanGuideText("2순환로"))) {
+            throw new AssertionError("Dashboard text cleanup mismatch");
         }
 
         // 3. Test DNS query builder

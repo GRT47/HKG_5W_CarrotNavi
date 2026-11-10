@@ -125,6 +125,34 @@ disable_hotspot() {
     log_info "Triggered setWifiApEnabled(null, false)"
 }
 
+# Boot auto-WiFi(Client): config/wifi_auto.conf = 1, effective only while auto-hotspot is OFF
+# (the Broadcom firmware runs either softap OR sta, so AP and STA can never be up together).
+is_wifi_auto() {
+    [ "$(getprop persist.sys.hotspot.auto)" = "0" ] || return 1
+    [ -f "$WIFI_CONF" ] || return 1
+    case "$(cat "$WIFI_CONF" 2>/dev/null)" in
+        *1*) return 0 ;;
+    esac
+    return 1
+}
+
+is_sta_enabled() {
+    # IWifiManager.getWifiEnabledState(): 2 = ENABLING, 3 = ENABLED
+    case "$(service call wifi 14 2>/dev/null)" in
+        *00000002*|*00000003*) return 0 ;;
+    esac
+    return 1
+}
+
+enable_wifi_client() {
+    if is_softap_active; then
+        service call wifi 29 i32 0 i32 0 >/dev/null 2>&1
+        sleep 2
+    fi
+    service call wifi 13 i32 1 >/dev/null 2>&1
+    log_info "Triggered setWifiEnabled(true) [boot auto-WiFi(Client)]"
+}
+
 start_bridge_java() {
     if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
         return 0
@@ -176,6 +204,10 @@ trap 'on_stop' TERM INT
 log_info "Service started (pid=$$)"
 
 HOTSPOT_CONF="$INSTALL_DIR/config/hotspot_auto.conf"
+WIFI_CONF="$INSTALL_DIR/config/wifi_auto.conf"
+# Created by the dashboard "WiFi(Client) 설정" button to pause auto-hotspot maintenance until the next boot
+HOTSPOT_PAUSE_FILE="/data/local/tmp/carrotbridge_hotspot_pause"
+rm -f "$HOTSPOT_PAUSE_FILE" 2>/dev/null
 if [ -f "$HOTSPOT_CONF" ]; then
     raw_conf="$(cat "$HOTSPOT_CONF" 2>/dev/null)"
     case "$raw_conf" in
@@ -209,6 +241,11 @@ if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
         log_info "Boot completed: auto-enabling Wi-Fi Hotspot"
         enable_hotspot
     fi
+elif is_wifi_auto; then
+    if ! is_sta_enabled; then
+        log_info "Boot completed: auto-enabling Wi-Fi (Client)"
+        enable_wifi_client
+    fi
 fi
 
 # Wake up com.mnsoft.navi [Cluster] plain-text TBT logger
@@ -221,6 +258,8 @@ LOOP_COUNT=0
 USB_DUMPED_SESSION=0
 NAVI_STARTUP_UPDATED=0
 WAS_SLEEP_OR_OFF=0
+# Re-check auto-WiFi(Client) for ~60 s (12 loops x 5 s) after boot / ACC wakeup, in case HKMC services turn STA off
+WIFI_RECHECK_UNTIL=12
 
 while true; do
     LOOP_COUNT=$((LOOP_COUNT + 1))
@@ -259,8 +298,17 @@ while true; do
 
     if [ "$auto_mode" != "0" ]; then
         apply_hotspot_props
-        if ! is_softap_active; then
+        if [ -f "$HOTSPOT_PAUSE_FILE" ]; then
+            : # paused by dashboard "WiFi(Client) 설정" until next boot
+        elif ! is_softap_active; then
             enable_hotspot
+        fi
+    elif [ "$LOOP_COUNT" -le "$WIFI_RECHECK_UNTIL" ] && is_wifi_auto; then
+        # Never tear down an AP in this re-check: on Niro EV / EV6 the same wlan0 AP is shared with wireless
+        # phone projection (WirelessPhoneProjectionService, setWifiApEnabledForConnectivity), so an AP that shows
+        # up after boot is most likely wireless CarPlay / Android Auto. Only re-enable STA when the radio is idle.
+        if ! is_sta_enabled && ! is_softap_active; then
+            enable_wifi_client
         fi
     fi
 
@@ -296,6 +344,7 @@ while true; do
             fi
         elif [ "$WAS_SLEEP_OR_OFF" = "1" ] && [ "$navi_status" = "3" ]; then
             WAS_SLEEP_OR_OFF=0
+            WIFI_RECHECK_UNTIL=$((LOOP_COUNT + 12))
             log_info "Navigation ON (Warm Wakeup / ACC ON, navistatus=${navi_status}) -> running one-time GitHub Auto-Update"
             run_github_update_check &
         fi
