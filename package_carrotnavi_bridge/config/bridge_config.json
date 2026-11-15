@@ -7,5 +7,6 @@
   "auto_hotspot_enabled": true,
   "auto_usb_tbt_dump_enabled": true,
   "udp_target_port": 7706,
-  "udp_broadcast_port": 7705
+  "udp_broadcast_port": 7705,
+  "tcp_route_port": 7709
 }

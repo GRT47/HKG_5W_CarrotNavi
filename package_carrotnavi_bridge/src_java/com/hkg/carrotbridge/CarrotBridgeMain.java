@@ -20,13 +20,17 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
+import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.Charset;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
@@ -37,6 +41,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.net.ssl.SSLContext;
@@ -63,7 +68,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.8";
+    public static final String BRIDGE_VERSION = "1.2.9";
     public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
@@ -72,6 +77,8 @@ public class CarrotBridgeMain {
 
     private static final int CARROT_BROADCAST_PORT = 7705;
     private static final int CARROT_TARGET_PORT = 7706;
+    private static final int CARROT_ROUTE_TCP_PORT = 7709;
+    public static final int NAVI_ROUTE_MAX_POINTS = 4096;
     private static final long TRACE_MAX_BYTES = 4L * 1024L * 1024L; // 4 MB cap with rotation
 
     /**
@@ -172,8 +179,44 @@ public class CarrotBridgeMain {
         public double posSpeedKph = 0.0;
         public String posRoadName = "";
 
+        // OEM Destination & Waypoints (from com.mnsoft.navi.action.DestinationInfo & Route_Guide_Status)
+        public int routeGuideState = -1; // -1=unknown, 0=none, 1=active guidance, 3=route selection
+        public double destLat = 0.0;
+        public double destLon = 0.0;
+        public String destPoiName = "";
+        public double wp1Lat = 0.0;
+        public double wp1Lon = 0.0;
+        public boolean wp1Passed = true;
+        public double wp2Lat = 0.0;
+        public double wp2Lon = 0.0;
+        public boolean wp2Passed = true;
+        public long lastDestUpdateMs = 0L;
+
         public int carrotIndex = 0;
         public long lastUpdateMs = System.currentTimeMillis();
+
+        public synchronized void clearDestinationLocked() {
+            destLat = 0.0;
+            destLon = 0.0;
+            destPoiName = "";
+            wp1Lat = 0.0;
+            wp1Lon = 0.0;
+            wp1Passed = true;
+            wp2Lat = 0.0;
+            wp2Lon = 0.0;
+            wp2Passed = true;
+        }
+
+        public synchronized List<double[]> getActiveWaypointsLocked() {
+            List<double[]> wps = new ArrayList<double[]>(2);
+            if (!wp1Passed && wp1Lat != 0.0 && wp1Lon != 0.0) {
+                wps.add(new double[]{wp1Lon, wp1Lat});
+            }
+            if (!wp2Passed && wp2Lat != 0.0 && wp2Lon != 0.0) {
+                wps.add(new double[]{wp2Lon, wp2Lat});
+            }
+            return wps;
+        }
 
         public synchronized boolean isGuidanceActive() {
             if (bGuid || setDestStatus == 1 || operationStatus == 1 || remainDistM > 0) {
@@ -612,14 +655,36 @@ public class CarrotBridgeMain {
                 interestingForTrace = true;
                 if (line.contains("bGuid=true")) {
                     st.bGuid = true;
+                    if (st.routeGuideState <= 0) {
+                        st.routeGuideState = 1;
+                    }
                 } else if (line.contains("bGuid=false")) {
                     st.bGuid = false;
+                    st.routeGuideState = 0;
+                    st.clearDestinationLocked();
                     st.tbtDistM = 0;
                     st.remainTurnDistM = 0;
                     st.sccNextTurnDist1 = 0;
                     st.sccNextTurnType1 = 0;
                     st.subInfo2Dist1M = 0;
                     st.crossroadName = "";
+                }
+            }
+            // 12b. BrdCast: com.mnsoft.navi.action.Route_Guide_Status
+            else if (line.contains("Route_Guide_Status")) {
+                interestingForTrace = true;
+                Map<String, Object> extras = parseBrdCastBundleMap(line);
+                int rgs = parseExtraInt(extras.get("ROUTE_GUIDE_STATE"), -1);
+                if (rgs >= 0) {
+                    applyRouteGuideStateLocked(st, rgs, traceFile);
+                }
+            }
+            // 12c. BrdCast: com.mnsoft.navi.action.DestinationInfo
+            else if (line.contains("DestinationInfo")) {
+                interestingForTrace = true;
+                if (canAcceptDestinationLocked(st)) {
+                    Map<String, Object> extras = parseBrdCastBundleMap(line);
+                    applyDestinationExtrasMap(st, extras, traceFile);
                 }
             }
             // 13. BrdCast: com.hkmc.telematics.gis.action.NAVI_GPS_CHANGED
@@ -651,6 +716,305 @@ public class CarrotBridgeMain {
 
         if (interestingForTrace && traceFile != null) {
             appendTraceLine(traceFile, "LOG: " + line);
+        }
+    }
+
+    public static double normalizeNaviCoord(double raw) {
+        if (Double.isNaN(raw) || Double.isInfinite(raw) || raw == 0.0) {
+            return 0.0;
+        }
+        double deg = Math.abs(raw) > 1000.0 ? (raw / 360000.0) : raw;
+        if (Math.abs(deg) > 180.0 || Math.abs(deg) < 0.001) {
+            return 0.0;
+        }
+        return deg;
+    }
+
+    private static double firstValidNaviCoord(double primary, double display) {
+        double p = normalizeNaviCoord(primary);
+        if (p != 0.0) {
+            return p;
+        }
+        return normalizeNaviCoord(display);
+    }
+
+    private static double parseExtraDouble(Object val) {
+        if (val == null) {
+            return 0.0;
+        }
+        if (val instanceof Number) {
+            return ((Number) val).doubleValue();
+        }
+        try {
+            return Double.parseDouble(val.toString().trim());
+        } catch (Exception ignored) {
+            return 0.0;
+        }
+    }
+
+    private static int parseExtraInt(Object val, int fallback) {
+        if (val == null) {
+            return fallback;
+        }
+        if (val instanceof Number) {
+            return ((Number) val).intValue();
+        }
+        try {
+            return Integer.parseInt(val.toString().trim());
+        } catch (Exception ignored) {
+            return fallback;
+        }
+    }
+
+    private static boolean parseExtraBool(Object val) {
+        if (val == null) {
+            return false;
+        }
+        if (val instanceof Boolean) {
+            return ((Boolean) val).booleanValue();
+        }
+        String s = val.toString().trim().toLowerCase(Locale.US);
+        return "true".equals(s) || "1".equals(s);
+    }
+
+    private static void applyRouteGuideStateLocked(NavState st, int state, File traceFile) {
+        int prev = st.routeGuideState;
+        st.routeGuideState = state;
+        if (state == 0) {
+            st.clearDestinationLocked();
+        }
+        if (traceFile != null && prev != state) {
+            appendTraceLine(traceFile, "ROUTE_GUIDE_STATE: " + prev + " -> " + state);
+        }
+    }
+
+    public static void applyDestinationExtrasMap(NavState st, Map<String, Object> extras, File traceFile) {
+        if (st == null || extras == null || extras.isEmpty()) {
+            return;
+        }
+        double lat = firstValidNaviCoord(parseExtraDouble(extras.get("LAT")), parseExtraDouble(extras.get("LAT.Display")));
+        double lon = firstValidNaviCoord(parseExtraDouble(extras.get("LON")), parseExtraDouble(extras.get("LON.Display")));
+        double wp1Lat = firstValidNaviCoord(parseExtraDouble(extras.get("LAT.waypoint1")), parseExtraDouble(extras.get("LAT.waypoint1.Display")));
+        double wp1Lon = firstValidNaviCoord(parseExtraDouble(extras.get("LON.waypoint1")), parseExtraDouble(extras.get("LON.waypoint1.Display")));
+        double wp2Lat = firstValidNaviCoord(parseExtraDouble(extras.get("LAT.waypoint2")), parseExtraDouble(extras.get("LAT.waypoint2.Display")));
+        double wp2Lon = firstValidNaviCoord(parseExtraDouble(extras.get("LON.waypoint2")), parseExtraDouble(extras.get("LON.waypoint2.Display")));
+
+        boolean wp1Valid = Math.abs(wp1Lat) > 0.1 && Math.abs(wp1Lat) <= 90.0 && Math.abs(wp1Lon) > 0.1 && Math.abs(wp1Lon) <= 180.0;
+        boolean wp2Valid = Math.abs(wp2Lat) > 0.1 && Math.abs(wp2Lat) <= 90.0 && Math.abs(wp2Lon) > 0.1 && Math.abs(wp2Lon) <= 180.0;
+
+        Object poiObj = extras.get("PoiName");
+        String poi = poiObj != null ? poiObj.toString().trim() : "";
+        boolean wp1Passed = parseExtraBool(extras.get("Passed.waypoint1"));
+        boolean wp2Passed = parseExtraBool(extras.get("Passed.waypoint2"));
+
+        boolean destValid = Math.abs(lat) > 0.1 && Math.abs(lat) <= 90.0 && Math.abs(lon) > 0.1 && Math.abs(lon) <= 180.0;
+        if (!destValid) {
+            return;
+        }
+
+        boolean changed = Math.abs(st.destLat - lat) > 1e-6
+                || Math.abs(st.destLon - lon) > 1e-6
+                || st.wp1Passed != wp1Passed
+                || st.wp2Passed != wp2Passed
+                || Math.abs(st.wp1Lat - (wp1Valid ? wp1Lat : 0.0)) > 1e-6
+                || Math.abs(st.wp1Lon - (wp1Valid ? wp1Lon : 0.0)) > 1e-6
+                || Math.abs(st.wp2Lat - (wp2Valid ? wp2Lat : 0.0)) > 1e-6
+                || Math.abs(st.wp2Lon - (wp2Valid ? wp2Lon : 0.0)) > 1e-6
+                || (!poi.isEmpty() && !poi.equals(st.destPoiName));
+
+        st.destLat = lat;
+        st.destLon = lon;
+        if (!poi.isEmpty()) {
+            st.destPoiName = poi;
+        }
+        st.wp1Lat = wp1Valid ? wp1Lat : 0.0;
+        st.wp1Lon = wp1Valid ? wp1Lon : 0.0;
+        st.wp1Passed = wp1Passed;
+        st.wp2Lat = wp2Valid ? wp2Lat : 0.0;
+        st.wp2Lon = wp2Valid ? wp2Lon : 0.0;
+        st.wp2Passed = wp2Passed;
+        st.lastDestUpdateMs = System.currentTimeMillis();
+
+        if (traceFile != null && changed) {
+            appendTraceLine(traceFile, String.format(Locale.US,
+                    "DEST_INFO: poi=%s lat=%.6f lon=%.6f wp1=(%.6f,%.6f,p=%s) wp2=(%.6f,%.6f,p=%s)",
+                    st.destPoiName, st.destLat, st.destLon,
+                    st.wp1Lat, st.wp1Lon, String.valueOf(st.wp1Passed),
+                    st.wp2Lat, st.wp2Lon, String.valueOf(st.wp2Passed)));
+        }
+    }
+
+    public static Map<String, Object> parseBrdCastBundleMap(String line) {
+        Map<String, Object> map = new LinkedHashMap<String, Object>();
+        if (line == null || line.isEmpty()) {
+            return map;
+        }
+        String body = line;
+        int bStart = line.indexOf("Bundle[{");
+        if (bStart >= 0) {
+            int valStart = bStart + "Bundle[{".length();
+            int bEnd = line.indexOf("}]", valStart);
+            body = (bEnd > valStart) ? line.substring(valStart, bEnd) : line.substring(valStart);
+        }
+
+        int n = body.length();
+        int i = 0;
+        while (i < n) {
+            while (i < n && (body.charAt(i) == ' ' || body.charAt(i) == ',' || body.charAt(i) == ';')) {
+                i++;
+            }
+            if (i >= n) {
+                break;
+            }
+            int eqIdx = body.indexOf('=', i);
+            if (eqIdx < 0) {
+                break;
+            }
+            String rawKey = body.substring(i, eqIdx).trim();
+            int lastSpace = rawKey.lastIndexOf(' ');
+            String key = lastSpace >= 0 ? rawKey.substring(lastSpace + 1) : rawKey;
+            if (!isBundleKeyToken(key)) {
+                i = eqIdx + 1;
+                continue;
+            }
+
+            int valStart = eqIdx + 1;
+            int valEnd = n;
+            int searchPos = valStart;
+            while (searchPos < n) {
+                int commaIdx = body.indexOf(", ", searchPos);
+                if (commaIdx < 0) {
+                    break;
+                }
+                int afterComma = commaIdx + 2;
+                int nextEq = body.indexOf('=', afterComma);
+                if (nextEq > afterComma && isBundleKeyToken(body.substring(afterComma, nextEq).trim())) {
+                    valEnd = commaIdx;
+                    break;
+                }
+                searchPos = afterComma;
+            }
+
+            String val = body.substring(valStart, valEnd).trim();
+            map.put(key, val);
+            i = (valEnd < n) ? (valEnd + 2) : n;
+        }
+        return map;
+    }
+
+    private static boolean isBundleKeyToken(String s) {
+        if (s == null || s.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean canAcceptDestinationLocked(NavState st) {
+        return (st.routeGuideState > 0) || (st.routeGuideState < 0 && st.isGuidanceActive());
+    }
+
+    private static void pollNaviStickyBroadcasts(NavState st, File traceFile) {
+        try {
+            Map<String, Object> rgsExtras = readStickyBroadcastExtras("com.mnsoft.navi.action.Route_Guide_Status");
+            boolean rgsKnown = false;
+            if (rgsExtras != null && rgsExtras.containsKey("ROUTE_GUIDE_STATE")) {
+                int rgs = parseExtraInt(rgsExtras.get("ROUTE_GUIDE_STATE"), -1);
+                if (rgs >= 0) {
+                    rgsKnown = true;
+                    synchronized (st) {
+                        applyRouteGuideStateLocked(st, rgs, traceFile);
+                    }
+                }
+            }
+            if (!rgsKnown) {
+                Map<String, Object> guidExtras = readStickyBroadcastExtras("com.mnsoft.navi.GuidStatus");
+                if (guidExtras != null && guidExtras.containsKey("bGuid")) {
+                    boolean active = parseExtraBool(guidExtras.get("bGuid"));
+                    synchronized (st) {
+                        st.bGuid = active;
+                        if (active && st.routeGuideState <= 0) {
+                            st.routeGuideState = 1;
+                        } else if (!active) {
+                            st.routeGuideState = 0;
+                            st.clearDestinationLocked();
+                        }
+                    }
+                }
+            }
+
+            boolean allowDest;
+            synchronized (st) {
+                allowDest = canAcceptDestinationLocked(st);
+            }
+            if (!allowDest) {
+                return;
+            }
+
+            Map<String, Object> destExtras = readStickyBroadcastExtras("com.mnsoft.navi.action.DestinationInfo");
+            if (destExtras != null && !destExtras.isEmpty()) {
+                synchronized (st) {
+                    if (canAcceptDestinationLocked(st)) {
+                        applyDestinationExtrasMap(st, destExtras, traceFile);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> readStickyBroadcastExtras(String action) {
+        try {
+            Class<?> amnClass = Class.forName("android.app.ActivityManagerNative");
+            Object am = amnClass.getMethod("getDefault").invoke(null);
+            if (am == null) {
+                return null;
+            }
+            Class<?> iAppThreadClass = Class.forName("android.app.IApplicationThread");
+            Class<?> iIntentReceiverClass = Class.forName("android.content.IIntentReceiver");
+            Class<?> intentFilterClass = Class.forName("android.content.IntentFilter");
+            Object filter = intentFilterClass.getConstructor(String.class).newInstance(action);
+
+            Class<?> iamClass = Class.forName("android.app.IActivityManager");
+            java.lang.reflect.Method regMethod = iamClass.getMethod(
+                    "registerReceiver",
+                    iAppThreadClass,
+                    String.class,
+                    iIntentReceiverClass,
+                    intentFilterClass,
+                    String.class,
+                    int.class);
+            Object intent = regMethod.invoke(am, null, null, null, filter, null, 0);
+            if (intent == null) {
+                return null;
+            }
+            Object extras = intent.getClass().getMethod("getExtras").invoke(intent);
+            if (extras == null) {
+                return null;
+            }
+            Object keySetObj = extras.getClass().getMethod("keySet").invoke(extras);
+            if (!(keySetObj instanceof Set<?>)) {
+                return null;
+            }
+            java.lang.reflect.Method getMethod = extras.getClass().getMethod("get", String.class);
+            Map<String, Object> map = new LinkedHashMap<String, Object>();
+            for (Object keyObj : (Set<?>) keySetObj) {
+                if (keyObj instanceof String) {
+                    String k = (String) keyObj;
+                    map.put(k, getMethod.invoke(extras, k));
+                }
+            }
+            return map;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -1189,9 +1553,12 @@ public class CarrotBridgeMain {
                 pkt.nTBTNextRoadWidth = st.numLanes > 0 ? Math.max(5, st.numLanes * 3) : 9;
                 pkt.nGoPosDist = Math.max(0, st.remainDistM);
                 pkt.nGoPosTime = Math.max(0, st.remainTimeSec);
-                pkt.goalPosX = 0.0;
-                pkt.goalPosY = 0.0;
-                pkt.szGoalName = st.destName;
+                boolean hasDestCoords = st.destLat != 0.0 && st.destLon != 0.0;
+                pkt.goalPosX = hasDestCoords ? st.destLon : 0.0;
+                pkt.goalPosY = hasDestCoords ? st.destLat : 0.0;
+                pkt.szGoalName = (st.destName != null && !st.destName.isEmpty())
+                        ? st.destName
+                        : (st.destPoiName != null ? st.destPoiName : "");
             } else {
                 pkt.nTBTTurnType = -1;
                 pkt.nTBTDist = 0;
@@ -1762,6 +2129,9 @@ public class CarrotBridgeMain {
     private static volatile boolean commaTxEnabled = true;
     private static volatile CarrotPacket latestSentPacket = null;
     private static volatile String latestTargetsStr = "[]";
+    private static volatile Set<String> latestArpPeers = Collections.emptySet();
+    private static volatile int latestRoutePointsCount = 0;
+    private static volatile String latestRouteStatus = "idle";
     private static volatile String lastAutoUpdateStatus = "내비 켜질 때 1회 자동 확인 (대기 중)";
     private static volatile long lastWarmWakeUpdateMs = System.currentTimeMillis();
     private static final Object AUTO_UPDATE_LOCK = new Object();
@@ -2037,6 +2407,7 @@ public class CarrotBridgeMain {
                                 appendTraceLine(traceFile, "DUMPSYS_SNAPSHOT:\n" + out);
                             }
                         }
+                        pollNaviStickyBroadcasts(navState, traceFile);
                         long sleepMs = navState.isGuidanceActive() ? 500L : 1500L;
                         Thread.sleep(sleepMs);
                     } catch (Exception e) {
@@ -2047,6 +2418,9 @@ public class CarrotBridgeMain {
         }, "DumpsysPoller");
         dumpsysThread.setDaemon(true);
         dumpsysThread.start();
+
+        // 3b. Route Sync Manager: Query keyless OSRM & push polyline over TCP 7709
+        RouteSyncManager.start(navState, traceFile);
 
         // 4. Main Loop: Send UDP 7706 packets at 5Hz (every 200ms)
         DatagramSocket txSock = new DatagramSocket();
@@ -2070,6 +2444,7 @@ public class CarrotBridgeMain {
             if (now - lastArpScanMs > 2500L) {
                 wlanInfo = readWlanNetInfo();
                 arpPeers = scanWlanArpPeers(wlanInfo);
+                latestArpPeers = arpPeers;
                 lastArpScanMs = now;
             }
 
@@ -2229,12 +2604,15 @@ public class CarrotBridgeMain {
 
     private static void writeStatusFile(File statusFile, String lastPacketJson, Set<String> targets) {
         try {
+            String safeRouteStatus = escapeJson(latestRouteStatus == null ? "idle" : latestRouteStatus);
             StringBuilder sb = new StringBuilder(1024);
             sb.append("{\n");
             sb.append("  \"bridgeVersion\": \"").append(BRIDGE_VERSION).append("\",\n");
             sb.append("  \"timestampMs\": ").append(System.currentTimeMillis()).append(",\n");
             sb.append("  \"discoveredCarrotIp\": \"").append(discoveredCarrotIp).append("\",\n");
             sb.append("  \"targets\": \"").append(targets.toString()).append("\",\n");
+            sb.append("  \"routePoints\": ").append(latestRoutePointsCount).append(",\n");
+            sb.append("  \"routeStatus\": \"").append(safeRouteStatus).append("\",\n");
             sb.append("  \"lastPacket\": ").append(lastPacketJson).append("\n");
             sb.append("}\n");
             writeBytesAtomic(statusFile, sb.toString().getBytes(UTF8));
@@ -2247,12 +2625,61 @@ public class CarrotBridgeMain {
     // =========================================================================
 
     private static final String[] PUBLIC_DNS_SERVERS = new String[]{"8.8.8.8", "1.1.1.1"};
+    private static final long DNS_CACHE_TTL_MS = 5L * 60L * 1000L;
+    private static final ConcurrentHashMap<String, DnsCacheEntry> dnsCache = new ConcurrentHashMap<String, DnsCacheEntry>();
+
+    private static final class DnsCacheEntry {
+        final String ip;
+        final long expiresAtMs;
+
+        DnsCacheEntry(String ip, long expiresAtMs) {
+            this.ip = ip;
+            this.expiresAtMs = expiresAtMs;
+        }
+    }
+
+    private static boolean isIpv4Literal(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        String[] parts = host.split("\\.", -1);
+        if (parts.length != 4) {
+            return false;
+        }
+        for (String p : parts) {
+            if (p.isEmpty() || p.length() > 3) {
+                return false;
+            }
+            for (int i = 0; i < p.length(); i++) {
+                if (p.charAt(i) < '0' || p.charAt(i) > '9') {
+                    return false;
+                }
+            }
+            int v = parseIntSafe(p, -1);
+            if (v < 0 || v > 255) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     /**
      * Resolves a hostname via direct UDP DNS query to 8.8.8.8 / 1.1.1.1 (routed over rmnet0 Public LTE),
      * bypassing Android's system DNS which is trapped on rmnet1 (172.19.140.37 SKT internal DNS).
      */
     public static String resolveHostViaPublicDns(String host) {
+        if (host == null || host.isEmpty()) {
+            return null;
+        }
+        if (isIpv4Literal(host)) {
+            return host;
+        }
+        long now = System.currentTimeMillis();
+        DnsCacheEntry cached = dnsCache.get(host);
+        if (cached != null && now < cached.expiresAtMs) {
+            return cached.ip;
+        }
+
         for (String dnsServer : PUBLIC_DNS_SERVERS) {
             DatagramSocket sock = null;
             try {
@@ -2267,6 +2694,7 @@ public class CarrotBridgeMain {
                 sock.receive(resp);
                 String ip = parseDnsResponseA(respBuf, resp.getLength());
                 if (ip != null && !ip.isEmpty()) {
+                    dnsCache.put(host, new DnsCacheEntry(ip, now + DNS_CACHE_TTL_MS));
                     return ip;
                 }
             } catch (Exception ignored) {
@@ -2274,12 +2702,15 @@ public class CarrotBridgeMain {
                 if (sock != null) try { sock.close(); } catch (Exception ignored) {}
             }
         }
-        // Hardcoded CDN fallbacks if UDP 53 is transiently blocked
+        // Hardcoded CDN/OSRM fallbacks if UDP 53 is transiently blocked
         if (host.contains("githubusercontent.com")) {
             return "185.199.108.133";
         }
         if (host.equals("github.com") || host.endsWith(".github.com")) {
             return "140.82.112.4";
+        }
+        if ("router.project-osrm.org".equals(host) || "routing.openstreetmap.de".equals(host)) {
+            return "5.148.170.168";
         }
         return null;
     }
@@ -2336,62 +2767,80 @@ public class CarrotBridgeMain {
     }
 
     public static byte[] httpsDownloadWithTls12(String urlStr, int maxRedirects) throws Exception {
+        if (urlStr == null || !urlStr.startsWith("https://")) {
+            throw new IOException("Only https:// URLs are supported: " + urlStr);
+        }
+        return httpOrHttpsDownload(urlStr, maxRedirects, 10000, 15000);
+    }
+
+    public static byte[] httpOrHttpsDownload(String urlStr, int maxRedirects, int connectTimeoutMs, int readTimeoutMs) throws Exception {
         String currentUrl = urlStr;
         for (int hop = 0; hop <= maxRedirects; hop++) {
-            if (!currentUrl.startsWith("https://")) {
-                throw new IOException("Only https:// URLs are supported: " + currentUrl);
+            boolean isHttps = currentUrl != null && currentUrl.startsWith("https://");
+            boolean isHttp = currentUrl != null && currentUrl.startsWith("http://");
+            if (!isHttps && !isHttp) {
+                throw new IOException("Unsupported URL scheme: " + currentUrl);
             }
-            String withoutScheme = currentUrl.substring("https://".length());
+            String schemePrefix = isHttps ? "https://" : "http://";
+            int defaultPort = isHttps ? 443 : 80;
+
+            String withoutScheme = currentUrl.substring(schemePrefix.length());
             int slashIdx = withoutScheme.indexOf('/');
-            String host = slashIdx >= 0 ? withoutScheme.substring(0, slashIdx) : withoutScheme;
+            String hostPort = slashIdx >= 0 ? withoutScheme.substring(0, slashIdx) : withoutScheme;
             String path = slashIdx >= 0 ? withoutScheme.substring(slashIdx) : "/";
-            int port = 443;
-            int colonIdx = host.indexOf(':');
+            String host = hostPort;
+            int port = defaultPort;
+            int colonIdx = hostPort.indexOf(':');
             if (colonIdx >= 0) {
-                port = Integer.parseInt(host.substring(colonIdx + 1));
-                host = host.substring(0, colonIdx);
+                port = Integer.parseInt(hostPort.substring(colonIdx + 1));
+                host = hostPort.substring(0, colonIdx);
             }
+            String hostHeader = (port == defaultPort) ? host : (host + ":" + port);
 
             String ip = resolveHostViaPublicDns(host);
             if (ip == null || ip.isEmpty()) {
                 throw new IOException("Failed to resolve host via Public DNS: " + host);
             }
 
-            SSLContext sc = SSLContext.getInstance("TLSv1.2");
-            TrustManager[] trustAll = new TrustManager[]{
-                    new X509TrustManager() {
-                        @Override public void checkClientTrusted(X509Certificate[] c, String a) {}
-                        @Override public void checkServerTrusted(X509Certificate[] c, String a) {}
-                        @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-                    }
-            };
-            sc.init(null, trustAll, new SecureRandom());
-            SSLSocketFactory factory = sc.getSocketFactory();
-
             Socket rawSock = new Socket();
             SSLSocket sslSock = null;
             try {
-                rawSock.connect(new InetSocketAddress(ip, port), 10000);
-                rawSock.setSoTimeout(15000);
-                sslSock = (SSLSocket) factory.createSocket(rawSock, host, port, true);
-                sslSock.setEnabledProtocols(new String[]{"TLSv1.2"});
-                try {
-                    Method setHostname = sslSock.getClass().getMethod("setHostname", String.class);
-                    setHostname.invoke(sslSock, host);
-                } catch (Exception ignored) {
-                }
-                sslSock.startHandshake();
+                rawSock.connect(new InetSocketAddress(ip, port), connectTimeoutMs);
+                rawSock.setSoTimeout(readTimeoutMs);
 
-                OutputStream out = sslSock.getOutputStream();
+                Socket ioSock = rawSock;
+                if (isHttps) {
+                    SSLContext sc = SSLContext.getInstance("TLSv1.2");
+                    TrustManager[] trustAll = new TrustManager[]{
+                            new X509TrustManager() {
+                                @Override public void checkClientTrusted(X509Certificate[] c, String a) {}
+                                @Override public void checkServerTrusted(X509Certificate[] c, String a) {}
+                                @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+                            }
+                    };
+                    sc.init(null, trustAll, new SecureRandom());
+                    SSLSocketFactory factory = sc.getSocketFactory();
+                    sslSock = (SSLSocket) factory.createSocket(rawSock, host, port, true);
+                    sslSock.setEnabledProtocols(new String[]{"TLSv1.2"});
+                    try {
+                        Method setHostname = sslSock.getClass().getMethod("setHostname", String.class);
+                        setHostname.invoke(sslSock, host);
+                    } catch (Exception ignored) {
+                    }
+                    sslSock.startHandshake();
+                    ioSock = sslSock;
+                }
+
+                OutputStream out = ioSock.getOutputStream();
                 String req = "GET " + path + " HTTP/1.1\r\n"
-                        + "Host: " + host + "\r\n"
+                        + "Host: " + hostHeader + "\r\n"
                         + "User-Agent: HKG-CarrotBridge/" + BRIDGE_VERSION + "\r\n"
                         + "Accept: */*\r\n"
                         + "Connection: close\r\n\r\n";
                 out.write(req.getBytes(UTF8));
                 out.flush();
 
-                InputStream in = sslSock.getInputStream();
+                InputStream in = ioSock.getInputStream();
                 String statusLine = readAsciiLine(in);
                 if (statusLine == null) throw new IOException("Empty HTTP response from " + host);
                 int statusCode = parseHttpStatus(statusLine);
@@ -2412,7 +2861,7 @@ public class CarrotBridgeMain {
                         throw new IOException("HTTP redirect without Location header: " + statusLine);
                     }
                     if (loc.startsWith("/")) {
-                        currentUrl = "https://" + host + loc;
+                        currentUrl = schemePrefix + hostHeader + loc;
                     } else {
                         currentUrl = loc;
                     }
@@ -2426,6 +2875,13 @@ public class CarrotBridgeMain {
                 if (te != null && te.toLowerCase(Locale.US).contains("chunked")) {
                     return readChunkedBody(in);
                 }
+                String clStr = headers.get("content-length");
+                if (clStr != null) {
+                    int cl = parseIntSafe(clStr.trim(), -1);
+                    if (cl >= 0 && cl <= 64 * 1024 * 1024) {
+                        return readFixedBytes(in, cl);
+                    }
+                }
                 return readAllBytes(in);
             } finally {
                 if (sslSock != null) try { sslSock.close(); } catch (Exception ignored) {}
@@ -2433,6 +2889,502 @@ public class CarrotBridgeMain {
             }
         }
         throw new IOException("Too many redirects for " + urlStr);
+    }
+
+    private static byte[] readFixedBytes(InputStream in, int length) throws IOException {
+        if (length <= 0) {
+            return new byte[0];
+        }
+        byte[] buf = new byte[length];
+        int offset = 0;
+        while (offset < length) {
+            int r = in.read(buf, offset, length - offset);
+            if (r < 0) {
+                throw new IOException("Unexpected EOF waiting for " + length + " bytes (got " + offset + ")");
+            }
+            offset += r;
+        }
+        return buf;
+    }
+
+    // =========================================================================
+    // OSRM KEYLESS ROUTE QUERY + POLYLINE5 + CARROT TCP 7709 SYNC
+    // =========================================================================
+
+    private static final String[] OSRM_BASE_URLS = new String[]{
+            "http://router.project-osrm.org/route/v1/driving/",
+            "http://routing.openstreetmap.de/routed-car/route/v1/driving/"
+    };
+
+    public static String buildOsrmDrivingUrl(
+            String baseUrl,
+            double startLat,
+            double startLon,
+            List<double[]> waypointsLonLat,
+            double destLat,
+            double destLon) {
+        StringBuilder sb = new StringBuilder(160);
+        sb.append(baseUrl);
+        if (!baseUrl.endsWith("/")) {
+            sb.append('/');
+        }
+        sb.append(String.format(Locale.US, "%.6f,%.6f", startLon, startLat));
+        if (waypointsLonLat != null) {
+            for (double[] wp : waypointsLonLat) {
+                if (wp != null && wp.length >= 2 && wp[0] != 0.0 && wp[1] != 0.0) {
+                    sb.append(String.format(Locale.US, ";%.6f,%.6f", wp[0], wp[1]));
+                }
+            }
+        }
+        sb.append(String.format(Locale.US, ";%.6f,%.6f", destLon, destLat));
+        sb.append("?overview=full&geometries=polyline&steps=false");
+        return sb.toString();
+    }
+
+    public static String extractJsonStringUnescaped(String json, String key) {
+        if (json == null || key == null || key.isEmpty()) {
+            return "";
+        }
+        Pattern keyPat = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*\"");
+        Matcher m = keyPat.matcher(json);
+        if (!m.find()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        int n = json.length();
+        int i = m.end();
+        while (i < n) {
+            char c = json.charAt(i++);
+            if (c == '"') {
+                return sb.toString();
+            }
+            if (c == '\\' && i < n) {
+                char esc = json.charAt(i++);
+                switch (esc) {
+                    case '\\': sb.append('\\'); break;
+                    case '"': sb.append('"'); break;
+                    case '/': sb.append('/'); break;
+                    case 'n': sb.append('\n'); break;
+                    case 'r': sb.append('\r'); break;
+                    case 't': sb.append('\t'); break;
+                    case 'b': sb.append('\b'); break;
+                    case 'f': sb.append('\f'); break;
+                    case 'u':
+                        if (i + 4 <= n) {
+                            try {
+                                int code = Integer.parseInt(json.substring(i, i + 4), 16);
+                                sb.append((char) code);
+                                i += 4;
+                            } catch (Exception ignored) {
+                                sb.append('u');
+                            }
+                        } else {
+                            sb.append('u');
+                        }
+                        break;
+                    default:
+                        sb.append(esc);
+                        break;
+                }
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Decodes Google Encoded Polyline (1e5) into a list of (lon, lat) pairs. */
+    public static List<double[]> decodePolyline5(String encoded) {
+        List<double[]> pts = new ArrayList<double[]>();
+        if (encoded == null || encoded.isEmpty()) {
+            return pts;
+        }
+        int index = 0;
+        int len = encoded.length();
+        int lat = 0;
+        int lng = 0;
+        while (index < len) {
+            int b;
+            int shift = 0;
+            int result = 0;
+            do {
+                if (index >= len) {
+                    return pts;
+                }
+                b = encoded.charAt(index++) - 63;
+                result |= (b & 0x1F) << shift;
+                shift += 5;
+            } while (b >= 0x20);
+            int dlat = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+            lat += dlat;
+
+            shift = 0;
+            result = 0;
+            do {
+                if (index >= len) {
+                    return pts;
+                }
+                b = encoded.charAt(index++) - 63;
+                result |= (b & 0x1F) << shift;
+                shift += 5;
+            } while (b >= 0x20);
+            int dlng = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+            lng += dlng;
+
+            double latDeg = lat / 1e5;
+            double lonDeg = lng / 1e5;
+            if (Math.abs(latDeg) <= 90.0 && Math.abs(lonDeg) <= 180.0) {
+                pts.add(new double[]{lonDeg, latDeg});
+            }
+        }
+        return pts;
+    }
+
+    public static List<double[]> parseOsrmRoutePolyline(String json) {
+        if (json == null || json.isEmpty()) {
+            return Collections.emptyList();
+        }
+        String code = extractJsonStringUnescaped(json, "code");
+        if (!"Ok".equalsIgnoreCase(code.trim())) {
+            return Collections.emptyList();
+        }
+        String geom = extractJsonStringUnescaped(json, "geometry");
+        if (geom.isEmpty()) {
+            return Collections.emptyList();
+        }
+        return decodePolyline5(geom);
+    }
+
+    public static List<double[]> limitRoutePoints(List<double[]> points, int maxPoints) {
+        if (points == null || points.isEmpty() || maxPoints <= 0) {
+            return Collections.emptyList();
+        }
+        int n = points.size();
+        if (n <= maxPoints) {
+            return new ArrayList<double[]>(points);
+        }
+        if (maxPoints == 1) {
+            List<double[]> single = new ArrayList<double[]>(1);
+            single.add(points.get(0));
+            return single;
+        }
+        List<double[]> out = new ArrayList<double[]>(maxPoints);
+        double step = (double) (n - 1) / (double) (maxPoints - 1);
+        for (int i = 0; i < maxPoints - 1; i++) {
+            int idx = (int) Math.round(i * step);
+            if (idx >= n - 1) {
+                idx = n - 2;
+            }
+            out.add(points.get(idx));
+        }
+        out.add(points.get(n - 1));
+        return out;
+    }
+
+    /** Encodes route points as Carrot TCP 7709 payload: !I (N*8) + N * !ff (lon, lat), or 4 zero bytes to clear. */
+    public static byte[] encodeCarrotRoutePayload(List<double[]> points) {
+        if (points == null || points.isEmpty()) {
+            return new byte[]{0, 0, 0, 0};
+        }
+        List<double[]> limited = limitRoutePoints(points, NAVI_ROUTE_MAX_POINTS);
+        int n = limited.size();
+        int dataBytes = n * 8;
+        ByteBuffer buf = ByteBuffer.allocate(4 + dataBytes).order(ByteOrder.BIG_ENDIAN);
+        buf.putInt(dataBytes);
+        for (int i = 0; i < n; i++) {
+            double[] pt = limited.get(i);
+            buf.putFloat((float) pt[0]);
+            buf.putFloat((float) pt[1]);
+        }
+        return buf.array();
+    }
+
+    public static double minDistanceToPolylineMeters(double lat, double lon, List<double[]> polylineLonLat) {
+        if (polylineLonLat == null || polylineLonLat.isEmpty()) {
+            return Double.MAX_VALUE;
+        }
+        double cosLat = Math.cos(Math.toRadians(lat));
+        double mPerDegLat = 111320.0;
+        double mPerDegLon = 111320.0 * Math.max(0.1, cosLat);
+        if (polylineLonLat.size() == 1) {
+            double[] p0 = polylineLonLat.get(0);
+            double dx = (p0[0] - lon) * mPerDegLon;
+            double dy = (p0[1] - lat) * mPerDegLat;
+            return Math.hypot(dx, dy);
+        }
+        double minDist = Double.MAX_VALUE;
+        for (int i = 0; i < polylineLonLat.size() - 1; i++) {
+            double[] a = polylineLonLat.get(i);
+            double[] b = polylineLonLat.get(i + 1);
+            double ax = (a[0] - lon) * mPerDegLon;
+            double ay = (a[1] - lat) * mPerDegLat;
+            double bx = (b[0] - lon) * mPerDegLon;
+            double by = (b[1] - lat) * mPerDegLat;
+            double dx = bx - ax;
+            double dy = by - ay;
+            double len2 = dx * dx + dy * dy;
+            double t = len2 > 1e-9 ? Math.max(0.0, Math.min(1.0, -(ax * dx + ay * dy) / len2)) : 0.0;
+            double px = ax + t * dx;
+            double py = ay + t * dy;
+            double d = Math.hypot(px, py);
+            if (d < minDist) {
+                minDist = d;
+            }
+        }
+        return minDist;
+    }
+
+    public static boolean sendRouteToCommaTcp7709(String ip, byte[] payload, int connectTimeoutMs, int writeTimeoutMs) {
+        return sendRouteToCommaTcp7709(ip, CARROT_ROUTE_TCP_PORT, payload, connectTimeoutMs, writeTimeoutMs);
+    }
+
+    public static boolean sendRouteToCommaTcp7709(String ip, int port, byte[] payload, int connectTimeoutMs, int writeTimeoutMs) {
+        if (ip == null || ip.isEmpty() || port <= 0 || payload == null || payload.length < 4) {
+            return false;
+        }
+        Socket sock = new Socket();
+        try {
+            sock.connect(new InetSocketAddress(ip, port), connectTimeoutMs);
+            sock.setSoTimeout(writeTimeoutMs);
+            OutputStream out = sock.getOutputStream();
+            out.write(payload);
+            out.flush();
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        } finally {
+            try { sock.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private static String pushRoutePayloadToTargets(byte[] payload) {
+        long now = System.currentTimeMillis();
+        List<String> candidates = new ArrayList<String>();
+        String disc = discoveredCarrotIp;
+        if (disc != null && !disc.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L) {
+            candidates.add(disc);
+        }
+        Set<String> peers = latestArpPeers;
+        if (peers != null) {
+            for (String p : peers) {
+                if (p != null && !p.isEmpty() && !candidates.contains(p)) {
+                    candidates.add(p);
+                }
+            }
+        }
+        for (String ip : candidates) {
+            if (sendRouteToCommaTcp7709(ip, payload, 800, 2000)) {
+                return ip;
+            }
+        }
+        return null;
+    }
+
+    private static final class RouteSyncManager {
+        private static final long LOOP_MS = 500L;
+        private static final long TARGET_DEBOUNCE_MS = 1200L;
+        private static final double OFF_ROUTE_DIST_M = 120.0;
+        private static final long OFF_ROUTE_HOLD_MS = 5000L;
+        private static final long REROUTE_COOLDOWN_MS = 20000L;
+        private static final long KEEP_ALIVE_PUSH_MS = 30000L;
+        private static final long PUSH_RETRY_INTERVAL_MS = 3000L;
+        private static final long MIN_RETRY_BACKOFF_MS = 5000L;
+        private static final long MAX_RETRY_BACKOFF_MS = 60000L;
+
+        static void start(final NavState navState, final File traceFile) {
+            Thread t = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    runLoop(navState, traceFile);
+                }
+            }, "RouteSyncManager");
+            t.setDaemon(true);
+            t.start();
+        }
+
+        private static void runLoop(NavState navState, File traceFile) {
+            String pendingTargetKey = "";
+            long targetChangedAtMs = 0L;
+            String activeRouteKey = "";
+            List<double[]> currentPolyline = Collections.emptyList();
+            byte[] currentPayload = null;
+            long lastOsrmQueryMs = 0L;
+            int consecutiveFailures = 0;
+            long nextAllowedRetryMs = 0L;
+            long offRouteSinceMs = 0L;
+            boolean clearSentForIdle = true;
+            boolean pendingPush = false;
+            String lastSyncedIp = "";
+            long lastPushMs = 0L;
+            long lastPushAttemptMs = 0L;
+
+            while (true) {
+                try {
+                    long now = System.currentTimeMillis();
+                    boolean txEnabled = commaTxEnabled;
+
+                    boolean guiding;
+                    double curLat;
+                    double curLon;
+                    boolean gpsValid;
+                    double destLat;
+                    double destLon;
+                    List<double[]> activeWps;
+                    boolean naviRerouting;
+                    synchronized (navState) {
+                        guiding = navState.isGuidanceActive() && navState.routeGuideState != 0 && navState.routeGuideState != 3;
+                        curLat = navState.lat;
+                        curLon = navState.lon;
+                        gpsValid = Math.abs(curLat) > 0.1 && Math.abs(curLat) <= 90.0
+                                && Math.abs(curLon) > 0.1 && Math.abs(curLon) <= 180.0
+                                && navState.lastGpsFixMs > 0L;
+                        destLat = navState.destLat;
+                        destLon = navState.destLon;
+                        activeWps = navState.getActiveWaypointsLocked();
+                        naviRerouting = (navState.offRouteStatus == 1 || navState.displayTypeCode == 10);
+                    }
+
+                    boolean hasDest = Math.abs(destLat) > 0.1 && Math.abs(destLon) > 0.1;
+                    if (!txEnabled || !guiding || !hasDest) {
+                        pendingTargetKey = "";
+                        activeRouteKey = "";
+                        currentPolyline = Collections.emptyList();
+                        currentPayload = null;
+                        latestRoutePointsCount = 0;
+                        offRouteSinceMs = 0L;
+                        consecutiveFailures = 0;
+                        nextAllowedRetryMs = 0L;
+                        pendingPush = false;
+                        latestRouteStatus = !txEnabled ? "tx off" : "idle";
+                        if (!clearSentForIdle) {
+                            byte[] clearPayload = encodeCarrotRoutePayload(null);
+                            pushRoutePayloadToTargets(clearPayload);
+                            clearSentForIdle = true;
+                            lastPushMs = now;
+                            appendTraceLine(traceFile, "ROUTE7709: cleared");
+                        }
+                        Thread.sleep(LOOP_MS);
+                        continue;
+                    }
+
+                    StringBuilder kb = new StringBuilder(96);
+                    for (int i = 0; i < activeWps.size(); i++) {
+                        double[] wp = activeWps.get(i);
+                        kb.append(String.format(Locale.US, "%.5f,%.5f;", wp[0], wp[1]));
+                    }
+                    kb.append(String.format(Locale.US, "%.5f,%.5f", destLon, destLat));
+                    String targetKey = kb.toString();
+
+                    if (!targetKey.equals(pendingTargetKey)) {
+                        pendingTargetKey = targetKey;
+                        targetChangedAtMs = now;
+                        offRouteSinceMs = 0L;
+                    }
+
+                    boolean targetDebounced = (now - targetChangedAtMs) >= TARGET_DEBOUNCE_MS;
+                    boolean needInitialQuery = targetDebounced && !targetKey.equals(activeRouteKey);
+
+                    boolean needOffRouteRequery = false;
+                    if (targetKey.equals(activeRouteKey) && !currentPolyline.isEmpty()) {
+                        if (gpsValid) {
+                            double distM = minDistanceToPolylineMeters(curLat, curLon, currentPolyline);
+                            if (distM > OFF_ROUTE_DIST_M) {
+                                if (offRouteSinceMs == 0L) {
+                                    offRouteSinceMs = now;
+                                }
+                            } else {
+                                offRouteSinceMs = 0L;
+                            }
+                        } else {
+                            offRouteSinceMs = 0L;
+                        }
+                        boolean distOffRoute = offRouteSinceMs > 0L && (now - offRouteSinceMs) >= OFF_ROUTE_HOLD_MS;
+                        if ((naviRerouting || distOffRoute)
+                                && (now - lastOsrmQueryMs) >= REROUTE_COOLDOWN_MS) {
+                            needOffRouteRequery = true;
+                        }
+                    }
+
+                    if ((needInitialQuery || needOffRouteRequery) && now >= nextAllowedRetryMs) {
+                        if (!gpsValid) {
+                            latestRouteStatus = "waiting GPS";
+                        } else {
+                            latestRouteStatus = "querying OSRM";
+                            List<double[]> fetched = null;
+                            String lastErr = "";
+                            for (String baseUrl : OSRM_BASE_URLS) {
+                                try {
+                                    String url = buildOsrmDrivingUrl(baseUrl, curLat, curLon, activeWps, destLat, destLon);
+                                    byte[] raw = httpOrHttpsDownload(url, 2, 5000, 8000);
+                                    String json = new String(raw, UTF8);
+                                    List<double[]> pts = parseOsrmRoutePolyline(json);
+                                    if (pts.size() >= 2) {
+                                        fetched = pts;
+                                        break;
+                                    }
+                                    lastErr = "empty polyline";
+                                } catch (Exception e) {
+                                    lastErr = e.getClass().getSimpleName() + ": " + e.getMessage();
+                                }
+                            }
+                            lastOsrmQueryMs = now;
+                            if (fetched != null && fetched.size() >= 2) {
+                                List<double[]> limited = limitRoutePoints(fetched, NAVI_ROUTE_MAX_POINTS);
+                                byte[] payload = encodeCarrotRoutePayload(limited);
+                                activeRouteKey = targetKey;
+                                currentPolyline = limited;
+                                currentPayload = payload;
+                                latestRoutePointsCount = limited.size();
+                                latestRouteStatus = "osrm ok (" + limited.size() + "pt)";
+                                consecutiveFailures = 0;
+                                nextAllowedRetryMs = 0L;
+                                offRouteSinceMs = 0L;
+                                clearSentForIdle = false;
+                                pendingPush = true;
+                                appendTraceLine(traceFile, "OSRM_OK: points=" + limited.size() + " target=" + targetKey);
+                            } else {
+                                consecutiveFailures++;
+                                long shift = Math.min(4, Math.max(0, consecutiveFailures - 1));
+                                long backoffMs = Math.min(MAX_RETRY_BACKOFF_MS, MIN_RETRY_BACKOFF_MS << shift);
+                                nextAllowedRetryMs = now + backoffMs;
+                                latestRouteStatus = "osrm retry (" + consecutiveFailures + "): " + lastErr;
+                                appendTraceLine(traceFile, "OSRM_FAIL: " + lastErr);
+                            }
+                        }
+                    }
+
+                    if (currentPayload != null && !currentPolyline.isEmpty()) {
+                        String disc = discoveredCarrotIp;
+                        boolean hasFreshDisc = disc != null && !disc.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
+                        boolean ipChanged = hasFreshDisc && !disc.equals(lastSyncedIp);
+                        boolean keepAliveDue = (now - lastPushMs) >= KEEP_ALIVE_PUSH_MS;
+                        boolean retryDue = pendingPush && (now - lastPushAttemptMs) >= PUSH_RETRY_INTERVAL_MS;
+                        if (pendingPush && lastPushAttemptMs == 0L) {
+                            retryDue = true;
+                        }
+                        if (ipChanged || keepAliveDue || retryDue) {
+                            lastPushAttemptMs = now;
+                            String pushedIp = pushRoutePayloadToTargets(currentPayload);
+                            if (pushedIp != null) {
+                                lastSyncedIp = pushedIp;
+                                lastPushMs = now;
+                                pendingPush = false;
+                                clearSentForIdle = false;
+                                latestRouteStatus = "synced " + latestRoutePointsCount + "pt -> " + pushedIp;
+                            } else {
+                                pendingPush = true;
+                                latestRouteStatus = "osrm " + latestRoutePointsCount + "pt (7709 waiting)";
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                try {
+                    Thread.sleep(LOOP_MS);
+                } catch (InterruptedException ignored) {
+                }
+            }
+        }
     }
 
     private static String readAsciiLine(InputStream in) throws IOException {
@@ -3857,7 +4809,11 @@ public class CarrotBridgeMain {
                 if (!commaTxEnabled) {
                     commaStr = "전송 중지됨";
                 } else if (commaAlive) {
+                    int routePts = latestRoutePointsCount;
                     commaStr = discoveredCarrotIp + " · " + String.format(Locale.US, "%.0f", carrotVEgoKph) + " km/h";
+                    if (routePts > 0) {
+                        commaStr += " · 경로 " + routePts + "pt";
+                    }
                 } else {
                     commaStr = discoveredCarrotIp.isEmpty() ? "찾는 중 (브로드캐스트)" : discoveredCarrotIp + " (대기 중)";
                 }
@@ -4781,6 +5737,147 @@ public class CarrotBridgeMain {
                 || !isValidRemotePeerIp("192.168.0.1", "192.168.0.25")
                 || isValidRemotePeerIp("192.168.0.25", "192.168.0.25")) {
             throw new AssertionError("Remote peer IP filtering mismatch");
+        }
+
+        // 6. Test OEM DestinationInfo / Route_Guide_Status, OSRM polyline5, & TCP 7709 sync
+        if (Math.abs(normalizeNaviCoord(37.49790) - 37.49790) > 1e-6
+                || Math.abs(normalizeNaviCoord(37.49790 * 360000.0) - 37.49790) > 1e-6
+                || Math.abs(normalizeNaviCoord(127.02764 * 360000.0) - 127.02764) > 1e-6
+                || normalizeNaviCoord(0.0) != 0.0) {
+            throw new AssertionError("normalizeNaviCoord centi-arcsecond conversion mismatch");
+        }
+
+        NavState stRoute = new NavState();
+        stRoute.lat = 37.49000;
+        stRoute.lon = 127.02000;
+        stRoute.lastGpsFixMs = System.currentTimeMillis();
+        stRoute.remainDistM = 1500;
+        stRoute.remainTimeSec = 180;
+        parseLogcatLine("BrdCast: com.mnsoft.navi.GuidStatus Bundle[{bGuid=true}]", stRoute, null);
+        parseLogcatLine("BrdCast: com.mnsoft.navi.action.Route_Guide_Status Bundle[{ROUTE_GUIDE_STATE=1}]", stRoute, null);
+        parseLogcatLine(
+                "BrdCast: com.mnsoft.navi.action.DestinationInfo extras=Bundle[{"
+                        + "LON=" + (127.02764 * 360000.0)
+                        + ", LAT=" + (37.49790 * 360000.0)
+                        + ", LON.waypoint1=127.03000, LAT.waypoint1=37.50000, Passed.waypoint1=false"
+                        + ", LON.waypoint2=127.03500, LAT.waypoint2=37.50500, Passed.waypoint2=true"
+                        + ", PoiName=강남역 2번 출구, 테헤란로}]",
+                stRoute, null);
+        if (Math.abs(stRoute.destLat - 37.49790) > 1e-5
+                || Math.abs(stRoute.destLon - 127.02764) > 1e-5
+                || !"강남역 2번 출구, 테헤란로".equals(stRoute.destPoiName)) {
+            throw new AssertionError("DestinationInfo parsing mismatch: poi=" + stRoute.destPoiName
+                    + " lat=" + stRoute.destLat + " lon=" + stRoute.destLon);
+        }
+        List<double[]> activeWps = stRoute.getActiveWaypointsLocked();
+        if (activeWps.size() != 1
+                || Math.abs(activeWps.get(0)[0] - 127.03000) > 1e-5
+                || Math.abs(activeWps.get(0)[1] - 37.50000) > 1e-5) {
+            throw new AssertionError("Active waypoint filtering mismatch: size=" + activeWps.size());
+        }
+        CarrotPacket pktRoute = buildCarrotPacket(stRoute);
+        if (Math.abs(pktRoute.goalPosX - 127.02764) > 1e-5
+                || Math.abs(pktRoute.goalPosY - 37.49790) > 1e-5
+                || !"강남역 2번 출구, 테헤란로".equals(pktRoute.szGoalName)) {
+            throw new AssertionError("CarrotPacket goalPosX/Y or szGoalName fallback mismatch");
+        }
+        parseLogcatLine("BrdCast: com.mnsoft.navi.action.Route_Guide_Status Bundle[{ROUTE_GUIDE_STATE=0}]", stRoute, null);
+        if (stRoute.destLat != 0.0 || stRoute.destLon != 0.0 || !stRoute.getActiveWaypointsLocked().isEmpty()) {
+            throw new AssertionError("Route_Guide_Status=0 must clear destination & waypoints");
+        }
+        parseLogcatLine(
+                "BrdCast: com.mnsoft.navi.action.DestinationInfo extras=Bundle[{LON=127.02764, LAT=37.49790, PoiName=StaleCancel}]",
+                stRoute, null);
+        if (stRoute.destLat != 0.0 || stRoute.destLon != 0.0) {
+            throw new AssertionError("DestinationInfo must be ignored when ROUTE_GUIDE_STATE=0 even if remainDistM>0");
+        }
+        NavState stIdle = new NavState();
+        parseLogcatLine(
+                "BrdCast: com.mnsoft.navi.action.DestinationInfo extras=Bundle[{LON=127.02764, LAT=37.49790, PoiName=StaleBoot}]",
+                stIdle, null);
+        if (stIdle.destLat != 0.0 || stIdle.destLon != 0.0) {
+            throw new AssertionError("DestinationInfo must be ignored when routeGuideState=-1 and idle");
+        }
+
+        String osrmUrl = buildOsrmDrivingUrl(OSRM_BASE_URLS[0], 37.49000, 127.02000, activeWps, 37.49790, 127.02764);
+        if (!osrmUrl.contains("127.020000,37.490000;127.030000,37.500000;127.027640,37.497900?overview=full&geometries=polyline")) {
+            throw new AssertionError("OSRM URL format mismatch: " + osrmUrl);
+        }
+
+        String sampleOsrmJson = "{\"code\":\"Ok\",\"routes\":[{\"geometry\":\"{xzcFwaifW?CCMMDKBWFg@PYJcA^mAb@_A^IBw@XiBr@aCv@_@JsAf@cAd@}@\\\\gA^}D~AeA`@eA^g@X?q@COYsA\\\\M\"}]}";
+        List<double[]> decodedPts = parseOsrmRoutePolyline(sampleOsrmJson);
+        if (decodedPts.size() <= 10) {
+            throw new AssertionError("OSRM polyline5 decode count too small: " + decodedPts.size());
+        }
+        double[] firstPt = decodedPts.get(0);
+        double[] lastPt = decodedPts.get(decodedPts.size() - 1);
+        if (Math.abs(firstPt[0] - 127.02764) > 0.001 || Math.abs(firstPt[1] - 37.49790) > 0.001
+                || Math.abs(lastPt[0] - 127.02542) > 0.001 || Math.abs(lastPt[1] - 37.50450) > 0.001) {
+            throw new AssertionError("OSRM polyline5 endpoint mismatch: first=("
+                    + firstPt[0] + "," + firstPt[1] + ") last=(" + lastPt[0] + "," + lastPt[1] + ")");
+        }
+
+        List<double[]> bigRoute = new ArrayList<double[]>(5000);
+        for (int i = 0; i < 5000; i++) {
+            bigRoute.add(new double[]{127.0 + i * 0.0001, 37.5 + i * 0.0001});
+        }
+        List<double[]> limitedBig = limitRoutePoints(bigRoute, NAVI_ROUTE_MAX_POINTS);
+        if (limitedBig.size() != NAVI_ROUTE_MAX_POINTS
+                || Math.abs(limitedBig.get(0)[0] - 127.0) > 1e-6
+                || Math.abs(limitedBig.get(limitedBig.size() - 1)[0] - bigRoute.get(4999)[0]) > 1e-6) {
+            throw new AssertionError("limitRoutePoints failed for 5000->4096");
+        }
+
+        byte[] routePayload = encodeCarrotRoutePayload(decodedPts);
+        byte[] clearPayload = encodeCarrotRoutePayload(null);
+        ByteBuffer checkBuf = ByteBuffer.wrap(routePayload).order(ByteOrder.BIG_ENDIAN);
+        int encodedDataLen = checkBuf.getInt();
+        float encLon0 = checkBuf.getFloat();
+        float encLat0 = checkBuf.getFloat();
+        if (routePayload.length != 4 + decodedPts.size() * 8
+                || encodedDataLen != decodedPts.size() * 8
+                || Math.abs(encLon0 - (float) firstPt[0]) > 1e-5f
+                || Math.abs(encLat0 - (float) firstPt[1]) > 1e-5f
+                || clearPayload.length != 4
+                || (clearPayload[0] | clearPayload[1] | clearPayload[2] | clearPayload[3]) != 0) {
+            throw new AssertionError("encodeCarrotRoutePayload binary format mismatch");
+        }
+
+        double onRouteDist = minDistanceToPolylineMeters(firstPt[1], firstPt[0], decodedPts);
+        double offRouteDist = minDistanceToPolylineMeters(firstPt[1] + 0.003, firstPt[0] + 0.003, decodedPts);
+        if (onRouteDist > 5.0 || offRouteDist < 150.0) {
+            throw new AssertionError("minDistanceToPolylineMeters mismatch: on=" + onRouteDist + " off=" + offRouteDist);
+        }
+
+        final ServerSocket testSrv = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"));
+        testSrv.setSoTimeout(5000);
+        final List<byte[]> receivedTcp = Collections.synchronizedList(new ArrayList<byte[]>());
+        Thread srvThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    for (int k = 0; k < 2; k++) {
+                        Socket c = testSrv.accept();
+                        c.setSoTimeout(2000);
+                        byte[] data = readAllBytes(c.getInputStream());
+                        receivedTcp.add(data);
+                        c.close();
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }, "TestTcp7709");
+        srvThread.setDaemon(true);
+        srvThread.start();
+        int srvPort = testSrv.getLocalPort();
+        boolean sent1 = sendRouteToCommaTcp7709("127.0.0.1", srvPort, routePayload, 1500, 1500);
+        boolean sent2 = sendRouteToCommaTcp7709("127.0.0.1", srvPort, clearPayload, 1500, 1500);
+        srvThread.join(3000);
+        try { testSrv.close(); } catch (Exception ignored) {}
+        if (!sent1 || !sent2 || receivedTcp.size() != 2
+                || !Arrays.equals(routePayload, receivedTcp.get(0))
+                || !Arrays.equals(clearPayload, receivedTcp.get(1))) {
+            throw new AssertionError("Loopback TCP 7709 route transfer mismatch");
         }
 
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());
