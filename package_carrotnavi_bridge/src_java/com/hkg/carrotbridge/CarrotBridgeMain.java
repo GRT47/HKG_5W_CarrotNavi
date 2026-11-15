@@ -15,8 +15,11 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
 import java.net.Socket;
 import java.nio.charset.Charset;
 import java.security.MessageDigest;
@@ -60,7 +63,8 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.7";
+    public static final String BRIDGE_VERSION = "1.2.8";
+    public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -163,6 +167,7 @@ public class CarrotBridgeMain {
         // GPS & Current Road
         public double lat = 0.0;
         public double lon = 0.0;
+        public long lastGpsFixMs = 0L;
         public double headingDeg = 0.0;
         public double posSpeedKph = 0.0;
         public String posRoadName = "";
@@ -221,6 +226,8 @@ public class CarrotBridgeMain {
 
         public int nGoPosDist = 0;
         public int nGoPosTime = 0;
+        public double goalPosX = 0.0;
+        public double goalPosY = 0.0;
         public String szGoalName = "";
         public String szPosRoadName = "";
 
@@ -267,6 +274,8 @@ public class CarrotBridgeMain {
 
             appendInt(sb, "nGoPosDist", nGoPosDist, false);
             appendInt(sb, "nGoPosTime", nGoPosTime, false);
+            appendDouble(sb, "goalPosX", goalPosX, 6);
+            appendDouble(sb, "goalPosY", goalPosY, 6);
             appendStr(sb, "szGoalName", szGoalName);
             appendStr(sb, "szPosRoadName", szPosRoadName);
 
@@ -330,6 +339,10 @@ public class CarrotBridgeMain {
     private static final Pattern TAIL_CAM_ALERT_PATTERN = Pattern.compile("cameraSafetyAlert(\\d+)");
 
     public static void parseLogcatLine(String line, NavState st, File traceFile) {
+        parseLogcatLine(line, st, traceFile, System.currentTimeMillis());
+    }
+
+    public static void parseLogcatLine(String line, NavState st, File traceFile, long nowMs) {
         if (line == null || line.isEmpty()) return;
         // Ignore rear parking camera popup noise from ExFW
         if (line.contains("CameraPopupOntheScreen") || line.contains("cameraUpdateFlyerIcon")) {
@@ -339,7 +352,7 @@ public class CarrotBridgeMain {
         boolean interestingForTrace = false;
 
         synchronized (st) {
-            st.lastUpdateMs = System.currentTimeMillis();
+            st.lastUpdateMs = nowMs;
 
             // 1. NaviCluster.updateTBTTrapInfo()
             if (line.contains("updateTBTTrapInfo()")) {
@@ -617,9 +630,12 @@ public class CarrotBridgeMain {
                 if (lat > 30.0 && lat < 45.0 && lon > 120.0 && lon < 135.0) {
                     st.lat = lat;
                     st.lon = lon;
+                    st.lastGpsFixMs = nowMs;
+                } else if (line.contains("LAT=")) {
+                    st.lastGpsFixMs = 0L;
                 }
                 if (hdg >= 0.0 && hdg <= 360.0) {
-                    st.headingDeg = hdg;
+                    st.headingDeg = normalizeHeadingDeg(hdg);
                 }
                 String admin = extractBundleStr(line, "ADMINNAME=");
                 if (!admin.isEmpty()) {
@@ -694,7 +710,7 @@ public class CarrotBridgeMain {
         } else if (line.contains("[IL TBT Sub Info - 0x4D] Compass =")) {
             String val = substringAfter(line, "Compass =").trim();
             double deg = parseLeadingDouble(val, -1.0);
-            if (deg >= 0.0 && deg <= 360.0) st.headingDeg = deg;
+            if (deg >= 0.0 && deg <= 360.0) st.headingDeg = normalizeHeadingDeg(deg);
         } else if (line.contains("[IL TBT Sub Info 2 - 0x4C] Distance To Next Point 1 =")) {
             String val = substringAfter(line, "Distance To Next Point 1 =").trim();
             st.subInfo2Dist1M = parseDistanceWithUnitText(val);
@@ -770,12 +786,16 @@ public class CarrotBridgeMain {
     // =========================================================================
 
     public static void parseDumpsysCluster(String dumpText, NavState st) {
+        parseDumpsysCluster(dumpText, st, System.currentTimeMillis());
+    }
+
+    public static void parseDumpsysCluster(String dumpText, NavState st, long nowMs) {
         if (dumpText == null || dumpText.isEmpty()) return;
         String section = "";
         String[] lines = dumpText.split("\n");
 
         synchronized (st) {
-            st.lastUpdateMs = System.currentTimeMillis();
+            st.lastUpdateMs = nowMs;
             for (String rawLine : lines) {
                 String line = rawLine.trim();
                 if (line.isEmpty()) continue;
@@ -894,8 +914,8 @@ public class CarrotBridgeMain {
                     }
                     if (line.startsWith("CompassDegree")) {
                         double deg = parseLeadingDouble(substringAfter(line, "=").trim(), -1.0);
-                        if (deg >= 0.0 && deg <= 360.0 && st.lat == 0.0) {
-                            st.headingDeg = deg;
+                        if (deg >= 0.0 && deg <= 360.0 && !isGpsFresh(st, nowMs)) {
+                            st.headingDeg = normalizeHeadingDeg(deg);
                         }
                     }
                 } else if ("SUB2".equals(section)) {
@@ -963,12 +983,40 @@ public class CarrotBridgeMain {
     // MAPPING ENGINE: NavState -> CarrotPacket (CarrotServ.update 7706 format)
     // =========================================================================
 
+    /**
+     * Normalizes heading into [0.0, 360.0) at 0.1-deg precision so "%.1f" formatting
+     * never outputs "360.0" (rejected by carrot-wip GPSSources: 0 <= heading < 360).
+     */
+    public static double normalizeHeadingDeg(double deg) {
+        if (Double.isNaN(deg) || Double.isInfinite(deg) || deg < 0.0 || deg > 360.0) {
+            return 0.0;
+        }
+        double norm = deg % 360.0;
+        double rounded1 = Math.round(norm * 10.0) / 10.0;
+        if (rounded1 < 0.0 || rounded1 >= 360.0) {
+            return 0.0;
+        }
+        return rounded1;
+    }
+
+    public static boolean isGpsFresh(NavState st, long nowMs) {
+        return st != null
+                && st.lat != 0.0 && st.lon != 0.0
+                && st.lastGpsFixMs > 0L
+                && nowMs >= st.lastGpsFixMs
+                && (nowMs - st.lastGpsFixMs) <= GPS_STALE_TIMEOUT_MS;
+    }
+
     public static CarrotPacket buildCarrotPacket(NavState st) {
+        return buildCarrotPacket(st, System.currentTimeMillis());
+    }
+
+    public static CarrotPacket buildCarrotPacket(NavState st, long nowMs) {
         CarrotPacket pkt = new CarrotPacket();
         synchronized (st) {
             st.carrotIndex++;
             pkt.carrotIndex = st.carrotIndex;
-            pkt.epochTime = System.currentTimeMillis() / 1000L;
+            pkt.epochTime = nowMs / 1000L;
             pkt.nRoadLimitSpeed = st.nRoadLimitSpeed > 0 ? st.nRoadLimitSpeed : 30;
             pkt.roadcate = st.roadcate;
 
@@ -989,7 +1037,6 @@ public class CarrotBridgeMain {
                     ? st.rangeCamAvgMovingSpd
                     : ((st.stdPosRangeAvgSpeed > 0 && st.stdPosRangeAvgSpeed < 255) ? st.stdPosRangeAvgSpeed : 0);
 
-            long nowMs = System.currentTimeMillis();
             if (st.rangeCamSpdLimit > 0) {
                 st.sectionLatchedSpeed = st.rangeCamSpdLimit;
                 st.lastTrapSpeedMs = nowMs;
@@ -1142,6 +1189,8 @@ public class CarrotBridgeMain {
                 pkt.nTBTNextRoadWidth = st.numLanes > 0 ? Math.max(5, st.numLanes * 3) : 9;
                 pkt.nGoPosDist = Math.max(0, st.remainDistM);
                 pkt.nGoPosTime = Math.max(0, st.remainTimeSec);
+                pkt.goalPosX = 0.0;
+                pkt.goalPosY = 0.0;
                 pkt.szGoalName = st.destName;
             } else {
                 pkt.nTBTTurnType = -1;
@@ -1150,12 +1199,16 @@ public class CarrotBridgeMain {
                 pkt.nTBTDistNext = 0;
                 pkt.nGoPosDist = 0;
                 pkt.nGoPosTime = 0;
+                pkt.goalPosX = 0.0;
+                pkt.goalPosY = 0.0;
+                pkt.szGoalName = "";
             }
 
             pkt.szPosRoadName = !st.posRoadName.isEmpty() ? st.posRoadName : st.crossroadName;
-            pkt.vpPosPointLat = st.lat;
-            pkt.vpPosPointLon = st.lon;
-            pkt.nPosAngle = st.headingDeg;
+            boolean gpsFresh = isGpsFresh(st, nowMs);
+            pkt.vpPosPointLat = gpsFresh ? st.lat : 0.0;
+            pkt.vpPosPointLon = gpsFresh ? st.lon : 0.0;
+            pkt.nPosAngle = normalizeHeadingDeg(st.headingDeg);
             pkt.nPosSpeed = st.posSpeedKph;
         }
         return pkt;
@@ -1862,7 +1915,8 @@ public class CarrotBridgeMain {
                             }
                             String msg = new String(pkt.getData(), pkt.getOffset(), pkt.getLength(), UTF8);
                             String senderIp = pkt.getAddress().getHostAddress();
-                            if (senderIp != null && !senderIp.startsWith("127.") && !senderIp.equals("192.168.0.1")) {
+                            WlanNetInfo wlan = readWlanNetInfo();
+                            if (isValidRemotePeerIp(senderIp, wlan.localIp) && !senderIp.equals(wlan.broadcastIp)) {
                                 discoveredCarrotIp = senderIp;
                                 discoveredCarrotTimeMs = System.currentTimeMillis();
                             }
@@ -1997,6 +2051,7 @@ public class CarrotBridgeMain {
         // 4. Main Loop: Send UDP 7706 packets at 5Hz (every 200ms)
         DatagramSocket txSock = new DatagramSocket();
         txSock.setBroadcast(true);
+        WlanNetInfo wlanInfo = readWlanNetInfo();
         Set<String> arpPeers = new LinkedHashSet<String>();
         long lastArpScanMs = 0L;
         long lastStatusWriteMs = 0L;
@@ -2012,8 +2067,9 @@ public class CarrotBridgeMain {
                 triggerBackgroundAutoUpdate(installDir, 0L, false);
             }
 
-            if (now - lastArpScanMs > 5000L) {
-                arpPeers = scanWlanArpPeers();
+            if (now - lastArpScanMs > 2500L) {
+                wlanInfo = readWlanNetInfo();
+                arpPeers = scanWlanArpPeers(wlanInfo);
                 lastArpScanMs = now;
             }
 
@@ -2029,7 +2085,7 @@ public class CarrotBridgeMain {
                 }
                 targets.addAll(arpPeers);
                 if (targets.isEmpty() || (pkt.carrotIndex % 5 == 0)) {
-                    targets.add("192.168.0.255");
+                    targets.add(wlanInfo.broadcastIp);
                 }
                 latestTargetsStr = targets.toString();
 
@@ -2059,10 +2115,94 @@ public class CarrotBridgeMain {
         }
     }
 
+    public static final class WlanNetInfo {
+        public final String localIp;
+        public final String broadcastIp;
+
+        public WlanNetInfo(String localIp, String broadcastIp) {
+            this.localIp = localIp == null ? "" : localIp;
+            this.broadcastIp = (broadcastIp == null || broadcastIp.isEmpty()) ? "192.168.0.255" : broadcastIp;
+        }
+    }
+
+    public static String computeIpv4Broadcast(String ipv4, int prefixLen) {
+        if (ipv4 == null || ipv4.isEmpty() || prefixLen <= 0 || prefixLen >= 32) return "";
+        String[] parts = ipv4.trim().split("\\.");
+        if (parts.length != 4) return "";
+        int ip = 0;
+        for (int i = 0; i < 4; i++) {
+            int oct = parseIntSafe(parts[i], -1);
+            if (oct < 0 || oct > 255) return "";
+            ip = (ip << 8) | oct;
+        }
+        int mask = (int) (0xFFFFFFFFL << (32 - prefixLen));
+        int bcast = ip | ~mask;
+        return ((bcast >>> 24) & 0xFF) + "."
+                + ((bcast >>> 16) & 0xFF) + "."
+                + ((bcast >>> 8) & 0xFF) + "."
+                + (bcast & 0xFF);
+    }
+
+    public static boolean isValidRemotePeerIp(String peerIp, String localWlanIp) {
+        if (peerIp == null || peerIp.isEmpty()) return false;
+        if (peerIp.startsWith("127.") || "0.0.0.0".equals(peerIp) || "255.255.255.255".equals(peerIp)) {
+            return false;
+        }
+        if (localWlanIp != null && !localWlanIp.isEmpty()) {
+            return !peerIp.equals(localWlanIp);
+        }
+        return !"192.168.0.1".equals(peerIp);
+    }
+
+    public static WlanNetInfo readWlanNetInfo() {
+        try {
+            NetworkInterface ni = NetworkInterface.getByName("wlan0");
+            if (ni == null) return new WlanNetInfo("", "192.168.0.255");
+            List<InterfaceAddress> ifAddrs = ni.getInterfaceAddresses();
+            if (ifAddrs != null) {
+                for (InterfaceAddress ia : ifAddrs) {
+                    if (ia == null) continue;
+                    InetAddress a = ia.getAddress();
+                    if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
+                        String ip = a.getHostAddress();
+                        String bcast = "";
+                        InetAddress ba = ia.getBroadcast();
+                        if (ba instanceof Inet4Address) {
+                            bcast = ba.getHostAddress();
+                        }
+                        if (bcast == null || bcast.isEmpty() || "0.0.0.0".equals(bcast)) {
+                            bcast = computeIpv4Broadcast(ip, ia.getNetworkPrefixLength());
+                        }
+                        if (bcast.isEmpty()) {
+                            bcast = computeIpv4Broadcast(ip, 24);
+                        }
+                        return new WlanNetInfo(ip, bcast);
+                    }
+                }
+            }
+            java.util.Enumeration<InetAddress> addrs = ni.getInetAddresses();
+            while (addrs.hasMoreElements()) {
+                InetAddress a = addrs.nextElement();
+                if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
+                    String ip = a.getHostAddress();
+                    return new WlanNetInfo(ip, computeIpv4Broadcast(ip, 24));
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return new WlanNetInfo("", "192.168.0.255");
+    }
+
     private static Set<String> scanWlanArpPeers() {
+        return scanWlanArpPeers(readWlanNetInfo());
+    }
+
+    private static Set<String> scanWlanArpPeers(WlanNetInfo wlan) {
         Set<String> peers = new LinkedHashSet<String>();
         File arp = new File("/proc/net/arp");
         if (!arp.exists()) return peers;
+        String localIp = wlan != null ? wlan.localIp : "";
+        String bcastIp = wlan != null ? wlan.broadcastIp : "";
         BufferedReader br = null;
         try {
             br = new BufferedReader(new InputStreamReader(new FileInputStream(arp), UTF8));
@@ -2074,7 +2214,8 @@ public class CarrotBridgeMain {
                     String ip = parts[0];
                     String flags = parts[2];
                     String dev = parts[5];
-                    if ("wlan0".equals(dev) && !"0x0".equals(flags) && !ip.equals("192.168.0.1")) {
+                    if ("wlan0".equals(dev) && !"0x0".equals(flags)
+                            && isValidRemotePeerIp(ip, localIp) && !ip.equals(bcastIp)) {
                         peers.add(ip);
                     }
                 }
@@ -3053,19 +3194,7 @@ public class CarrotBridgeMain {
         }
 
         private static String readWlanIpv4() {
-            try {
-                java.net.NetworkInterface ni = java.net.NetworkInterface.getByName("wlan0");
-                if (ni == null) return "";
-                java.util.Enumeration<java.net.InetAddress> addrs = ni.getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    java.net.InetAddress a = addrs.nextElement();
-                    if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) {
-                        return a.getHostAddress();
-                    }
-                }
-            } catch (Throwable ignored) {
-            }
-            return "";
+            return readWlanNetInfo().localIp;
         }
 
         private static boolean isSoftApMode(String wlanIp) {
@@ -4602,6 +4731,56 @@ public class CarrotBridgeMain {
         }
         if (!checkMapShortcutLine("I/ivi_mode_broadcast(  524): [1004,KEYCODE_SHORTCUT_MAP]", t0 + 760L)) {
             throw new AssertionError("Should trigger on 3rd MAP press!");
+        }
+
+        // 5. Test carrot-wip compatibility: GPS freshness expiration, heading < 360 normalization, goalPosX/Y, wlan0 subnet helpers
+        NavState stGps = new NavState();
+        long tGps = 500000L;
+        parseLogcatLine("D/ BrdCast( 1168): action:Intent { act=com.hkmc.telematics.gis.action.NAVI_GPS_CHANGED } [BrdCast]Bundle[{LAT=37.497942, LON=127.027621, HEADING=360.0, ADMINNAME=테헤란로}]", stGps, null, tGps);
+        stGps.bGuid = true;
+        stGps.displayTypeCode = 13;
+        stGps.destName = "서울역";
+
+        CarrotPacket gpsFreshPkt = buildCarrotPacket(stGps, tGps + 1000L);
+        if (Math.abs(gpsFreshPkt.vpPosPointLat - 37.497942) > 1e-6
+                || Math.abs(gpsFreshPkt.vpPosPointLon - 127.027621) > 1e-6
+                || gpsFreshPkt.nPosAngle != 0.0) {
+            throw new AssertionError("Fresh GPS / normalized heading mismatch: " + gpsFreshPkt.toJson());
+        }
+        String freshJson = gpsFreshPkt.toJson();
+        if (freshJson.contains("\"nPosAngle\":360.0")) {
+            throw new AssertionError("nPosAngle must never serialize as 360.0: " + freshJson);
+        }
+        if (!freshJson.contains("\"goalPosX\":0.000000,\"goalPosY\":0.000000,\"szGoalName\":\"서울역\"")) {
+            throw new AssertionError("goalPosX/goalPosY/szGoalName serialization mismatch: " + freshJson);
+        }
+        if (normalizeHeadingDeg(359.96) != 0.0 || normalizeHeadingDeg(359.94) != 359.9) {
+            throw new AssertionError("Heading normalization edge case mismatch");
+        }
+
+        CarrotPacket gpsExpiredPkt = buildCarrotPacket(stGps, tGps + 2600L);
+        if (gpsExpiredPkt.vpPosPointLat != 0.0 || gpsExpiredPkt.vpPosPointLon != 0.0) {
+            throw new AssertionError("Expired GPS must fall back to 0.0: " + gpsExpiredPkt.toJson());
+        }
+
+        parseLogcatLine("D/ BrdCast( 1168): action:Intent { act=com.hkmc.telematics.gis.action.NAVI_GPS_CHANGED } [BrdCast]Bundle[{LAT=37.500000, LON=127.030000, HEADING=180.0}]", stGps, null, tGps + 3000L);
+        if (!isGpsFresh(stGps, tGps + 3100L)) {
+            throw new AssertionError("GPS should be fresh after valid update");
+        }
+        parseLogcatLine("D/ BrdCast( 1168): action:Intent { act=com.hkmc.telematics.gis.action.NAVI_GPS_CHANGED } [BrdCast]Bundle[{LAT=0.0, LON=0.0}]", stGps, null, tGps + 3200L);
+        if (isGpsFresh(stGps, tGps + 3200L)) {
+            throw new AssertionError("Zero coordinates must invalidate GPS freshness immediately");
+        }
+
+        if (!"192.168.0.255".equals(computeIpv4Broadcast("192.168.0.1", 24))
+                || !"10.42.0.255".equals(computeIpv4Broadcast("10.42.0.58", 24))
+                || !"172.20.10.15".equals(computeIpv4Broadcast("172.20.10.4", 28))) {
+            throw new AssertionError("IPv4 broadcast computation mismatch");
+        }
+        if (isValidRemotePeerIp("192.168.0.1", "192.168.0.1")
+                || !isValidRemotePeerIp("192.168.0.1", "192.168.0.25")
+                || isValidRemotePeerIp("192.168.0.25", "192.168.0.25")) {
+            throw new AssertionError("Remote peer IP filtering mismatch");
         }
 
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());
