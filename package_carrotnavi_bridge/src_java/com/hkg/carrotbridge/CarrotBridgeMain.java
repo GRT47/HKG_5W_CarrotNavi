@@ -68,7 +68,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.3.1";
+    public static final String BRIDGE_VERSION = "1.3.2";
     public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
@@ -4242,8 +4242,11 @@ public class CarrotBridgeMain {
         // Created when the user opens WiFi(Client) settings: bridge-daemon.sh skips auto-hotspot maintenance while it
         // exists (AP and STA cannot run concurrently on this Broadcom firmware). Deleted by the daemon on every boot.
         private static final String HOTSPOT_PAUSE_FILE = "/data/local/tmp/carrotbridge_hotspot_pause";
+        static final long AUTO_CLOSE_DURATION_MS = 60000L;
         private static volatile boolean isVisible = false;
         private static volatile long shownAtMs = 0L;
+        private static volatile boolean autoClosePaused = false;
+        private static volatile long autoCloseRemainingMs = AUTO_CLOSE_DURATION_MS;
         private static volatile String actionBannerMsg = "";
         private static volatile long lastSysBadgeMs = 0L;
         private static volatile String cachedSysBadgeText = "CPU --   RAM --";
@@ -4252,6 +4255,51 @@ public class CarrotBridgeMain {
         private static volatile int lastCpuLoadPct = 0;
         private static volatile File cachedThermalFile = null;
         private static volatile boolean thermalSearchDone = false;
+
+        static long computeAutoCloseRemainingMs(long shownMs, boolean paused, long pausedRemainMs, long nowMs) {
+            if (paused) {
+                return Math.max(1000L, Math.min(AUTO_CLOSE_DURATION_MS, pausedRemainMs));
+            }
+            return AUTO_CLOSE_DURATION_MS - Math.max(0L, nowMs - shownMs);
+        }
+
+        static boolean shouldAutoClose(long shownMs, boolean paused, long nowMs) {
+            if (paused) return false;
+            return (nowMs - shownMs) >= AUTO_CLOSE_DURATION_MS;
+        }
+
+        static String formatCountdownText(long shownMs, boolean paused, long pausedRemainMs, long nowMs) {
+            long remMs = computeAutoCloseRemainingMs(shownMs, paused, pausedRemainMs, nowMs);
+            long remSec = Math.min(60L, Math.max(1L, (remMs + 999L) / 1000L));
+            return paused ? (remSec + "초 · 일시정지") : (remSec + "초 후 닫힘");
+        }
+
+        private static void resetAutoCloseState(long nowMs) {
+            shownAtMs = nowMs;
+            autoClosePaused = false;
+            autoCloseRemainingMs = AUTO_CLOSE_DURATION_MS;
+            if (actionBannerMsg != null && actionBannerMsg.contains("자동 닫힘 카운터")) {
+                actionBannerMsg = "";
+            }
+        }
+
+        private static void toggleAutoClosePauseFromUi() {
+            long now = System.currentTimeMillis();
+            if (!autoClosePaused) {
+                autoCloseRemainingMs = Math.max(1000L, Math.min(AUTO_CLOSE_DURATION_MS,
+                        AUTO_CLOSE_DURATION_MS - Math.max(0L, now - shownAtMs)));
+                autoClosePaused = true;
+                long sec = Math.min(60L, Math.max(1L, (autoCloseRemainingMs + 999L) / 1000L));
+                actionBannerMsg = "자동 닫힘 카운터 일시정지 (" + sec + "초 남음 · 다시 누르면 재개)";
+            } else {
+                long rem = Math.max(1000L, Math.min(AUTO_CLOSE_DURATION_MS, autoCloseRemainingMs));
+                shownAtMs = now - (AUTO_CLOSE_DURATION_MS - rem);
+                autoClosePaused = false;
+                long sec = Math.min(60L, Math.max(1L, (rem + 999L) / 1000L));
+                actionBannerMsg = "자동 닫힘 카운터 재개 (" + sec + "초 후 닫힘)";
+            }
+            refreshOnUiThread();
+        }
 
         private static final Runnable REFRESH_TASK = new Runnable() {
             @Override
@@ -4439,6 +4487,7 @@ public class CarrotBridgeMain {
         private static final int C_INFO_TEXT = 0xFF7DD3FC;
         private static final int C_OK = 0xFF34D399;
         private static final int C_WARN = 0xFFFBBF24;
+        private static final int C_PAUSE_BG = 0xFF292012;
         private static final int C_SIGN_RED = 0xFFDC2626;
         private static final int C_OFF = 0xFF334155;
         private static final int C_WHITE = 0xFFFFFFFF;
@@ -4454,7 +4503,7 @@ public class CarrotBridgeMain {
         /** Views of the dashboard that change on refresh (null while hidden). */
         private static final class Dash {
             Object root;
-            Object versionPill, bridgeDot, bridgeText, commaDot, commaText, gpsDot, gpsChipText, modeChipText, sysText, countdownText;
+            Object versionPill, bridgeDot, bridgeText, commaDot, commaText, gpsDot, gpsChipText, modeChipText, sysText, countdownBtn, countdownIcon, countdownText;
             Object guideBadge, guideBlock, emptyBlock, turnIcon, turnDist, turnUnit, turnName, crossroad;
             Object barFill, barRest, nextText, destText;
             Object limitText, roadTypeText, speedText;
@@ -4465,6 +4514,7 @@ public class CarrotBridgeMain {
             Object segAp, segWifi, segOff;
             Object txTrack;
             Object messageText;
+            int countdownStyleState = -1;
             String turnIconKey = "";
             String camIconKey = "";
         }
@@ -4612,6 +4662,8 @@ public class CarrotBridgeMain {
             if ("refresh".equals(key)) return "M20 12 Q20 20 12 20 Q4 20 4 12 Q4 4 12 4 Q15.5 4 17.7 6.3 M20 4 L20 9 L15 9";
             if ("download".equals(key)) return "M12 4 L12 15 M7 10 L12 15 L17 10 M5 20 L19 20";
             if ("close".equals(key)) return "M6 6 L18 18 M18 6 L6 18";
+            if ("pause".equals(key)) return "M8 5 L8 19 M16 5 L16 19";
+            if ("play".equals(key)) return "M8 5 L19 12 L8 19 Z";
             if ("camera".equals(key)) return "M5 7 L15 7 Q17 7 17 9 L17 15 Q17 17 15 17 L5 17 Q3 17 3 15 L3 9 Q3 7 5 7 Z M17 10 L21 8 L21 16 L17 14";
             if ("section".equals(key)) return "M4 18 L20 18 M4 14 L4 22 M20 14 L20 22 M8 10 L12 4 L16 10";
             if ("bump".equals(key)) return "M2 18 L7 18 Q12 8 17 18 L22 18";
@@ -4619,8 +4671,8 @@ public class CarrotBridgeMain {
         }
 
         static final String[] ICON_KEYS = {"right", "left", "slight_right", "slight_left", "uturn", "roundabout", "flag",
-                "toll", "nav", "wifi", "wifi_small", "hotspot", "sliders", "refresh", "download", "close", "camera",
-                "section", "bump", "straight"};
+                "toll", "nav", "wifi", "wifi_small", "hotspot", "sliders", "refresh", "download", "close", "pause", "play",
+                "camera", "section", "bump", "straight"};
 
         /**
          * Parses an icon spec into {Character cmd, float[] args} entries (absolute coords on a 24x24 grid).
@@ -4912,9 +4964,21 @@ public class CarrotBridgeMain {
             d.modeChipText = modeChip[1];
 
             d.sysText = u.text("", 13f, C_MUTED, false);
-            u.add(top, d.sysText, WRAP, WRAP, 0f, 0f, 0f, 14f, 0f);
-            d.countdownText = u.text("", 13f, C_TEXT_2, true);
-            u.add(top, d.countdownText, WRAP, WRAP, 0f, 0f, 0f, 14f, 0f);
+            u.add(top, d.sysText, WRAP, WRAP, 0f, 0f, 0f, 10f, 0f);
+            d.countdownBtn = u.ll(0, G_CENTER);
+            u.bg(d.countdownBtn, C_BTN, C_BORDER_STRONG, 1f, 11f);
+            u.pad(d.countdownBtn, 10f, 0f, 11f, 0f);
+            d.countdownIcon = u.icon("pause", C_MUTED, 2.2f);
+            u.add(d.countdownBtn, d.countdownIcon, 13f, 13f);
+            d.countdownText = u.text("", 12.5f, C_TEXT_2, true);
+            u.add(d.countdownBtn, d.countdownText, WRAP, WRAP, 0f, 5f, 0f, 0f, 0f);
+            attachClickListener(d.countdownBtn, false, new Runnable() {
+                @Override
+                public void run() {
+                    toggleAutoClosePauseFromUi();
+                }
+            });
+            u.add(top, d.countdownBtn, WRAP, 36f, 0f, 0f, 0f, 10f, 0f);
             Object closeBtn = u.ll(0, G_CENTER);
             u.bg(closeBtn, C_BTN, C_BORDER_STRONG, 1f, 12f);
             u.add(closeBtn, u.icon("close", C_TEXT, 2.2f), 20f, 20f);
@@ -5184,7 +5248,9 @@ public class CarrotBridgeMain {
                     return;
                 }
                 if (isVisible && rootOverlayView != null) {
-                    shownAtMs = System.currentTimeMillis();
+                    if (!autoClosePaused) {
+                        shownAtMs = System.currentTimeMillis();
+                    }
                     refreshOnUiThread();
                     return;
                 }
@@ -5234,7 +5300,7 @@ public class CarrotBridgeMain {
                         rootOverlayView = candidateRoot;
                         dash = built;
                         isVisible = true;
-                        shownAtMs = System.currentTimeMillis();
+                        resetAutoCloseState(System.currentTimeMillis());
                         System.out.println("[CarrotBridge] StatusDashboardOverlay displayed full-screen (windowType=" + wtype + ")");
                         refreshOnUiThread();
                         break;
@@ -5259,6 +5325,7 @@ public class CarrotBridgeMain {
             rootOverlayView = null;
             dash = null;
             isVisible = false;
+            resetAutoCloseState(0L);
             try {
                 removeCallbacksFromUi(REFRESH_TASK);
                 if (oldRoot != null && windowManager != null) {
@@ -5289,9 +5356,9 @@ public class CarrotBridgeMain {
         private static void refreshOnUiThread() {
             final Dash d = dash;
             if (!isVisible || rootOverlayView == null || d == null) return;
+            removeCallbacksFromUi(REFRESH_TASK);
             long now = System.currentTimeMillis();
-            long elapsedSec = (now - shownAtMs) / 1000L;
-            if (elapsedSec >= 60L) {
+            if (shouldAutoClose(shownAtMs, autoClosePaused, now)) {
                 hideOnUiThread();
                 return;
             }
@@ -5337,8 +5404,21 @@ public class CarrotBridgeMain {
                 setTextIfChanged(d.modeChipText, ip.isEmpty() ? radioName : (radioName + " · " + ip));
 
                 setTextIfChanged(d.sysText, updateSystemResourceBadge(now));
-                long remainClose = Math.max(1L, 60L - elapsedSec);
-                setTextIfChanged(d.countdownText, remainClose + "초 후 닫힘");
+                boolean timerPaused = autoClosePaused;
+                int wantedCountdownStyle = timerPaused ? 1 : 0;
+                if (d.countdownStyleState != wantedCountdownStyle) {
+                    if (timerPaused) {
+                        u.bg(d.countdownBtn, C_PAUSE_BG, C_WARN, 1f, 11f);
+                        setIconDrawable(d.countdownIcon, "play", C_WARN, 2.2f);
+                        setTextColor(d.countdownText, C_WARN);
+                    } else {
+                        u.bg(d.countdownBtn, C_BTN, C_BORDER_STRONG, 1f, 11f);
+                        setIconDrawable(d.countdownIcon, "pause", C_MUTED, 2.2f);
+                        setTextColor(d.countdownText, C_TEXT_2);
+                    }
+                    d.countdownStyleState = wantedCountdownStyle;
+                }
+                setTextIfChanged(d.countdownText, formatCountdownText(shownAtMs, timerPaused, autoCloseRemainingMs, now));
 
                 // ---------- Card 1: route guidance ----------
                 boolean guiding = pkt.nTBTTurnType >= 0 || pkt.nGoPosDist > 0;
@@ -5918,6 +5998,10 @@ public class CarrotBridgeMain {
          * which throws SecurityException("Unable to find app for caller ...") in a standalone app_process.
          */
         private static void attachClickListener(Object view, final Runnable action) throws Exception {
+            attachClickListener(view, true, action);
+        }
+
+        private static void attachClickListener(Object view, final boolean resetTimer, final Runnable action) throws Exception {
             disableViewEffects(view, false);
             Class<?> touchListenerCls = Class.forName("android.view.View$OnTouchListener");
             Class<?> viewCls = Class.forName("android.view.View");
@@ -5943,7 +6027,9 @@ public class CarrotBridgeMain {
                                     Object motionEvent = args[1];
                                     int act = ((Integer) motionEvent.getClass().getMethod("getAction").invoke(motionEvent)).intValue() & 0xFF;
                                     if (act == 1) { // MotionEvent.ACTION_UP = 1
-                                        shownAtMs = System.currentTimeMillis();
+                                        if (resetTimer && !autoClosePaused) {
+                                            shownAtMs = System.currentTimeMillis();
+                                        }
                                         action.run();
                                     }
                                 } catch (Throwable t) {
@@ -6635,6 +6721,28 @@ public class CarrotBridgeMain {
                 || !"GPS 대기 중".equals(formatGpsChipText(stGpsUi, tGpsUi + 5000L))
                 || !"수신 대기 중".equals(formatGpsDetailText(stGpsUi, tGpsUi + 5000L))) {
             throw new AssertionError("Stale GPS waiting UI status mismatch");
+        }
+
+        long tTimer0 = 100000L;
+        if (StatusDashboardOverlay.shouldAutoClose(tTimer0, false, tTimer0)
+                || !"60초 후 닫힘".equals(StatusDashboardOverlay.formatCountdownText(tTimer0, false, StatusDashboardOverlay.AUTO_CLOSE_DURATION_MS, tTimer0))
+                || !"42초 후 닫힘".equals(StatusDashboardOverlay.formatCountdownText(tTimer0, false, StatusDashboardOverlay.AUTO_CLOSE_DURATION_MS, tTimer0 + 18000L))) {
+            throw new AssertionError("Auto-close countdown normal behavior mismatch");
+        }
+        if (StatusDashboardOverlay.shouldAutoClose(tTimer0, true, tTimer0 + 300000L)
+                || !"42초 · 일시정지".equals(StatusDashboardOverlay.formatCountdownText(tTimer0, true, 42000L, tTimer0 + 300000L))) {
+            throw new AssertionError("Auto-close countdown pause behavior mismatch");
+        }
+        long shownResume = (tTimer0 + 300000L) - (StatusDashboardOverlay.AUTO_CLOSE_DURATION_MS - 42000L);
+        if (!"42초 후 닫힘".equals(StatusDashboardOverlay.formatCountdownText(shownResume, false, 42000L, tTimer0 + 300000L))
+                || !"32초 후 닫힘".equals(StatusDashboardOverlay.formatCountdownText(shownResume, false, 42000L, tTimer0 + 310000L))
+                || !StatusDashboardOverlay.shouldAutoClose(shownResume, false, tTimer0 + 342000L)) {
+            throw new AssertionError("Auto-close countdown resume behavior mismatch");
+        }
+        long tReopen = tTimer0 + 400000L;
+        if (!"60초 후 닫힘".equals(StatusDashboardOverlay.formatCountdownText(tReopen, false, StatusDashboardOverlay.AUTO_CLOSE_DURATION_MS, tReopen))
+                || !StatusDashboardOverlay.shouldAutoClose(tReopen, false, tReopen + 60000L)) {
+            throw new AssertionError("Auto-close countdown reopen reset mismatch");
         }
 
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());
