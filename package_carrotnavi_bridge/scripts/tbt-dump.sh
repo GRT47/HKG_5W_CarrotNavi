@@ -14,6 +14,7 @@ am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,
 # 1. Capture live snapshots to local dump dir
 dumpsys com.hkmc.micom.cluster > "$LOCAL_DUMP_DIR/dumpsys_cluster_latest.txt" 2>&1
 dumpsys activity broadcasts 2>/dev/null | grep -E -A 6 "DestinationInfo|Route_Guide_Status|GuidStatus" > "$LOCAL_DUMP_DIR/dumpsys_navi_broadcasts.txt" 2>&1
+dumpsys location > "$LOCAL_DUMP_DIR/dumpsys_location.txt" 2>&1
 logcat -d -v time ClusterService:D NavigationCluster:D Java_Layer:I BrdCast:D CarrotBridge:I *:S > "$LOCAL_DUMP_DIR/logcat_navi_recent.txt" 2>&1
 getprop > "$LOCAL_DUMP_DIR/getprop.txt" 2>&1
 ip addr > "$LOCAL_DUMP_DIR/ip_addr.txt" 2>&1

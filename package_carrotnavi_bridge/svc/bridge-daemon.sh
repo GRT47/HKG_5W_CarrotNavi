@@ -175,7 +175,9 @@ start_bridge_java() {
 check_bridge_java_watchdog() {
     if [ -z "$BRIDGE_PID" ] || ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
         elapsed_loops=$((LOOP_COUNT - ${BRIDGE_START_LOOP:-0}))
-        if [ "$elapsed_loops" -ge 0 ] && [ "$elapsed_loops" -le 3 ] && [ -f "$INSTALL_DIR/bin/carrotbridge.jar.bak" ]; then
+        if [ -f "/data/local/tmp/carrotbridge_ota_restart" ]; then
+            rm -f "/data/local/tmp/carrotbridge_ota_restart" 2>/dev/null
+        elif [ "$elapsed_loops" -ge 0 ] && [ "$elapsed_loops" -le 3 ] && [ -f "$INSTALL_DIR/bin/carrotbridge.jar.bak" ]; then
             log_info "Daemon exited within ${elapsed_loops} loops! Rolling back carrotbridge.jar.bak -> carrotbridge.jar"
             cp "$INSTALL_DIR/bin/carrotbridge.jar.bak" "$INSTALL_DIR/bin/carrotbridge.jar" 2>/dev/null
             rm -f "$INSTALL_DIR/bin/carrotbridge.jar.bak" 2>/dev/null

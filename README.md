@@ -16,8 +16,9 @@
      - `Navigation$DisplayType`(47종) + 회전 각도(`Direction` `0~360°`) + `SCC_HU_Navi_P`(`nextTurnType1/2`)를 CarrotPilot `nTBTTurnType` / `nTBTTurnTypeNext` 코드로 매핑
      - `com.mnsoft.navi`의 UTF-16LE/BE 바이트 스왑(`CrossroadName`, `DestinationName`) 자동 복원 디코더 탑재 (`szTBTMainText`, `szGoalName`)
      - 목적지 잔여 거리(`nGoPosDist`), 잔여 시간(`nGoPosTime`), 차선 수 기반 도로 폭(`nTBTNextRoadWidth`), GPS(`vpPosPointLat`, `vpPosPointLon`, `nPosAngle`, `nPosSpeed`) 및 목적지 좌표(`goalPosX`, `goalPosY`, `szGoalName`) 전송
-   - **Mapbox 경로 폴리라인 연동 (무인증 OSRM → `TCP 7709`, v1.2.9)**:
-     - `com.mnsoft.navi.action.DestinationInfo` / `Route_Guide_Status` (스티키 브로드캐스트 + `BrdCast` 로그)에서 목적지·경유지 좌표(`LON`/`LAT`, `waypoint1/2`, `Passed.waypoint1/2`, `PoiName`) 추출 및 `goalPosX`/`goalPosY` 전송
+   - **Mapbox 경로 폴리라인 연동 (무인증 OSRM → `TCP 7709`, v1.3.0)**:
+     - `com.mnsoft.navi.action.DestinationInfo` / `Route_Guide_Status` (스티키 브로드캐스트 + `BrdCast` 로그, `com.mnsoft.navi.action.extra.*` 키 지원)에서 목적지·경유지 좌표(`LON`/`LAT`, `waypoint1/2`, `Passed.waypoint1/2`, `PoiName`/`Address`) 추출 및 `ROUTE_GUIDE_STATE` 활성(`> 0`) 기반 `goalPosX`/`goalPosY` 전송
+     - Android `LocationManager` / `ILocationManager` 실시간 차량 GPS(`gps`/`passive`/`network`) 주기 폴링으로 `vpPosPointLat`/`vpPosPointLon` 및 OSRM 출발 좌표 확보
      - Mapbox 토큰 없이 공용 OSRM 서버(`router.project-osrm.org`, 백업 `routing.openstreetmap.de`)로 경로 조회(공용 UDP DNS `8.8.8.8`/`1.1.1.1`) 후 Google Polyline5 디코딩·최대 4096포인트 제한을 거쳐 CarrotPilot `TCP 7709`(`!I` + `lon/lat float32`)로 푸시 (경로 이탈·재탐색 자동 재조회, 안내 종료/전송 OFF 시 초기화)
    - **CarrotPilot 자동 탐색**:
      - `UDP 7705` 브로드캐스트 수신 + `wlan0` ARP 테이블(`/proc/net/arp`) 스캔 + 서브넷 브로드캐스트(`192.168.0.255:7706`) 병행

@@ -68,7 +68,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.9";
+    public static final String BRIDGE_VERSION = "1.3.0";
     public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
@@ -180,7 +180,7 @@ public class CarrotBridgeMain {
         public String posRoadName = "";
 
         // OEM Destination & Waypoints (from com.mnsoft.navi.action.DestinationInfo & Route_Guide_Status)
-        public int routeGuideState = -1; // -1=unknown, 0=none, 1=active guidance, 3=route selection
+        public int routeGuideState = -1; // -1=unknown, 0=none, >0=active guidance (e.g. 1 or 3 on Gen5W)
         public double destLat = 0.0;
         public double destLon = 0.0;
         public String destPoiName = "";
@@ -689,20 +689,25 @@ public class CarrotBridgeMain {
             }
             // 13. BrdCast: com.hkmc.telematics.gis.action.NAVI_GPS_CHANGED
             else if (line.contains("NAVI_GPS_CHANGED")) {
-                double lat = extractDoubleAfter(line, "LAT=");
-                double lon = extractDoubleAfter(line, "LON=");
-                double hdg = extractDoubleAfter(line, "HEADING=");
+                Map<String, Object> gpsExtras = parseBrdCastBundleMap(line);
+                Object latObj = getGpsExtra(gpsExtras, "LAT");
+                Object lonObj = getGpsExtra(gpsExtras, "LON");
+                double lat = latObj != null ? parseExtraDouble(latObj) : extractDoubleAfter(line, "LAT=");
+                double lon = lonObj != null ? parseExtraDouble(lonObj) : extractDoubleAfter(line, "LON=");
+                Object hdgObj = getGpsExtra(gpsExtras, "HEADING");
+                double hdg = hdgObj != null ? parseExtraDouble(hdgObj) : extractDoubleAfter(line, "HEADING=");
                 if (lat > 30.0 && lat < 45.0 && lon > 120.0 && lon < 135.0) {
                     st.lat = lat;
                     st.lon = lon;
                     st.lastGpsFixMs = nowMs;
-                } else if (line.contains("LAT=")) {
+                } else if (latObj != null || line.contains("LAT=")) {
                     st.lastGpsFixMs = 0L;
                 }
-                if (hdg >= 0.0 && hdg <= 360.0) {
+                if (hdg >= 0.0 && hdg <= 360.0 && (hdgObj != null || line.contains("HEADING="))) {
                     st.headingDeg = normalizeHeadingDeg(hdg);
                 }
-                String admin = extractBundleStr(line, "ADMINNAME=");
+                Object adminObj = getGpsExtra(gpsExtras, "ADMINNAME");
+                String admin = adminObj != null ? adminObj.toString().trim() : extractBundleStr(line, "ADMINNAME=");
                 if (!admin.isEmpty()) {
                     st.posRoadName = admin;
                 }
@@ -788,24 +793,47 @@ public class CarrotBridgeMain {
         }
     }
 
+    private static final String MNSOFT_EXTRA_PREFIX = "com.mnsoft.navi.action.extra.";
+    private static final String HKMC_GIS_EXTRA_PREFIX = "com.hkmc.telematics.gis.extra.";
+
+    private static Object getPrefixedExtra(Map<String, Object> extras, String prefix, String shortKey) {
+        if (extras == null || shortKey == null) {
+            return null;
+        }
+        Object v = extras.get(prefix + shortKey);
+        return v != null ? v : extras.get(shortKey);
+    }
+
+    private static Object getNaviExtra(Map<String, Object> extras, String shortKey) {
+        return getPrefixedExtra(extras, MNSOFT_EXTRA_PREFIX, shortKey);
+    }
+
+    private static Object getGpsExtra(Map<String, Object> extras, String shortKey) {
+        return getPrefixedExtra(extras, HKMC_GIS_EXTRA_PREFIX, shortKey);
+    }
+
     public static void applyDestinationExtrasMap(NavState st, Map<String, Object> extras, File traceFile) {
         if (st == null || extras == null || extras.isEmpty()) {
             return;
         }
-        double lat = firstValidNaviCoord(parseExtraDouble(extras.get("LAT")), parseExtraDouble(extras.get("LAT.Display")));
-        double lon = firstValidNaviCoord(parseExtraDouble(extras.get("LON")), parseExtraDouble(extras.get("LON.Display")));
-        double wp1Lat = firstValidNaviCoord(parseExtraDouble(extras.get("LAT.waypoint1")), parseExtraDouble(extras.get("LAT.waypoint1.Display")));
-        double wp1Lon = firstValidNaviCoord(parseExtraDouble(extras.get("LON.waypoint1")), parseExtraDouble(extras.get("LON.waypoint1.Display")));
-        double wp2Lat = firstValidNaviCoord(parseExtraDouble(extras.get("LAT.waypoint2")), parseExtraDouble(extras.get("LAT.waypoint2.Display")));
-        double wp2Lon = firstValidNaviCoord(parseExtraDouble(extras.get("LON.waypoint2")), parseExtraDouble(extras.get("LON.waypoint2.Display")));
+        double lat = firstValidNaviCoord(parseExtraDouble(getNaviExtra(extras, "LAT")), parseExtraDouble(getNaviExtra(extras, "LAT.Display")));
+        double lon = firstValidNaviCoord(parseExtraDouble(getNaviExtra(extras, "LON")), parseExtraDouble(getNaviExtra(extras, "LON.Display")));
+        double wp1Lat = firstValidNaviCoord(parseExtraDouble(getNaviExtra(extras, "LAT.waypoint1")), parseExtraDouble(getNaviExtra(extras, "LAT.waypoint1.Display")));
+        double wp1Lon = firstValidNaviCoord(parseExtraDouble(getNaviExtra(extras, "LON.waypoint1")), parseExtraDouble(getNaviExtra(extras, "LON.waypoint1.Display")));
+        double wp2Lat = firstValidNaviCoord(parseExtraDouble(getNaviExtra(extras, "LAT.waypoint2")), parseExtraDouble(getNaviExtra(extras, "LAT.waypoint2.Display")));
+        double wp2Lon = firstValidNaviCoord(parseExtraDouble(getNaviExtra(extras, "LON.waypoint2")), parseExtraDouble(getNaviExtra(extras, "LON.waypoint2.Display")));
 
         boolean wp1Valid = Math.abs(wp1Lat) > 0.1 && Math.abs(wp1Lat) <= 90.0 && Math.abs(wp1Lon) > 0.1 && Math.abs(wp1Lon) <= 180.0;
         boolean wp2Valid = Math.abs(wp2Lat) > 0.1 && Math.abs(wp2Lat) <= 90.0 && Math.abs(wp2Lon) > 0.1 && Math.abs(wp2Lon) <= 180.0;
 
-        Object poiObj = extras.get("PoiName");
+        Object poiObj = getNaviExtra(extras, "PoiName");
         String poi = poiObj != null ? poiObj.toString().trim() : "";
-        boolean wp1Passed = parseExtraBool(extras.get("Passed.waypoint1"));
-        boolean wp2Passed = parseExtraBool(extras.get("Passed.waypoint2"));
+        if (poi.isEmpty()) {
+            Object addrObj = getNaviExtra(extras, "Address");
+            poi = addrObj != null ? addrObj.toString().trim() : "";
+        }
+        boolean wp1Passed = parseExtraBool(getNaviExtra(extras, "Passed.waypoint1"));
+        boolean wp2Passed = parseExtraBool(getNaviExtra(extras, "Passed.waypoint2"));
 
         boolean destValid = Math.abs(lat) > 0.1 && Math.abs(lat) <= 90.0 && Math.abs(lon) > 0.1 && Math.abs(lon) <= 180.0;
         if (!destValid) {
@@ -1013,8 +1041,166 @@ public class CarrotBridgeMain {
                 }
             }
             return map;
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            if (!(t instanceof ClassNotFoundException)) {
+                long now = System.currentTimeMillis();
+                if (now - lastStickyErrLogMs > 60000L) {
+                    lastStickyErrLogMs = now;
+                    Throwable cause = t.getCause() != null ? t.getCause() : t;
+                    System.out.println("[CarrotBridge] Sticky read warning (" + action + "): " + cause);
+                }
+            }
             return null;
+        }
+    }
+
+    private static volatile long lastStickyErrLogMs = 0L;
+
+    public static boolean applyLocationValues(
+            NavState st,
+            double lat,
+            double lon,
+            float bearingDeg,
+            float gnssHeadingDeg,
+            float speedMps,
+            long locElapsedNs,
+            long sysElapsedNs,
+            String provider,
+            long nowMs,
+            File traceFile) {
+        if (st == null || Double.isNaN(lat) || Double.isInfinite(lat)
+                || Double.isNaN(lon) || Double.isInfinite(lon)) {
+            return false;
+        }
+        if (Math.abs(lat) <= 0.1 || Math.abs(lat) > 90.0
+                || Math.abs(lon) <= 0.1 || Math.abs(lon) > 180.0) {
+            return false;
+        }
+        if (locElapsedNs > 0L && sysElapsedNs >= locElapsedNs) {
+            long ageMs = (sysElapsedNs - locElapsedNs) / 1000000L;
+            if (ageMs > 20000L) {
+                return false;
+            }
+        }
+        synchronized (st) {
+            boolean firstOrRecovered = (st.lat == 0.0 || st.lon == 0.0
+                    || (st.lastGpsFixMs > 0L && (nowMs - st.lastGpsFixMs) > 10000L));
+            st.lat = lat;
+            st.lon = lon;
+            st.lastGpsFixMs = nowMs;
+
+            float hdg = bearingDeg > 0.0f ? bearingDeg : gnssHeadingDeg;
+            if (hdg > 0.0f && hdg <= 360.0f) {
+                st.headingDeg = normalizeHeadingDeg(hdg);
+            }
+            if ((nowMs - discoveredCarrotTimeMs) > 5000L
+                    && speedMps >= 0.0f && !Float.isNaN(speedMps)) {
+                st.posSpeedKph = speedMps * 3.6;
+            }
+            if (firstOrRecovered && traceFile != null) {
+                appendTraceLine(traceFile, String.format(Locale.US,
+                        "GPS_LOCK: provider=%s lat=%.6f lon=%.6f hdg=%.1f",
+                        provider != null ? provider : "unknown", lat, lon, st.headingDeg));
+            }
+        }
+        return true;
+    }
+
+    private static boolean extractAndApplyLocationObj(
+            NavState st, Object loc, long sysElapsedNs, String provider, long nowMs, File traceFile) {
+        if (loc == null) {
+            return false;
+        }
+        try {
+            Class<?> lc = loc.getClass();
+            double lat = ((Number) lc.getMethod("getLatitude").invoke(loc)).doubleValue();
+            double lon = ((Number) lc.getMethod("getLongitude").invoke(loc)).doubleValue();
+            float bearing = ((Number) lc.getMethod("getBearing").invoke(loc)).floatValue();
+            float gnssHdg = 0.0f;
+            try {
+                gnssHdg = ((Number) lc.getMethod("getGnssHeading").invoke(loc)).floatValue();
+            } catch (Throwable ignored) {
+            }
+            float speed = -1.0f;
+            try {
+                boolean hasSpd = ((Boolean) lc.getMethod("hasSpeed").invoke(loc)).booleanValue();
+                if (hasSpd) {
+                    speed = ((Number) lc.getMethod("getSpeed").invoke(loc)).floatValue();
+                }
+            } catch (Throwable ignored) {
+            }
+            long locElapsedNs = 0L;
+            try {
+                locElapsedNs = ((Number) lc.getMethod("getElapsedRealtimeNanos").invoke(loc)).longValue();
+            } catch (Throwable ignored) {
+            }
+            return applyLocationValues(st, lat, lon, bearing, gnssHdg, speed, locElapsedNs, sysElapsedNs, provider, nowMs, traceFile);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void pollAndroidLocationManager(NavState st, File traceFile) {
+        long nowMs = System.currentTimeMillis();
+        long sysElapsedNs = 0L;
+        try {
+            Class<?> clkCls = Class.forName("android.os.SystemClock");
+            sysElapsedNs = ((Number) clkCls.getMethod("elapsedRealtimeNanos").invoke(null)).longValue();
+        } catch (Throwable ignored) {
+        }
+
+        String[] providers = new String[]{"gps", "passive", "network"};
+        Object sysCtx = StatusDashboardOverlay.getSysContext();
+        Object lm = null;
+        Method lmGetLastKnown = null;
+        if (sysCtx != null) {
+            try {
+                lm = sysCtx.getClass().getMethod("getSystemService", String.class).invoke(sysCtx, "location");
+                if (lm != null) {
+                    lmGetLastKnown = lm.getClass().getMethod("getLastKnownLocation", String.class);
+                }
+            } catch (Throwable ignored) {
+                lm = null;
+            }
+        }
+
+        Object ilm = null;
+        Method ilmGetLastLoc = null;
+        Class<?> lrCls = null;
+        Method lrCreate = null;
+
+        for (String provider : providers) {
+            Object loc = null;
+            if (lm != null && lmGetLastKnown != null) {
+                try {
+                    loc = lmGetLastKnown.invoke(lm, provider);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (loc == null) {
+                try {
+                    if (ilm == null) {
+                        Class<?> smCls = Class.forName("android.os.ServiceManager");
+                        Object binder = smCls.getMethod("getService", String.class).invoke(null, "location");
+                        if (binder != null) {
+                            Class<?> stubCls = Class.forName("android.location.ILocationManager$Stub");
+                            ilm = stubCls.getMethod("asInterface", Class.forName("android.os.IBinder")).invoke(null, binder);
+                            lrCls = Class.forName("android.location.LocationRequest");
+                            lrCreate = lrCls.getMethod("createFromDeprecatedProvider",
+                                    String.class, long.class, float.class, boolean.class);
+                            ilmGetLastLoc = ilm.getClass().getMethod("getLastLocation", lrCls, String.class);
+                        }
+                    }
+                    if (ilm != null && lrCreate != null && ilmGetLastLoc != null) {
+                        Object req = lrCreate.invoke(null, provider, Long.valueOf(0L), Float.valueOf(0.0f), Boolean.TRUE);
+                        loc = ilmGetLastLoc.invoke(ilm, req, "android");
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            if (extractAndApplyLocationObj(st, loc, sysElapsedNs, provider, nowMs, traceFile)) {
+                return;
+            }
         }
     }
 
@@ -1697,47 +1883,154 @@ public class CarrotBridgeMain {
     }
 
     private static void applyDisplayTypeStringLocked(NavState st, String raw) {
-        if (raw == null || raw.isEmpty()) return;
-        st.displayTypeName = raw;
-        String u = raw.toUpperCase(Locale.US);
-        // Check if raw is an integer code
-        int numeric = parseIntSafe(u, -1);
-        if (numeric >= 0 && numeric <= 46) {
-            st.displayTypeCode = numeric;
+        if (raw == null) return;
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) return;
+        String u = trimmed.toUpperCase(Locale.US);
+
+        if (u.contains("UNKNOWN DISPLAY TYPE")) {
+            int pStart = u.indexOf("0X");
+            int hexCode = -1;
+            if (pStart >= 0) {
+                int pEnd = pStart + 2;
+                while (pEnd < u.length() && Character.digit(u.charAt(pEnd), 16) >= 0) {
+                    pEnd++;
+                }
+                if (pEnd > pStart + 2) {
+                    try {
+                        hexCode = Integer.parseInt(u.substring(pStart + 2, pEnd), 16);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+            if (hexCode == 0x72) {
+                st.displayTypeCode = 2;
+                st.displayTypeName = "목적지 방향";
+            } else {
+                st.displayTypeCode = 11;
+                st.displayTypeName = "직진 주행";
+            }
             return;
         }
-        if (numeric == 0x43 || numeric > 46) {
-            // In Gen5W com.mnsoft.navi [IL TBT Info - 0x4E], DisplayType = 0x43 (67) is emitted during
+
+        // Check if raw is an integer code or hex (e.g. "13" or "0x72")
+        int numeric = -1;
+        if (u.startsWith("0X")) {
+            try {
+                numeric = Integer.parseInt(u.substring(2), 16);
+            } catch (Exception ignored) {
+            }
+        } else {
+            numeric = parseIntSafe(u, -1);
+        }
+        if (numeric == 0x72) {
+            st.displayTypeCode = 2;
+            st.displayTypeName = "목적지 방향";
+            return;
+        }
+        if (numeric >= 0 && numeric <= 46) {
+            st.displayTypeCode = numeric;
+            st.displayTypeName = "";
+            return;
+        }
+        if (numeric > 46) {
+            // In Gen5W com.mnsoft.navi [IL TBT Info - 0x4E], DisplayType = 0x42/0x43 is emitted during
             // straight road-following guidance (>300m before the next turn). Map to 11 (FOLLOW STREET / 직진).
             st.displayTypeCode = 11;
             st.displayTypeName = "직진 주행";
             return;
         }
-        if (u.contains("NO ROUTE GUIDANCE") || u.contains("COMPASS")) st.displayTypeCode = 8;
-        else if (u.contains("RECALC ROUTE")) st.displayTypeCode = 10;
-        else if (u.contains("CALC ROUTE")) st.displayTypeCode = 9;
-        else if (u.contains("ARRIVED")) st.displayTypeCode = 3;
-        else if (u.contains("NEAR DESTINATION")) st.displayTypeCode = 4;
-        else if (u.contains("FOLLOW STREET")) st.displayTypeCode = 11;
-        else if (u.contains("PREPARE U TURN") || u.equals("U TURN") || u.contains("U-TURN")) st.displayTypeCode = 31;
-        else if (u.contains("EXIT RIGHT RAMP UP")) st.displayTypeCode = 39;
-        else if (u.contains("EXIT RIGHT RAMP DOWN")) st.displayTypeCode = 40;
-        else if (u.contains("EXIT LEFT RAMP UP")) st.displayTypeCode = 41;
-        else if (u.contains("EXIT LEFT RAMP DOWN")) st.displayTypeCode = 42;
-        else if (u.contains("EXIT RIGHT")) st.displayTypeCode = 17;
-        else if (u.contains("EXIT LEFT")) st.displayTypeCode = 18;
-        else if (u.contains("SERVICE ROAD RIGHT")) st.displayTypeCode = 23;
-        else if (u.contains("SERVICE ROAD LEFT")) st.displayTypeCode = 24;
-        else if (u.contains("OVERPASS RIGHT")) st.displayTypeCode = 43;
-        else if (u.contains("OVERPASS LEFT")) st.displayTypeCode = 44;
-        else if (u.contains("UNDERPASS RIGHT")) st.displayTypeCode = 45;
-        else if (u.contains("UNDERPASS LEFT")) st.displayTypeCode = 46;
-        else if (u.contains("ROUNDABOUT") || u.contains("ROUNABOUT")) st.displayTypeCode = 27;
-        else if (u.contains("FORK")) st.displayTypeCode = 25;
-        else if (u.contains("CHANGE LANE")) st.displayTypeCode = 12;
-        else if (u.contains("TURN")) st.displayTypeCode = 13;
-        else if (u.contains("NO SYMBOL")) st.displayTypeCode = 0;
-        else if (u.contains("NO INFO")) st.displayTypeCode = 1;
+
+        if (u.contains("NO ROUTE GUIDANCE") || u.contains("COMPASS")) {
+            st.displayTypeCode = 8;
+            st.displayTypeName = "";
+        } else if (u.contains("DIRECTION TO DESTINATION")) {
+            st.displayTypeCode = 2;
+            st.displayTypeName = "목적지 방향";
+        } else if (u.contains("RECALC ROUTE")) {
+            st.displayTypeCode = 10;
+            st.displayTypeName = "경로 재탐색";
+        } else if (u.contains("CALC ROUTE")) {
+            st.displayTypeCode = 9;
+            st.displayTypeName = "경로 탐색 중";
+        } else if (u.contains("OFF ROAD")) {
+            st.displayTypeCode = 6;
+            st.displayTypeName = "";
+        } else if (u.contains("OFF MAP")) {
+            st.displayTypeCode = 7;
+            st.displayTypeName = "";
+        } else if (u.contains("ARRIVED")) {
+            st.displayTypeCode = 3;
+            st.displayTypeName = "목적지 도착";
+        } else if (u.contains("NEAR DESTINATION")) {
+            st.displayTypeCode = 4;
+            st.displayTypeName = "목적지 부근";
+        } else if (u.contains("FOLLOW STREET")) {
+            st.displayTypeCode = 11;
+            st.displayTypeName = "직진 주행";
+        } else if (u.contains("PREPARE U TURN") || u.equals("U TURN") || u.contains("U-TURN")) {
+            st.displayTypeCode = 31;
+            st.displayTypeName = "유턴";
+        } else if (u.contains("EXIT RIGHT RAMP UP")) {
+            st.displayTypeCode = 39;
+            st.displayTypeName = "우측 출구";
+        } else if (u.contains("EXIT RIGHT RAMP DOWN")) {
+            st.displayTypeCode = 40;
+            st.displayTypeName = "우측 출구";
+        } else if (u.contains("EXIT LEFT RAMP UP")) {
+            st.displayTypeCode = 41;
+            st.displayTypeName = "좌측 출구";
+        } else if (u.contains("EXIT LEFT RAMP DOWN")) {
+            st.displayTypeCode = 42;
+            st.displayTypeName = "좌측 출구";
+        } else if (u.contains("EXIT RIGHT")) {
+            st.displayTypeCode = 17;
+            st.displayTypeName = "우측 출구";
+        } else if (u.contains("EXIT LEFT")) {
+            st.displayTypeCode = 18;
+            st.displayTypeName = "좌측 출구";
+        } else if (u.contains("SERVICE ROAD RIGHT")) {
+            st.displayTypeCode = 23;
+            st.displayTypeName = "우측 옆길";
+        } else if (u.contains("SERVICE ROAD LEFT")) {
+            st.displayTypeCode = 24;
+            st.displayTypeName = "좌측 옆길";
+        } else if (u.contains("OVERPASS RIGHT")) {
+            st.displayTypeCode = 43;
+            st.displayTypeName = "우측 고가도로";
+        } else if (u.contains("OVERPASS LEFT")) {
+            st.displayTypeCode = 44;
+            st.displayTypeName = "좌측 고가도로";
+        } else if (u.contains("UNDERPASS RIGHT")) {
+            st.displayTypeCode = 45;
+            st.displayTypeName = "우측 지하차도";
+        } else if (u.contains("UNDERPASS LEFT")) {
+            st.displayTypeCode = 46;
+            st.displayTypeName = "좌측 지하차도";
+        } else if (u.contains("ROUNDABOUT") || u.contains("ROUNABOUT")) {
+            st.displayTypeCode = 27;
+            st.displayTypeName = "회전교차로";
+        } else if (u.contains("SQUARE")) {
+            st.displayTypeCode = 29;
+            st.displayTypeName = "광장 교차로";
+        } else if (u.contains("FORK")) {
+            st.displayTypeCode = 25;
+            st.displayTypeName = "분기점";
+        } else if (u.contains("CHANGE LANE")) {
+            st.displayTypeCode = 12;
+            st.displayTypeName = "차선 변경";
+        } else if (u.contains("TURN")) {
+            st.displayTypeCode = 13;
+            st.displayTypeName = "";
+        } else if (u.contains("NO SYMBOL")) {
+            st.displayTypeCode = 0;
+            st.displayTypeName = "";
+        } else if (u.contains("NO INFO")) {
+            st.displayTypeCode = 1;
+            st.displayTypeName = "";
+        } else {
+            st.displayTypeName = trimmed;
+        }
     }
 
     /**
@@ -2163,6 +2456,10 @@ public class CarrotBridgeMain {
                         if (fromUi) {
                             StatusDashboardOverlay.notifyUpdateResult(10, nowStr);
                         }
+                        try {
+                            writeBytesAtomic(new File("/data/local/tmp/carrotbridge_ota_restart"), "1".getBytes(UTF8));
+                        } catch (Exception ignored) {
+                        }
                         try { Thread.sleep(1200L); } catch (InterruptedException ignored) {}
                         System.exit(0); // Watchdog in bridge-daemon.sh immediately restarts updated JAR
                     } else if (fromUi) {
@@ -2428,6 +2725,7 @@ public class CarrotBridgeMain {
         WlanNetInfo wlanInfo = readWlanNetInfo();
         Set<String> arpPeers = new LinkedHashSet<String>();
         long lastArpScanMs = 0L;
+        long lastLocationPollMs = 0L;
         long lastStatusWriteMs = 0L;
 
         while (true) {
@@ -2439,6 +2737,11 @@ public class CarrotBridgeMain {
             if (checkUpdateTriggerFile.exists()) {
                 checkUpdateTriggerFile.delete();
                 triggerBackgroundAutoUpdate(installDir, 0L, false);
+            }
+
+            if (now - lastLocationPollMs >= 500L) {
+                lastLocationPollMs = now;
+                pollAndroidLocationManager(navState, traceFile);
             }
 
             if (now - lastArpScanMs > 2500L) {
@@ -3232,12 +3535,13 @@ public class CarrotBridgeMain {
                     List<double[]> activeWps;
                     boolean naviRerouting;
                     synchronized (navState) {
-                        guiding = navState.isGuidanceActive() && navState.routeGuideState != 0 && navState.routeGuideState != 3;
+                        guiding = navState.isGuidanceActive() && navState.routeGuideState != 0;
                         curLat = navState.lat;
                         curLon = navState.lon;
                         gpsValid = Math.abs(curLat) > 0.1 && Math.abs(curLat) <= 90.0
                                 && Math.abs(curLon) > 0.1 && Math.abs(curLon) <= 180.0
-                                && navState.lastGpsFixMs > 0L;
+                                && navState.lastGpsFixMs > 0L
+                                && (now - navState.lastGpsFixMs) <= 30000L;
                         destLat = navState.destLat;
                         destLon = navState.destLon;
                         activeWps = navState.getActiveWaypointsLocked();
@@ -3763,6 +4067,10 @@ public class CarrotBridgeMain {
             return sysContext != null && windowManager != null;
         }
 
+        static Object getSysContext() {
+            return sysContext;
+        }
+
         public static void toggle() {
             postToUi(new Runnable() {
                 @Override
@@ -4137,11 +4445,13 @@ public class CarrotBridgeMain {
             return s.substring(i).trim();
         }
 
-        /** HKMC raw DisplayType names such as "0xd" are not useful as a crossroad label. */
+        /** HKMC raw DisplayType names such as "0xd" or "Unknown display type(0x72)" are not useful as a crossroad label. */
         static String cleanGuideText(String s) {
             if (s == null) return "";
             String t = s.trim();
-            if (t.matches("(?i)0x[0-9a-f]+")) return "";
+            if (t.matches("(?i)0x[0-9a-f]+") || t.toUpperCase(Locale.US).startsWith("UNKNOWN DISPLAY TYPE")) {
+                return "";
+            }
             return t;
         }
 
@@ -5878,6 +6188,64 @@ public class CarrotBridgeMain {
                 || !Arrays.equals(routePayload, receivedTcp.get(0))
                 || !Arrays.equals(clearPayload, receivedTcp.get(1))) {
             throw new AssertionError("Loopback TCP 7709 route transfer mismatch");
+        }
+
+        // 7. Test v1.3.0 real-vehicle extra prefix, ROUTE_GUIDE_STATE=3, LocationManager GPS, & DisplayType cleanup
+        NavState stRealDest = new NavState();
+        stRealDest.remainDistM = 7200;
+        stRealDest.remainTimeSec = 480;
+        parseLogcatLine("BrdCast: com.mnsoft.navi.action.Route_Guide_Status Bundle[{ROUTE_GUIDE_STATE=3}]", stRealDest, null);
+        parseLogcatLine(
+                "BrdCast: com.mnsoft.navi.action.DestinationInfo Bundle[{"
+                        + "com.mnsoft.navi.action.extra.LON=127.48952, "
+                        + "com.mnsoft.navi.action.extra.LAT=36.63581, "
+                        + "com.mnsoft.navi.action.extra.Address=충북 청주시 서원구 2순환로1814번길 67, "
+                        + "com.mnsoft.navi.action.extra.LON.waypoint1=127.47100, "
+                        + "com.mnsoft.navi.action.extra.LAT.waypoint1=36.62500, "
+                        + "com.mnsoft.navi.action.extra.Passed.waypoint1=false}]",
+                stRealDest, null);
+        CarrotPacket pktRealDest = buildCarrotPacket(stRealDest);
+        if (Math.abs(pktRealDest.goalPosX - 127.48952) > 1e-5
+                || Math.abs(pktRealDest.goalPosY - 36.63581) > 1e-5
+                || !"충북 청주시 서원구 2순환로1814번길 67".equals(pktRealDest.szGoalName)
+                || stRealDest.getActiveWaypointsLocked().size() != 1) {
+            throw new AssertionError("v1.3.0 prefixed DestinationInfo / ROUTE_GUIDE_STATE=3 mismatch: " + pktRealDest.toJson());
+        }
+
+        NavState stLoc = new NavState();
+        long tLocNow = System.currentTimeMillis();
+        long sysNs = 100_000_000_000L;
+        boolean okFresh = applyLocationValues(stLoc, 36.63581, 127.48952, 0.0f, 240.0f, 12.5f,
+                sysNs - 1_000_000_000L, sysNs, "gps", tLocNow, null);
+        CarrotPacket pktLoc = buildCarrotPacket(stLoc, tLocNow + 100L);
+        boolean okStale = applyLocationValues(stLoc, 37.0, 127.0, 90.0f, 0.0f, 0.0f,
+                sysNs - 25_000_000_000L, sysNs, "gps", tLocNow + 200L, null);
+        if (!okFresh || okStale
+                || Math.abs(pktLoc.vpPosPointLat - 36.63581) > 1e-5
+                || Math.abs(pktLoc.vpPosPointLon - 127.48952) > 1e-5
+                || Math.abs(pktLoc.nPosAngle - 240.0) > 1e-3
+                || Math.abs(stLoc.lat - 36.63581) > 1e-5) {
+            throw new AssertionError("v1.3.0 applyLocationValues fresh/stale mismatch: " + pktLoc.toJson());
+        }
+
+        NavState stDisp = new NavState();
+        parseDumpsysCluster("Navigation Cluster:\n  OperationStatus = 1\n  TBT Info:\n    Display Type  = Unknown display type(0x42)\n    Distance      = 400.0 METER\n", stDisp);
+        CarrotPacket p42 = buildCarrotPacket(stDisp);
+        if (p42.nTBTTurnType != 51 || !"직진 주행".equals(p42.szTBTMainText)) {
+            throw new AssertionError("Unknown display type(0x42) cleanup mismatch: " + p42.toJson());
+        }
+        parseDumpsysCluster("Navigation Cluster:\n  OperationStatus = 1\n  TBT Info:\n    Display Type  = Unknown display type(0x72)\n    Distance      = 400.0 METER\n", stDisp);
+        CarrotPacket p72 = buildCarrotPacket(stDisp);
+        if (p72.nTBTTurnType != 51 || !"목적지 방향".equals(p72.szTBTMainText)) {
+            throw new AssertionError("Unknown display type(0x72) cleanup mismatch: " + p72.toJson());
+        }
+        parseDumpsysCluster("Navigation Cluster:\n  OperationStatus = 1\n  TBT Info:\n    Display Type  = DIRECTION TO DESTINATION\n    Distance      = 400.0 METER\n", stDisp);
+        CarrotPacket pDirDest = buildCarrotPacket(stDisp);
+        if (pDirDest.nTBTTurnType != 51 || !"목적지 방향".equals(pDirDest.szTBTMainText)) {
+            throw new AssertionError("DIRECTION TO DESTINATION cleanup mismatch: " + pDirDest.toJson());
+        }
+        if (!"".equals(StatusDashboardOverlay.cleanGuideText("Unknown display type(0x72)"))) {
+            throw new AssertionError("cleanGuideText must suppress Unknown display type fallback");
         }
 
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());
