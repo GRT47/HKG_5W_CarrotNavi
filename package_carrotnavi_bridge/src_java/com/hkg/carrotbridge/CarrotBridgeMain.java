@@ -68,7 +68,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.3.2";
+    public static final String BRIDGE_VERSION = "1.3.3";
     public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
@@ -183,6 +183,12 @@ public class CarrotBridgeMain {
         public int gpsFixStatus = 0; // 0=no sat fix, 2=2D, 3=3D
         public int gpsDrStatus = 0;  // 1=dead reckoning (gyro+odo) active
         public boolean inTunnel = false;
+        public int gpsSatUsed = -1;   // -1=unknown, >=0=GPS+GLONASS satellites used in fix
+        public int gpsSatInView = -1; // -1=unknown, >=0=total satellites in view
+        public float gpsMaxSnr = 0.0f;
+        public long lastSatUpdateMs = 0L;
+        public long lastDirectLocMs = 0L;
+        public long lastDumpLocMs = 0L;
 
         // OEM Destination & Waypoints (from com.mnsoft.navi.action.DestinationInfo & Route_Guide_Status)
         public int routeGuideState = -1; // -1=unknown, 0=none, >0=active guidance (e.g. 1 or 3 on Gen5W)
@@ -1149,6 +1155,14 @@ public class CarrotBridgeMain {
         return true;
     }
 
+    private static final Pattern AndroidDurationPattern = Pattern.compile("(\\d+)(ms|[dhms])");
+    private static final Pattern DumpsysLocPattern = Pattern.compile(
+            "Location\\[([A-Za-z0-9_]+)\\s+(-?\\d+(?:\\.\\d+)?),(-?\\d+(?:\\.\\d+)?)\\b(.*)$");
+    private static final Pattern DumpsysSatPattern = Pattern.compile("\\bsatellites\\s*=\\s*(\\d+)");
+    private static final Pattern DumpsysEtPattern = Pattern.compile("\\bet=([^\\s\\]]+)");
+    private static volatile Object registeredGpsStatusBinder = null;
+    private static volatile long lastGpsStatusRegAttemptMs = 0L;
+
     /** Returns 0 = waiting/stale, 1 = DR / tunnel DR active, 2 = satellite fix (2D/3D). */
     public static int getGpsStatusState(NavState st, long nowMs) {
         if (st == null) {
@@ -1165,19 +1179,43 @@ public class CarrotBridgeMain {
         }
     }
 
+    private static boolean isSatFreshLocked(NavState st, long nowMs) {
+        return st.lastSatUpdateMs > 0L && (nowMs - st.lastSatUpdateMs) <= 10000L;
+    }
+
+    private static String formatSatBadgeLocked(NavState st, long nowMs) {
+        if (!isSatFreshLocked(st, nowMs) || st.gpsSatUsed < 0) {
+            return "";
+        }
+        if (st.gpsSatInView > 0) {
+            return st.gpsSatUsed + "/" + Math.max(st.gpsSatUsed, st.gpsSatInView) + "기";
+        }
+        return st.gpsSatUsed + "기";
+    }
+
     public static String formatGpsChipText(NavState st, long nowMs) {
         if (st == null) {
             return "GPS 대기 중";
         }
         synchronized (st) {
+            boolean satFresh = isSatFreshLocked(st, nowMs);
             int state = getGpsStatusState(st, nowMs);
             if (state == 0) {
+                if (satFresh && st.gpsSatInView > 0) {
+                    return "GPS 대기 · 0/" + st.gpsSatInView + "기";
+                }
                 return "GPS 대기 중";
             }
+            String base;
             if (state == 2) {
-                return st.gpsFixStatus == 2 ? "GPS 위성(2D)" : "GPS 위성(3D)";
+                base = st.gpsFixStatus == 2 ? "GPS 위성(2D)" : "GPS 위성(3D)";
+            } else {
+                base = st.inTunnel ? "GPS 터널 DR" : "GPS 추측(DR)";
             }
-            return st.inTunnel ? "GPS 터널 DR" : "GPS 추측(DR)";
+            if (satFresh && st.gpsSatUsed >= 0) {
+                return base + " · " + st.gpsSatUsed + "기";
+            }
+            return base;
         }
     }
 
@@ -1186,18 +1224,384 @@ public class CarrotBridgeMain {
             return "수신 대기 중";
         }
         synchronized (st) {
+            boolean satFresh = isSatFreshLocked(st, nowMs);
             int state = getGpsStatusState(st, nowMs);
             if (state == 0) {
+                if (satFresh && st.gpsSatInView > 0) {
+                    return "수신 대기 중 (관측 " + st.gpsSatInView + "기)";
+                }
                 return "수신 대기 중";
             }
+            String satBadge = formatSatBadgeLocked(st, nowMs);
             String modeLabel;
             if (state == 2) {
-                modeLabel = st.gpsFixStatus == 2 ? "위성(2D)" : "위성(3D)";
+                String kind = st.gpsFixStatus == 2 ? "2D" : "3D";
+                modeLabel = satBadge.isEmpty() ? ("위성(" + kind + ")") : ("위성(" + kind + " · " + satBadge + ")");
+            } else if (st.inTunnel) {
+                modeLabel = satBadge.isEmpty() ? "터널 DR 보정" : ("터널 DR(" + satBadge + ")");
             } else {
-                modeLabel = st.inTunnel ? "터널 DR 보정" : "추측항법(DR)";
+                modeLabel = satBadge.isEmpty() ? "추측항법(DR)" : ("추측DR(" + satBadge + ")");
             }
             return String.format(Locale.US, "%s · %.4f, %.4f · %.0f°",
                     modeLabel, st.lat, st.lon, normalizeHeadingDeg(st.headingDeg));
+        }
+    }
+
+    public static void applySvStatus(
+            NavState st, int svCount, float[] snrs, int usedInFixMask, int glonassUsedInFixMask, long nowMs) {
+        if (st == null) {
+            return;
+        }
+        int used = Integer.bitCount(usedInFixMask) + Integer.bitCount(glonassUsedInFixMask);
+        int inView = Math.max(used, Math.max(0, svCount));
+        float maxSnr = 0.0f;
+        if (snrs != null && svCount > 0) {
+            int n = Math.min(svCount, snrs.length);
+            for (int i = 0; i < n; i++) {
+                float s = snrs[i];
+                if (!Float.isNaN(s) && s > maxSnr && s < 100.0f) {
+                    maxSnr = s;
+                }
+            }
+        }
+        synchronized (st) {
+            st.gpsSatUsed = used;
+            st.gpsSatInView = inView;
+            st.gpsMaxSnr = maxSnr;
+            st.lastSatUpdateMs = nowMs;
+        }
+    }
+
+    public static boolean verifyNmeaChecksum(String sentence) {
+        if (sentence == null) {
+            return false;
+        }
+        String t = sentence.trim();
+        if (!t.startsWith("$") || t.length() < 6) {
+            return false;
+        }
+        int star = t.indexOf('*');
+        if (star < 0) {
+            return true;
+        }
+        if (star + 3 > t.length()) {
+            return false;
+        }
+        int xorVal = 0;
+        for (int i = 1; i < star; i++) {
+            xorVal ^= (t.charAt(i) & 0xFF);
+        }
+        try {
+            int expected = Integer.parseInt(t.substring(star + 1, star + 3), 16);
+            return xorVal == expected;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    public static double parseNmeaCoord(String ddmm, String hemi) {
+        if (ddmm == null || hemi == null || ddmm.isEmpty() || hemi.isEmpty()) {
+            return Double.NaN;
+        }
+        try {
+            int dot = ddmm.indexOf('.');
+            int intLen = (dot >= 0) ? dot : ddmm.length();
+            if (intLen < 3) {
+                return Double.NaN;
+            }
+            int degDigits = intLen - 2;
+            double deg = Double.parseDouble(ddmm.substring(0, degDigits));
+            double mins = Double.parseDouble(ddmm.substring(degDigits));
+            double dec = deg + (mins / 60.0);
+            char h = Character.toUpperCase(hemi.charAt(0));
+            if (h == 'S' || h == 'W') {
+                dec = -dec;
+            } else if (h != 'N' && h != 'E') {
+                return Double.NaN;
+            }
+            return dec;
+        } catch (Throwable ignored) {
+            return Double.NaN;
+        }
+    }
+
+    public static void parseNmeaSentence(NavState st, String rawNmea, long nowMs, File traceFile) {
+        if (st == null || rawNmea == null || !verifyNmeaChecksum(rawNmea)) {
+            return;
+        }
+        String t = rawNmea.trim();
+        int star = t.indexOf('*');
+        String body = (star > 1 ? t.substring(1, star) : t.substring(1));
+        String[] f = body.split(",", -1);
+        if (f.length == 0) {
+            return;
+        }
+        String type = f[0];
+        if (type.endsWith("GGA") && f.length > 7) {
+            int fixQual = parseIntSafe(f[6], -1);
+            int numSat = parseIntSafe(f[7], -1);
+            synchronized (st) {
+                if (fixQual == 6) {
+                    st.gpsDrStatus = 1;
+                } else if (fixQual == 1 || fixQual == 2) {
+                    st.gpsDrStatus = 0;
+                    if (st.gpsFixStatus == 0) {
+                        st.gpsFixStatus = 3;
+                    }
+                }
+                if (numSat >= 0 && (nowMs - st.lastSatUpdateMs) > 2500L) {
+                    st.gpsSatUsed = numSat;
+                    if (st.gpsSatInView < numSat) {
+                        st.gpsSatInView = numSat;
+                    }
+                    st.lastSatUpdateMs = nowMs;
+                }
+            }
+        } else if (type.endsWith("GSA") && f.length > 2) {
+            int mode = parseIntSafe(f[2], -1);
+            if (mode >= 1 && mode <= 3) {
+                synchronized (st) {
+                    if ((nowMs - st.lastDumpLocMs) > 2500L && (nowMs - st.lastDirectLocMs) > 2500L) {
+                        st.gpsFixStatus = (mode == 2) ? 2 : (mode == 3 ? 3 : 0);
+                    }
+                }
+            }
+        } else if (type.endsWith("RMC") && f.length > 8 && "A".equals(f[2])) {
+            boolean needRmcLoc;
+            int curFix;
+            int curDr;
+            synchronized (st) {
+                needRmcLoc = (nowMs - st.lastDirectLocMs) > 1500L && (nowMs - st.lastDumpLocMs) > 1500L;
+                curFix = st.gpsFixStatus > 0 ? st.gpsFixStatus : 3;
+                curDr = st.gpsDrStatus;
+            }
+            if (!needRmcLoc) {
+                return;
+            }
+            double lat = parseNmeaCoord(f[3], f[4]);
+            double lon = parseNmeaCoord(f[5], f[6]);
+            if (Double.isNaN(lat) || Double.isNaN(lon)) {
+                return;
+            }
+            double knots = parseLeadingDouble(f[7], -1.0);
+            float speedMps = knots >= 0.0 ? (float) (knots * 0.514444) : -1.0f;
+            float trackDeg = (float) parseLeadingDouble(f[8], 0.0);
+            if (f.length > 12 && "E".equals(f[12])) {
+                curDr = 1;
+            }
+            applyLocationValues(st, lat, lon, trackDeg, trackDeg, speedMps,
+                    0L, 0L, "nmea", nowMs, traceFile, curFix, curDr);
+        }
+    }
+
+    public static long parseAndroidDurationMs(String etText) {
+        if (etText == null || etText.isEmpty() || etText.contains("?")) {
+            return 0L;
+        }
+        Matcher m = AndroidDurationPattern.matcher(etText);
+        long totalMs = 0L;
+        boolean matched = false;
+        while (m.find()) {
+            matched = true;
+            long val = parseIntSafe(m.group(1), 0);
+            String unit = m.group(2);
+            if ("d".equals(unit)) totalMs += val * 86400000L;
+            else if ("h".equals(unit)) totalMs += val * 3600000L;
+            else if ("m".equals(unit)) totalMs += val * 60000L;
+            else if ("s".equals(unit)) totalMs += val * 1000L;
+            else if ("ms".equals(unit)) totalMs += val;
+        }
+        return matched ? totalMs : 0L;
+    }
+
+    private static int providerRank(String provider) {
+        if ("gps".equals(provider)) return 3;
+        if ("passive".equals(provider)) return 2;
+        if ("network".equals(provider)) return 1;
+        return 0;
+    }
+
+    public static boolean parseDumpsysLocation(
+            String dumpText, NavState st, long sysElapsedNs, long nowMs, File traceFile) {
+        if (dumpText == null || dumpText.isEmpty() || st == null) {
+            return false;
+        }
+        String[] lines = dumpText.split("\\r?\\n");
+        boolean inCoarse = false;
+        int bestRank = -1;
+        String bestProvider = null;
+        double bestLat = 0.0;
+        double bestLon = 0.0;
+        float bestVel = -1.0f;
+        float bestBear = 0.0f;
+        float bestGnssHdg = 0.0f;
+        long bestElapsedNs = 0L;
+        int bestFix = 3;
+        int bestDr = 0;
+        int bestSat = -1;
+
+        for (String raw : lines) {
+            String line = raw.trim();
+            if (line.contains("Coarse") || line.startsWith("fudger:") || line.startsWith("Enabled Providers")) {
+                inCoarse = true;
+                continue;
+            }
+            if (line.startsWith("Last Known Locations:")) {
+                inCoarse = false;
+                continue;
+            }
+            if (inCoarse) {
+                continue;
+            }
+            Matcher hm = DumpsysLocPattern.matcher(line);
+            if (!hm.find()) {
+                continue;
+            }
+            String provider = hm.group(1).toLowerCase(Locale.US);
+            int rank = providerRank(provider);
+            if (rank <= 0 || rank < bestRank) {
+                continue;
+            }
+            double lat;
+            double lon;
+            try {
+                lat = Double.parseDouble(hm.group(2));
+                lon = Double.parseDouble(hm.group(3));
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            if (Math.abs(lat) <= 0.1 || Math.abs(lat) > 90.0 || Math.abs(lon) <= 0.1 || Math.abs(lon) > 180.0) {
+                continue;
+            }
+            String rest = hm.group(4);
+            long etMs = 0L;
+            Matcher etm = DumpsysEtPattern.matcher(rest);
+            if (etm.find()) {
+                etMs = parseAndroidDurationMs(etm.group(1));
+            }
+            long locElapsedNs = etMs * 1000000L;
+            if (locElapsedNs > 0L && sysElapsedNs >= locElapsedNs && ((sysElapsedNs - locElapsedNs) / 1000000L) > 20000L) {
+                continue;
+            }
+
+            float vel = (float) extractKeyDouble(rest, "\\bvel=([-+]?\\d+(?:\\.\\d+)?)", -1.0);
+            if (vel < 0.0f) {
+                vel = (float) extractKeyDouble(rest, "\\bgnssSpeed=([-+]?\\d+(?:\\.\\d+)?)", -1.0);
+            }
+            float bear = (float) extractKeyDouble(rest, "\\bbear=([-+]?\\d+(?:\\.\\d+)?)", 0.0);
+            float gnssHdg = (float) extractKeyDouble(rest, "\\bgnssHeading=([-+]?\\d+(?:\\.\\d+)?)", 0.0);
+            int gpsStatus = extractKeyInt(rest, "\\bgpsstatus\\s*=\\s*(-?\\d+)", 3);
+            int rawDr = extractKeyInt(rest, "\\bdrstatus\\s*=\\s*(-?\\d+)", 0);
+            int gyroS = extractKeyInt(rest, "\\bgyroS\\s*=\\s*(-?\\d+)", 0);
+            int odoS = extractKeyInt(rest, "\\bodoS\\s*=\\s*(-?\\d+)", 0);
+            int drStatus = (rawDr == 1 || (gyroS == 1 && odoS == 1)) ? 1 : 0;
+            int sat = -1;
+            Matcher sm = DumpsysSatPattern.matcher(rest);
+            if (sm.find()) {
+                sat = parseIntSafe(sm.group(1), -1);
+            }
+
+            bestRank = rank;
+            bestProvider = provider;
+            bestLat = lat;
+            bestLon = lon;
+            bestVel = vel;
+            bestBear = bear;
+            bestGnssHdg = gnssHdg;
+            bestElapsedNs = locElapsedNs;
+            bestFix = gpsStatus;
+            bestDr = drStatus;
+            bestSat = sat;
+        }
+
+        if (bestRank <= 0) {
+            return false;
+        }
+        boolean applied = applyLocationValues(st, bestLat, bestLon, bestBear, bestGnssHdg, bestVel,
+                bestElapsedNs, sysElapsedNs, bestProvider, nowMs, traceFile, bestFix, bestDr);
+        if (applied) {
+            synchronized (st) {
+                st.lastDumpLocMs = nowMs;
+                if (bestSat >= 0 && (nowMs - st.lastSatUpdateMs) > 2500L) {
+                    st.gpsSatUsed = bestSat;
+                    if (st.gpsSatInView < bestSat) {
+                        st.gpsSatInView = bestSat;
+                    }
+                    st.lastSatUpdateMs = nowMs;
+                }
+            }
+        }
+        return applied;
+    }
+
+    private static double extractKeyDouble(String line, String regex, double def) {
+        Matcher m = Pattern.compile(regex).matcher(line);
+        if (m.find()) {
+            return parseLeadingDouble(m.group(1), def);
+        }
+        return def;
+    }
+
+    private static long readSystemElapsedNs() {
+        try {
+            Class<?> clkCls = Class.forName("android.os.SystemClock");
+            return ((Number) clkCls.getMethod("elapsedRealtimeNanos").invoke(null)).longValue();
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
+    private static Object getILocationManager() {
+        try {
+            Class<?> smCls = Class.forName("android.os.ServiceManager");
+            Object binder = smCls.getMethod("getService", String.class).invoke(null, "location");
+            if (binder == null) {
+                return null;
+            }
+            Class<?> stubCls = Class.forName("android.location.ILocationManager$Stub");
+            return stubCls.getMethod("asInterface", Class.forName("android.os.IBinder")).invoke(null, binder);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void ensureGpsStatusListenerRegistered(NavState st, File traceFile) {
+        if (registeredGpsStatusBinder != null || st == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastGpsStatusRegAttemptMs < 5000L) {
+            return;
+        }
+        lastGpsStatusRegAttemptMs = now;
+        Object ilm = getILocationManager();
+        if (ilm == null) {
+            return;
+        }
+        try {
+            Class<?> iGpsCls = Class.forName("android.location.IGpsStatusListener");
+            Method addMethod = ilm.getClass().getMethod("addGpsStatusListener", iGpsCls, String.class);
+            GpsStatusBinder listener = new GpsStatusBinder(st, traceFile);
+            String[] pkgs = new String[]{"root", "android", "com.android.shell"};
+            for (String pkg : pkgs) {
+                try {
+                    Object ok = addMethod.invoke(ilm, listener, pkg);
+                    if (Boolean.TRUE.equals(ok)) {
+                        registeredGpsStatusBinder = listener;
+                        System.out.println("[CarrotBridge] Registered IGpsStatusListener via ILocationManager (pkg=" + pkg + ")");
+                        if (traceFile != null) {
+                            appendTraceLine(traceFile, "GPS_STATUS_LISTENER_OK: pkg=" + pkg);
+                        }
+                        return;
+                    }
+                } catch (Throwable t) {
+                    Throwable cause = t.getCause() != null ? t.getCause() : t;
+                    System.out.println("[CarrotBridge] addGpsStatusListener(" + pkg + ") failed: " + cause);
+                }
+            }
+        } catch (Throwable t) {
+            Throwable cause = t.getCause() != null ? t.getCause() : t;
+            System.out.println("[CarrotBridge] IGpsStatusListener init error: " + cause);
         }
     }
 
@@ -1240,26 +1644,44 @@ public class CarrotBridgeMain {
                 locElapsedNs = ((Number) lc.getMethod("getElapsedRealtimeNanos").invoke(loc)).longValue();
             } catch (Throwable ignored) {
             }
+            int sat = -1;
+            try {
+                Object extras = lc.getMethod("getExtras").invoke(loc);
+                if (extras != null) {
+                    sat = ((Number) extras.getClass().getMethod("getInt", String.class, int.class)
+                            .invoke(extras, "satellites", Integer.valueOf(-1))).intValue();
+                }
+            } catch (Throwable ignored) {
+            }
             int gpsStatus = invokeOptionalIntMethod(lc, loc, "getGpsstatus", 3);
             int rawDr = invokeOptionalIntMethod(lc, loc, "getDrStatus", 0);
             int gyro = invokeOptionalIntMethod(lc, loc, "getGyrostatus", 0);
             int odo = invokeOptionalIntMethod(lc, loc, "getOdostatus", 0);
             int drStatus = (rawDr == 1 || (gyro == 1 && odo == 1)) ? 1 : 0;
-            return applyLocationValues(st, lat, lon, bearing, gnssHdg, speed, locElapsedNs, sysElapsedNs,
+            boolean ok = applyLocationValues(st, lat, lon, bearing, gnssHdg, speed, locElapsedNs, sysElapsedNs,
                     provider, nowMs, traceFile, gpsStatus, drStatus);
+            if (ok) {
+                synchronized (st) {
+                    st.lastDirectLocMs = nowMs;
+                    if (sat >= 0 && (nowMs - st.lastSatUpdateMs) > 2500L) {
+                        st.gpsSatUsed = sat;
+                        if (st.gpsSatInView < sat) {
+                            st.gpsSatInView = sat;
+                        }
+                        st.lastSatUpdateMs = nowMs;
+                    }
+                }
+            }
+            return ok;
         } catch (Throwable ignored) {
             return false;
         }
     }
 
     private static void pollAndroidLocationManager(NavState st, File traceFile) {
+        ensureGpsStatusListenerRegistered(st, traceFile);
         long nowMs = System.currentTimeMillis();
-        long sysElapsedNs = 0L;
-        try {
-            Class<?> clkCls = Class.forName("android.os.SystemClock");
-            sysElapsedNs = ((Number) clkCls.getMethod("elapsedRealtimeNanos").invoke(null)).longValue();
-        } catch (Throwable ignored) {
-        }
+        long sysElapsedNs = readSystemElapsedNs();
 
         String[] providers = new String[]{"gps", "passive", "network"};
         Object sysCtx = StatusDashboardOverlay.getSysContext();
@@ -1292,11 +1714,8 @@ public class CarrotBridgeMain {
             if (loc == null) {
                 try {
                     if (ilm == null) {
-                        Class<?> smCls = Class.forName("android.os.ServiceManager");
-                        Object binder = smCls.getMethod("getService", String.class).invoke(null, "location");
-                        if (binder != null) {
-                            Class<?> stubCls = Class.forName("android.location.ILocationManager$Stub");
-                            ilm = stubCls.getMethod("asInterface", Class.forName("android.os.IBinder")).invoke(null, binder);
+                        ilm = getILocationManager();
+                        if (ilm != null) {
                             lrCls = Class.forName("android.location.LocationRequest");
                             lrCreate = lrCls.getMethod("createFromDeprecatedProvider",
                                     String.class, long.class, float.class, boolean.class);
@@ -2886,6 +3305,18 @@ public class CarrotBridgeMain {
                             }
                         }
                         pollNaviStickyBroadcasts(navState, traceFile);
+                        long locDirectAgeMs;
+                        synchronized (navState) {
+                            locDirectAgeMs = now - navState.lastDirectLocMs;
+                        }
+                        if (locDirectAgeMs > 1500L) {
+                            String locOut = execCommandCapture(new String[]{
+                                    "/system/bin/dumpsys", "location"
+                            }, 120);
+                            if (!locOut.isEmpty()) {
+                                parseDumpsysLocation(locOut, navState, readSystemElapsedNs(), now, traceFile);
+                            }
+                        }
                         long sleepMs = navState.isGuidanceActive() ? 500L : 1500L;
                         Thread.sleep(sleepMs);
                     } catch (Exception e) {
@@ -3088,17 +3519,30 @@ public class CarrotBridgeMain {
 
     private static void writeStatusFile(File statusFile, NavState st, String lastPacketJson, Set<String> targets) {
         try {
+            long nowMs = System.currentTimeMillis();
             String safeRouteStatus = escapeJson(latestRouteStatus == null ? "idle" : latestRouteStatus);
-            String safeGpsStatus = escapeJson(formatGpsChipText(st, System.currentTimeMillis()));
+            String safeGpsStatus = escapeJson(formatGpsChipText(st, nowMs));
+            int satUsed = -1;
+            int satInView = -1;
+            if (st != null) {
+                synchronized (st) {
+                    if (isSatFreshLocked(st, nowMs)) {
+                        satUsed = st.gpsSatUsed;
+                        satInView = st.gpsSatInView;
+                    }
+                }
+            }
             StringBuilder sb = new StringBuilder(1024);
             sb.append("{\n");
             sb.append("  \"bridgeVersion\": \"").append(BRIDGE_VERSION).append("\",\n");
-            sb.append("  \"timestampMs\": ").append(System.currentTimeMillis()).append(",\n");
+            sb.append("  \"timestampMs\": ").append(nowMs).append(",\n");
             sb.append("  \"discoveredCarrotIp\": \"").append(discoveredCarrotIp).append("\",\n");
             sb.append("  \"targets\": \"").append(targets.toString()).append("\",\n");
             sb.append("  \"routePoints\": ").append(latestRoutePointsCount).append(",\n");
             sb.append("  \"routeStatus\": \"").append(safeRouteStatus).append("\",\n");
             sb.append("  \"gpsStatus\": \"").append(safeGpsStatus).append("\",\n");
+            sb.append("  \"gpsSatUsed\": ").append(satUsed).append(",\n");
+            sb.append("  \"gpsSatInView\": ").append(satInView).append(",\n");
             sb.append("  \"lastPacket\": ").append(lastPacketJson).append("\n");
             sb.append("}\n");
             writeBytesAtomic(statusFile, sb.toString().getBytes(UTF8));
@@ -4860,7 +5304,7 @@ public class CarrotBridgeMain {
         private static Object[] makeChip(U u, Object parent, String iconKey, int iconColor, boolean last) throws Exception {
             Object chip = u.ll(0, G_CV);
             u.bg(chip, C_CHIP, C_BORDER, 1f, 15f);
-            u.pad(chip, 11f, 0f, 11f, 0f);
+            u.pad(chip, 10f, 0f, 10f, 0f);
             Object lead;
             if (iconKey != null) {
                 lead = u.icon(iconKey, iconColor, 2f);
@@ -4872,7 +5316,7 @@ public class CarrotBridgeMain {
             }
             Object text = u.text("", 12.5f, C_TEXT, false);
             u.add(chip, text, WRAP, WRAP, 0f, 6f, 0f, 0f, 0f);
-            u.add(parent, chip, WRAP, 30f, 0f, 0f, 0f, last ? 0f : 7f, 0f);
+            u.add(parent, chip, WRAP, 30f, 0f, 0f, 0f, last ? 0f : 6f, 0f);
             return new Object[]{lead, text};
         }
 
@@ -4890,8 +5334,8 @@ public class CarrotBridgeMain {
 
         private static Object makeKvRow(U u, Object parent, String label, float marginTop) throws Exception {
             Object row = u.ll(0, G_CV);
-            u.add(row, u.text(label, 14f, C_MUTED, false), WRAP, WRAP);
-            Object value = u.singleLine(u.gravity(u.text("-", 14f, C_TEXT, false), G_RIGHT_CV));
+            u.add(row, u.text(label, 13.5f, C_MUTED, false), WRAP, WRAP);
+            Object value = u.singleLine(u.gravity(u.text("-", 13.5f, C_TEXT, false), G_RIGHT_CV));
             u.add(row, value, 0f, WRAP, 1f, 10f, 0f, 0f, 0f);
             u.add(parent, row, MATCH, WRAP, 0f, 0f, marginTop, 0f, 0f);
             return value;
@@ -6743,6 +7187,71 @@ public class CarrotBridgeMain {
         if (!"60초 후 닫힘".equals(StatusDashboardOverlay.formatCountdownText(tReopen, false, StatusDashboardOverlay.AUTO_CLOSE_DURATION_MS, tReopen))
                 || !StatusDashboardOverlay.shouldAutoClose(tReopen, false, tReopen + 60000L)) {
             throw new AssertionError("Auto-close countdown reopen reset mismatch");
+        }
+
+        NavState stSat = new NavState();
+        GpsStatusBinder binder = new GpsStatusBinder(stSat, null);
+        binder.onSvStatusChanged(13, new int[13], new float[]{32.5f, 41.0f, 28.0f},
+                new float[13], new float[13], 0, 0, 0x1F, 0x0F);
+        long nowSat = System.currentTimeMillis();
+        stSat.lat = 36.63581;
+        stSat.lon = 127.48952;
+        stSat.headingDeg = 83.0;
+        stSat.lastGpsFixMs = nowSat;
+        stSat.gpsFixStatus = 3;
+        if (stSat.gpsSatUsed != 9 || stSat.gpsSatInView != 13 || Math.abs(stSat.gpsMaxSnr - 41.0f) > 0.01f
+                || !"GPS 위성(3D) · 9기".equals(formatGpsChipText(stSat, nowSat + 100L))
+                || !formatGpsDetailText(stSat, nowSat + 100L).startsWith("위성(3D · 9/13기) · ")) {
+            throw new AssertionError("SV bitmask / 3D sat format mismatch: " + formatGpsDetailText(stSat, nowSat + 100L));
+        }
+        binder.onSvStatusChanged(12, new int[12], new float[]{18.0f}, new float[12], new float[12], 0, 0, 0, 0);
+        stSat.lastGpsFixMs = System.currentTimeMillis();
+        stSat.gpsFixStatus = 0;
+        stSat.gpsDrStatus = 1;
+        stSat.inTunnel = true;
+        long nowTunnel = System.currentTimeMillis();
+        if (!"GPS 터널 DR · 0기".equals(formatGpsChipText(stSat, nowTunnel + 50L))
+                || !formatGpsDetailText(stSat, nowTunnel + 50L).startsWith("터널 DR(0/12기) · ")) {
+            throw new AssertionError("Tunnel DR sat format mismatch: " + formatGpsDetailText(stSat, nowTunnel + 50L));
+        }
+        binder.onSvStatusChanged(5, new int[5], new float[]{22.0f}, new float[5], new float[5], 0, 0, 0, 0);
+        stSat.lastGpsFixMs = System.currentTimeMillis() - 5000L;
+        long nowWaitSat = System.currentTimeMillis();
+        if (!"GPS 대기 · 0/5기".equals(formatGpsChipText(stSat, nowWaitSat))
+                || !"수신 대기 중 (관측 5기)".equals(formatGpsDetailText(stSat, nowWaitSat))) {
+            throw new AssertionError("Waiting sat format mismatch: " + formatGpsDetailText(stSat, nowWaitSat));
+        }
+
+        NavState stNmea = new NavState();
+        long tNmea = 500000L;
+        binder.onNmeaReceived(0L, "$GNGGA,092725.00,3638.1486,N,12729.3712,E,1,09,0.9,52.3,M,18.0,M,,*48");
+        if (verifyNmeaChecksum("$GNGGA,092725.00,3638.1486,N,12729.3712,E,1,09,0.9,52.3,M,18.0,M,,*48")) {
+            throw new AssertionError("Bad NMEA checksum must fail verification");
+        }
+        parseNmeaSentence(stNmea, "$GNGGA,092725.00,3638.1486,N,12729.3712,E,1,09,0.9,52.3,M,18.0,M,,*49", tNmea, null);
+        parseNmeaSentence(stNmea, "$GNRMC,092725.00,A,3638.1486,N,12729.3712,E,12.5,83.4,161126,,,A*4C", tNmea + 10L, null);
+        if (stNmea.gpsSatUsed != 9 || Math.abs(stNmea.lat - 36.63581) > 0.0001
+                || Math.abs(stNmea.lon - 127.48952) > 0.0001 || stNmea.gpsFixStatus != 3) {
+            throw new AssertionError("NMEA GGA/RMC parse mismatch: lat=" + stNmea.lat + " sat=" + stNmea.gpsSatUsed);
+        }
+
+        if (parseAndroidDurationMs("+1h23m45s678ms") != 5025678L || parseAndroidDurationMs("+45s10ms") != 45010L) {
+            throw new AssertionError("Android duration parser mismatch");
+        }
+        String sampleLocDump = "Current Location Manager state:\n"
+                + "  Last Known Locations:\n"
+                + "    gps: Location[gps 36.635810,127.489520 acc=5 et=+1h23m45s678ms vel=12.50 bear=83.0 odoS=1 gyroS=0 gpsstatus=3 drstatus=0 Bundle[{DREHPE=4.2, satellites=11}]]\n"
+                + "  Last Known Locations Coarse:\n"
+                + "    gps: Location[gps 37.000000,128.000000 acc=2000 et=+1h23m45s678ms Bundle[{satellites=99}]]\n";
+        NavState stDump = new NavState();
+        long tDump = 800000L;
+        if (!parseDumpsysLocation(sampleLocDump, stDump, (5025678L + 1000L) * 1000000L, tDump, null)
+                || stDump.gpsSatUsed != 11 || Math.abs(stDump.lat - 36.63581) > 0.0001) {
+            throw new AssertionError("dumpsys location fresh parse mismatch: sat=" + stDump.gpsSatUsed + " lat=" + stDump.lat);
+        }
+        NavState stDumpStale = new NavState();
+        if (parseDumpsysLocation(sampleLocDump, stDumpStale, (5025678L + 30000L) * 1000000L, tDump, null)) {
+            throw new AssertionError("dumpsys location stale sample (>20s) must be rejected");
         }
 
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());

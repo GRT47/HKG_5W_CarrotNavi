@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import zipfile
 from pathlib import Path
@@ -13,6 +14,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
 BUILD_DIR = BASE_DIR / "build"
+STUB_CLASSES_DIR = BUILD_DIR / "stub_classes"
 CLASSES_DIR = BUILD_DIR / "classes"
 DEX_DIR = BUILD_DIR / "dex"
 PKG_STAGE_DIR = BUILD_DIR / "pkg_stage"
@@ -21,7 +23,7 @@ USB_ROOT_DIR = BUILD_DIR / "usb_root"
 OUTER_ZIP_PATH = REPO_ROOT / "HKG_5W_CarrotNavi_USB.zip"
 VERSION_JSON_PATH = REPO_ROOT / "version.json"
 
-BRIDGE_VERSION = "1.3.2"
+BRIDGE_VERSION = "1.3.3"
 GITHUB_OWNER = "GRT47"
 GITHUB_REPO = "HKG_5W_CarrotNavi"
 GITHUB_BRANCH = "main"
@@ -83,9 +85,51 @@ def normalize_lf(path: Path) -> bytes:
     return raw
 
 
+def _parse_uleb128(data: bytes, off: int) -> tuple[int, int]:
+    val = 0
+    shift = 0
+    while True:
+        b = data[off]
+        off += 1
+        val |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            return val, off
+        shift += 7
+
+
+def verify_dex_classes(dex_bytes: bytes) -> None:
+    """Verify DEX 035 defines only com.hkg.carrotbridge.* classes (no leaked android.* stubs)."""
+    if dex_bytes[:8] != b"dex\n035\x00":
+        raise RuntimeError(f"Unexpected DEX magic header: {dex_bytes[:8]!r} (expected b'dex\\n035\\x00')")
+    hdr = struct.unpack_from("<8sI20sIIIIIIIIIIIIIIIIII", dex_bytes, 0)
+    str_cnt, str_off = hdr[9], hdr[10]
+    type_cnt, type_off = hdr[11], hdr[12]
+    cls_cnt, cls_off = hdr[19], hdr[20]
+
+    strings = []
+    for i in range(str_cnt):
+        soff = struct.unpack_from("<I", dex_bytes, str_off + i * 4)[0]
+        _, pos = _parse_uleb128(dex_bytes, soff)
+        end = dex_bytes.find(b"\x00", pos)
+        strings.append(dex_bytes[pos:end].decode("utf-8", errors="replace"))
+
+    types = [strings[struct.unpack_from("<I", dex_bytes, type_off + i * 4)[0]] for i in range(type_cnt)]
+    defined = set()
+    for i in range(cls_cnt):
+        c_idx = struct.unpack_from("<I", dex_bytes, cls_off + i * 32)[0]
+        cname = types[c_idx]
+        if not cname.startswith("Lcom/hkg/carrotbridge/"):
+            raise RuntimeError(f"Stub or unexpected class leaked into classes.dex: {cname}")
+        defined.add(cname)
+
+    if "Landroid/location/IGpsStatusListener$Stub;" not in types or "Landroid/location/IGpsStatusListener$Stub;" in defined:
+        raise RuntimeError("IGpsStatusListener$Stub must be referenced externally, not defined in DEX")
+
+
 def build() -> None:
     if BUILD_DIR.exists():
         shutil.rmtree(BUILD_DIR)
+    STUB_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
     CLASSES_DIR.mkdir(parents=True, exist_ok=True)
     DEX_DIR.mkdir(parents=True, exist_ok=True)
     PKG_STAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -130,34 +174,38 @@ def build() -> None:
     version_bytes = (json.dumps(version_doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     VERSION_JSON_PATH.write_bytes(version_bytes)
 
-    # 3. Compile CarrotBridgeMain.java (Java 8 target -> Android API 19 DEX)
+    # 3. Compile compile-only Android stubs, then application Java sources (Java 8 target -> Android API 19 DEX)
     javac = find_javac()
     java = find_java()
     d8 = find_d8()
-    java_src = BASE_DIR / "src_java" / "com" / "hkg" / "carrotbridge" / "CarrotBridgeMain.java"
+    stub_sources = [str(p) for p in sorted((BASE_DIR / "src_stub").rglob("*.java"))]
+    java_sources = [str(p) for p in sorted((BASE_DIR / "src_java").rglob("*.java"))]
 
     subprocess.run(
-        [javac, "--release", "8", "-encoding", "UTF-8", "-d", str(CLASSES_DIR), str(java_src)],
+        [javac, "--release", "8", "-encoding", "UTF-8", "-d", str(STUB_CLASSES_DIR), *stub_sources],
+        check=True,
+    )
+    subprocess.run(
+        [javac, "--release", "8", "-encoding", "UTF-8", "-cp", str(STUB_CLASSES_DIR), "-d", str(CLASSES_DIR), *java_sources],
         check=True,
     )
 
-    # 4. Run host self-test suite on compiled classes
+    # 4. Run host self-test suite on compiled classes (+ stubs on host classpath)
     subprocess.run(
-        [java, "-cp", str(CLASSES_DIR), "com.hkg.carrotbridge.CarrotBridgeMain", "test-self"],
+        [java, "-cp", f"{CLASSES_DIR}{os.pathsep}{STUB_CLASSES_DIR}", "com.hkg.carrotbridge.CarrotBridgeMain", "test-self"],
         check=True,
     )
 
-    # 5. Convert .class files to Dalvik DEX (--min-api 19 -> DEX 035 for Android 4.4.2)
+    # 5. Convert app .class files to Dalvik DEX (--min-api 19 -> DEX 035; stubs stay classpath-only)
     class_files = [str(p) for p in sorted(CLASSES_DIR.rglob("*.class"))]
     subprocess.run(
-        [d8, "--min-api", "19", "--no-desugaring", "--output", str(DEX_DIR), *class_files],
+        [d8, "--min-api", "19", "--no-desugaring", "--classpath", str(STUB_CLASSES_DIR), "--output", str(DEX_DIR), *class_files],
         check=True,
     )
 
     classes_dex = DEX_DIR / "classes.dex"
     dex_bytes = classes_dex.read_bytes()
-    if dex_bytes[:8] != b"dex\n035\x00":
-        raise RuntimeError(f"Unexpected DEX magic header: {dex_bytes[:8]!r} (expected b'dex\\n035\\x00')")
+    verify_dex_classes(dex_bytes)
 
     jar_path = BUILD_DIR / "carrotbridge.jar"
     with zipfile.ZipFile(jar_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
