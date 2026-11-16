@@ -16,10 +16,10 @@
      - `Navigation$DisplayType`(47종) + 회전 각도(`Direction` `0~360°`) + `SCC_HU_Navi_P`(`nextTurnType1/2`)를 CarrotPilot `nTBTTurnType` / `nTBTTurnTypeNext` 코드로 매핑
      - `com.mnsoft.navi`의 UTF-16LE/BE 바이트 스왑(`CrossroadName`, `DestinationName`) 자동 복원 디코더 탑재 (`szTBTMainText`, `szGoalName`)
      - 목적지 잔여 거리(`nGoPosDist`), 잔여 시간(`nGoPosTime`), 차선 수 기반 도로 폭(`nTBTNextRoadWidth`), GPS(`vpPosPointLat`, `vpPosPointLon`, `nPosAngle`, `nPosSpeed`) 및 목적지 좌표(`goalPosX`, `goalPosY`, `szGoalName`) 전송
-   - **Mapbox 경로 폴리라인 연동 (무인증 OSRM → `TCP 7709`, v1.3.0)**:
+   - **Mapbox 경로 폴리라인 연동 (무인증 OSRM → `TCP 7709`, v1.3.1)**:
      - `com.mnsoft.navi.action.DestinationInfo` / `Route_Guide_Status` (스티키 브로드캐스트 + `BrdCast` 로그, `com.mnsoft.navi.action.extra.*` 키 지원)에서 목적지·경유지 좌표(`LON`/`LAT`, `waypoint1/2`, `Passed.waypoint1/2`, `PoiName`/`Address`) 추출 및 `ROUTE_GUIDE_STATE` 활성(`> 0`) 기반 `goalPosX`/`goalPosY` 전송
-     - Android `LocationManager` / `ILocationManager` 실시간 차량 GPS(`gps`/`passive`/`network`) 주기 폴링으로 `vpPosPointLat`/`vpPosPointLon` 및 OSRM 출발 좌표 확보
-     - Mapbox 토큰 없이 공용 OSRM 서버(`router.project-osrm.org`, 백업 `routing.openstreetmap.de`)로 경로 조회(공용 UDP DNS `8.8.8.8`/`1.1.1.1`) 후 Google Polyline5 디코딩·최대 4096포인트 제한을 거쳐 CarrotPilot `TCP 7709`(`!I` + `lon/lat float32`)로 푸시 (경로 이탈·재탐색 자동 재조회, 안내 종료/전송 OFF 시 초기화)
+     - Android `LocationManager` / `ILocationManager` 실시간 차량 GPS(`gps`/`passive`/`network`) 및 위성/추측항법(DR)/터널 상태(`getGpsstatus`/`getDrStatus`/`STD_SEG_E.tunnel`) 폴링으로 `vpPosPointLat`/`vpPosPointLon` 및 OSRM 출발 좌표 확보
+     - Mapbox 토큰 없이 공용 OSRM 서버(`router.project-osrm.org`, 백업 `routing.openstreetmap.de`)로 경로 조회(공용 UDP DNS `8.8.8.8`/`1.1.1.1`) 후 Google Polyline5 디코딩·최대 4096포인트 제한을 거쳐 CarrotPilot `TCP 7709`(`!I` + `lon/lat float32`)로 푸시 (경로 이탈·재탐색 자동 재조회, 안내 종료/전송 OFF 시 초기화, OSRM 폴리라인 기반 2차 회전 방향 추론 및 `dumpsys` 목적지 `0.0 km`/다음 안내 깜빡임 보정 포함)
    - **CarrotPilot 자동 탐색**:
      - `UDP 7705` 브로드캐스트 수신 + `wlan0` ARP 테이블(`/proc/net/arp`) 스캔 + 서브넷 브로드캐스트(`192.168.0.255:7706`) 병행
 
@@ -37,7 +37,7 @@
 
 5. **MAP 버튼 3연타 & NEMESIS 대시보드 상태 오버레이 (`StatusDashboardOverlay`)**
    - 전면 물리 `MAP` 버튼을 연속 3번 누르거나(`ivi_mode_broadcast` `KEYCODE_SHORTCUT_MAP` / `com.hkmc.intent.action.MAP_SHORTCUT` 감지), NEMESIS 대시보드에서 `CarrotNavi 7706 Bridge`를 선택하면 현재 화면 위에 **실시간 패키지 버전·동작 상태 대시보드 오버레이**가 즉시 표시됨
-   - 실시간 표시 항목: 패키지 버전, UDP `7706` 송신 카운터, Wi-Fi 핫스팟 상태, 콤마(캐럿파일럿) 연결 IP·수신 차속·`TCP 7709` 경로 포인트 수, 현재 도로 제한속도, 전방 단속카메라/구간단속/방지턱(SDI), 1차/2차 TBT 회전 및 한글 교차로명, 목적지 잔여 거리/시간
+   - 실시간 표시 항목: 패키지 버전, 상단 GPS 수신 상태 칩(`위성(3D)`/`터널 DR`/`추측(DR)`/`대기`), UDP `7706` 송신 카운터, Wi-Fi 핫스팟 상태, 콤마(캐럿파일럿) 연결 IP·수신 차속·`TCP 7709` 경로 포인트 수, 차량 GPS 상태·좌표, 현재 도로 제한속도, 전방 단속카메라/구간단속/방지턱(SDI), 1차/2차 TBT 회전 및 한글 교차로명, 목적지 잔여 거리/시간
    - 터치 조작 버튼: `[📶 핫스팟 설정 화면]`(`com.hkmc.wifisettings/.WifiHotspot` 즉시 진입), `[⚙️ 엔지니어링 WiFi]`(`com.hkmc.system.app.engineering/.module.WifiInfo` 진입), `[📡 핫스팟 즉시 켜기]`, `[🔄 GitHub 업데이트]`, `[💾 TBT 정밀 덤프]`, `[✖ 닫기 (MAP 3연타)]`
 
 ---

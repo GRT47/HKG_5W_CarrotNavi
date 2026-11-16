@@ -68,7 +68,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.3.0";
+    public static final String BRIDGE_VERSION = "1.3.1";
     public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
@@ -170,6 +170,8 @@ public class CarrotBridgeMain {
         public int remainDistM = 0;
         public int remainTimeSec = 0;
         public int subInfoTimeType = 0;
+        public long lastLogcatSubInfoMs = 0L;
+        public long lastLogcatSubInfo2Ms = 0L;
 
         // GPS & Current Road
         public double lat = 0.0;
@@ -178,6 +180,9 @@ public class CarrotBridgeMain {
         public double headingDeg = 0.0;
         public double posSpeedKph = 0.0;
         public String posRoadName = "";
+        public int gpsFixStatus = 0; // 0=no sat fix, 2=2D, 3=3D
+        public int gpsDrStatus = 0;  // 1=dead reckoning (gyro+odo) active
+        public boolean inTunnel = false;
 
         // OEM Destination & Waypoints (from com.mnsoft.navi.action.DestinationInfo & Route_Guide_Status)
         public int routeGuideState = -1; // -1=unknown, 0=none, >0=active guidance (e.g. 1 or 3 on Gen5W)
@@ -266,6 +271,7 @@ public class CarrotBridgeMain {
         public int nTBTDistNext = 0;
         public int nTBTTurnTypeNext = -1;
         public String szTBTMainTextNext = "";
+        public boolean nextTurnKnown = false;
 
         public int nGoPosDist = 0;
         public int nGoPosTime = 0;
@@ -572,6 +578,7 @@ public class CarrotBridgeMain {
                 int i2 = kv.containsKey("distToPoint2_I") ? kv.get("distToPoint2_I") : 0;
                 int f2 = kv.containsKey("distToPoint2_F") ? kv.get("distToPoint2_F") : 0;
                 st.subInfo2Dist2M = (u2 < 0 || u2 >= 15 || i2 >= 65535) ? 0 : convertDistToMeters(i2, f2, u2, false);
+                st.lastLogcatSubInfo2Ms = nowMs;
             }
             // 7. NaviCluster.updateSLIFNaviInformation()
             else if (line.contains("updateSLIFNaviInformation()")) {
@@ -592,6 +599,9 @@ public class CarrotBridgeMain {
             // 8. NaviCluster.updateSTD_SEG_E_SPEED5_Info() / updateSTD_SEG_E_Info()
             else if (line.contains("updateSTD_SEG_E")) {
                 Map<String, Integer> kv = extractIntMap(line);
+                if (kv.containsKey("tunnel")) {
+                    st.inTunnel = (kv.get("tunnel") == 1);
+                }
                 if (kv.containsKey("directionLanes") && kv.get("directionLanes") > 0 && kv.get("directionLanes") <= 12) {
                     st.numLanes = kv.get("directionLanes");
                 }
@@ -610,9 +620,11 @@ public class CarrotBridgeMain {
                 int unit = extractIntAfter(line, "unit:", 15);
                 if (distVal >= 0.0 && unit >= 0 && unit < 15) {
                     st.remainDistM = convertFloatDistToMeters(distVal, unit, false);
+                    st.lastLogcatSubInfoMs = nowMs;
                 } else if (unit == 15) {
                     st.remainDistM = 0;
                     st.remainTimeSec = 0;
+                    st.lastLogcatSubInfoMs = 0L;
                 }
                 int arrivalType = extractIntAfter(line, "arrivalTimeType:", -1);
                 int hh = extractIntAfter(line, "hour:", -1);
@@ -667,6 +679,9 @@ public class CarrotBridgeMain {
                     st.sccNextTurnDist1 = 0;
                     st.sccNextTurnType1 = 0;
                     st.subInfo2Dist1M = 0;
+                    st.subInfo2Dist2M = 0;
+                    st.lastLogcatSubInfoMs = 0L;
+                    st.lastLogcatSubInfo2Ms = 0L;
                     st.crossroadName = "";
                 }
             }
@@ -700,6 +715,10 @@ public class CarrotBridgeMain {
                     st.lat = lat;
                     st.lon = lon;
                     st.lastGpsFixMs = nowMs;
+                    if (st.gpsFixStatus == 0 && st.gpsDrStatus == 0) {
+                        st.gpsFixStatus = st.inTunnel ? 0 : 3;
+                        st.gpsDrStatus = st.inTunnel ? 1 : 0;
+                    }
                 } else if (latObj != null || line.contains("LAT=")) {
                     st.lastGpsFixMs = 0L;
                 }
@@ -715,7 +734,7 @@ public class CarrotBridgeMain {
             // 14. I/Java_Layer: [Cluster] plain-text logs from com.mnsoft.navi (enabled via Eng.LogSetting)
             else if (line.contains("[Cluster]") || line.contains("[IL TBT") || line.contains("[TP ")) {
                 interestingForTrace = true;
-                parseMnsoftClusterLogLocked(line, st);
+                parseMnsoftClusterLogLocked(line, st, nowMs);
             }
         }
 
@@ -787,6 +806,10 @@ public class CarrotBridgeMain {
         st.routeGuideState = state;
         if (state == 0) {
             st.clearDestinationLocked();
+            st.subInfo2Dist1M = 0;
+            st.subInfo2Dist2M = 0;
+            st.lastLogcatSubInfoMs = 0L;
+            st.lastLogcatSubInfo2Ms = 0L;
         }
         if (traceFile != null && prev != state) {
             appendTraceLine(traceFile, "ROUTE_GUIDE_STATE: " + prev + " -> " + state);
@@ -1068,6 +1091,24 @@ public class CarrotBridgeMain {
             String provider,
             long nowMs,
             File traceFile) {
+        return applyLocationValues(st, lat, lon, bearingDeg, gnssHeadingDeg, speedMps,
+                locElapsedNs, sysElapsedNs, provider, nowMs, traceFile, 3, 0);
+    }
+
+    public static boolean applyLocationValues(
+            NavState st,
+            double lat,
+            double lon,
+            float bearingDeg,
+            float gnssHeadingDeg,
+            float speedMps,
+            long locElapsedNs,
+            long sysElapsedNs,
+            String provider,
+            long nowMs,
+            File traceFile,
+            int gpsFixStatus,
+            int gpsDrStatus) {
         if (st == null || Double.isNaN(lat) || Double.isInfinite(lat)
                 || Double.isNaN(lon) || Double.isInfinite(lon)) {
             return false;
@@ -1088,6 +1129,8 @@ public class CarrotBridgeMain {
             st.lat = lat;
             st.lon = lon;
             st.lastGpsFixMs = nowMs;
+            st.gpsFixStatus = gpsFixStatus;
+            st.gpsDrStatus = gpsDrStatus;
 
             float hdg = bearingDeg > 0.0f ? bearingDeg : gnssHeadingDeg;
             if (hdg > 0.0f && hdg <= 360.0f) {
@@ -1099,11 +1142,74 @@ public class CarrotBridgeMain {
             }
             if (firstOrRecovered && traceFile != null) {
                 appendTraceLine(traceFile, String.format(Locale.US,
-                        "GPS_LOCK: provider=%s lat=%.6f lon=%.6f hdg=%.1f",
-                        provider != null ? provider : "unknown", lat, lon, st.headingDeg));
+                        "GPS_LOCK: provider=%s lat=%.6f lon=%.6f hdg=%.1f fix=%d dr=%d",
+                        provider != null ? provider : "unknown", lat, lon, st.headingDeg, gpsFixStatus, gpsDrStatus));
             }
         }
         return true;
+    }
+
+    /** Returns 0 = waiting/stale, 1 = DR / tunnel DR active, 2 = satellite fix (2D/3D). */
+    public static int getGpsStatusState(NavState st, long nowMs) {
+        if (st == null) {
+            return 0;
+        }
+        synchronized (st) {
+            if (!isGpsFresh(st, nowMs)) {
+                return 0;
+            }
+            if (st.gpsFixStatus >= 2 && !st.inTunnel) {
+                return 2;
+            }
+            return 1;
+        }
+    }
+
+    public static String formatGpsChipText(NavState st, long nowMs) {
+        if (st == null) {
+            return "GPS 대기 중";
+        }
+        synchronized (st) {
+            int state = getGpsStatusState(st, nowMs);
+            if (state == 0) {
+                return "GPS 대기 중";
+            }
+            if (state == 2) {
+                return st.gpsFixStatus == 2 ? "GPS 위성(2D)" : "GPS 위성(3D)";
+            }
+            return st.inTunnel ? "GPS 터널 DR" : "GPS 추측(DR)";
+        }
+    }
+
+    public static String formatGpsDetailText(NavState st, long nowMs) {
+        if (st == null) {
+            return "수신 대기 중";
+        }
+        synchronized (st) {
+            int state = getGpsStatusState(st, nowMs);
+            if (state == 0) {
+                return "수신 대기 중";
+            }
+            String modeLabel;
+            if (state == 2) {
+                modeLabel = st.gpsFixStatus == 2 ? "위성(2D)" : "위성(3D)";
+            } else {
+                modeLabel = st.inTunnel ? "터널 DR 보정" : "추측항법(DR)";
+            }
+            return String.format(Locale.US, "%s · %.4f, %.4f · %.0f°",
+                    modeLabel, st.lat, st.lon, normalizeHeadingDeg(st.headingDeg));
+        }
+    }
+
+    private static int invokeOptionalIntMethod(Class<?> cls, Object obj, String methodName, int fallback) {
+        try {
+            Object v = cls.getMethod(methodName).invoke(obj);
+            if (v instanceof Number) {
+                return ((Number) v).intValue();
+            }
+        } catch (Throwable ignored) {
+        }
+        return fallback;
     }
 
     private static boolean extractAndApplyLocationObj(
@@ -1134,7 +1240,13 @@ public class CarrotBridgeMain {
                 locElapsedNs = ((Number) lc.getMethod("getElapsedRealtimeNanos").invoke(loc)).longValue();
             } catch (Throwable ignored) {
             }
-            return applyLocationValues(st, lat, lon, bearing, gnssHdg, speed, locElapsedNs, sysElapsedNs, provider, nowMs, traceFile);
+            int gpsStatus = invokeOptionalIntMethod(lc, loc, "getGpsstatus", 3);
+            int rawDr = invokeOptionalIntMethod(lc, loc, "getDrStatus", 0);
+            int gyro = invokeOptionalIntMethod(lc, loc, "getGyrostatus", 0);
+            int odo = invokeOptionalIntMethod(lc, loc, "getOdostatus", 0);
+            int drStatus = (rawDr == 1 || (gyro == 1 && odo == 1)) ? 1 : 0;
+            return applyLocationValues(st, lat, lon, bearing, gnssHdg, speed, locElapsedNs, sysElapsedNs,
+                    provider, nowMs, traceFile, gpsStatus, drStatus);
         } catch (Throwable ignored) {
             return false;
         }
@@ -1204,7 +1316,7 @@ public class CarrotBridgeMain {
         }
     }
 
-    private static void parseMnsoftClusterLogLocked(String line, NavState st) {
+    private static void parseMnsoftClusterLogLocked(String line, NavState st, long nowMs) {
         if (line.contains("[IL TBT Info - 0x4E] DisplayType =")) {
             String val = substringAfter(line, "DisplayType =").trim();
             applyDisplayTypeStringLocked(st, val);
@@ -1241,9 +1353,13 @@ public class CarrotBridgeMain {
             if (val.contains("Invalid") || val.contains("None")) {
                 st.remainDistM = 0;
                 st.remainTimeSec = 0;
+                st.lastLogcatSubInfoMs = 0L;
             } else {
                 int d = parseDistanceWithUnitText(val);
-                if (d >= 0) st.remainDistM = d;
+                if (d >= 0) {
+                    st.remainDistM = d;
+                    st.lastLogcatSubInfoMs = nowMs;
+                }
             }
         } else if (line.contains("[IL TBT Sub Info - 0x4D] TimeType =")) {
             String val = substringAfter(line, "TimeType =").trim();
@@ -1264,9 +1380,13 @@ public class CarrotBridgeMain {
         } else if (line.contains("[IL TBT Sub Info 2 - 0x4C] Distance To Next Point 1 =")) {
             String val = substringAfter(line, "Distance To Next Point 1 =").trim();
             st.subInfo2Dist1M = parseDistanceWithUnitText(val);
+            st.lastLogcatSubInfo2Ms = nowMs;
         } else if (line.contains("[IL TBT Sub Info 2 - 0x4C] Distance To Next Point 2 =")) {
             String val = substringAfter(line, "Distance To Next Point 2 =").trim();
             st.subInfo2Dist2M = parseDistanceWithUnitText(val);
+            st.lastLogcatSubInfo2Ms = nowMs;
+        } else if (line.contains("[SEGInfo] tunnel =")) {
+            st.inTunnel = parseIntSafe(substringAfter(line, "tunnel =").trim(), 0) == 1;
         } else if (line.contains("[POSInfo] RangeSpeed =")) {
             int rawAvg = parseIntSafe(substringAfter(line, "RangeSpeed =").trim(), 0);
             st.stdPosRangeAvgSpeed = (rawAvg <= 0 || rawAvg >= 255) ? 0 : rawAvg;
@@ -1335,6 +1455,35 @@ public class CarrotBridgeMain {
     // PARSER: DUMPSYS (dumpsys activity service com.hkmc.micom.ClusterService)
     // =========================================================================
 
+    /**
+     * Parses ClusterService dumpsys TBT SubInfo remaining distance, repairing HKMC firmware bug where
+     * km values (e.g. "6.1 METER" or "6.0 METER" when 1st turn is 400m) are emitted with the "METER" label.
+     */
+    public static int parseDumpsysSubInfoDistMeters(String distText, int currentTbtDistM) {
+        if (distText == null || distText.isEmpty()) {
+            return -1;
+        }
+        String u = distText.trim().toUpperCase(Locale.US);
+        if (u.contains("INVALID") || u.contains("NONE")) {
+            return 0;
+        }
+        if (u.contains("KILO") || u.contains("KM")) {
+            return parseDistanceWithUnitText(distText);
+        }
+        double val = parseLeadingDouble(distText, -1.0);
+        if (val < 0.0) {
+            return -1;
+        }
+        boolean hasFraction = Math.abs(val - Math.rint(val)) > 0.01;
+        boolean smallerThanTurn = (val >= 1.0 && val < 500.0
+                && currentTbtDistM > (int) Math.round(val) + 20
+                && val * 1000.0 >= currentTbtDistM);
+        if (hasFraction || smallerThanTurn) {
+            return (int) Math.round(val * 1000.0);
+        }
+        return (int) Math.round(val);
+    }
+
     public static void parseDumpsysCluster(String dumpText, NavState st) {
         parseDumpsysCluster(dumpText, st, System.currentTimeMillis());
     }
@@ -1364,6 +1513,9 @@ public class CarrotBridgeMain {
                     continue;
                 } else if (line.startsWith("STD POS P Info:")) {
                     section = "STDPOS";
+                    continue;
+                } else if (line.startsWith("STD SEG E Info:")) {
+                    section = "STDSEG";
                     continue;
                 } else if (line.startsWith("SCC HU P Info:")) {
                     section = "SCC";
@@ -1441,24 +1593,34 @@ public class CarrotBridgeMain {
                         }
                     }
                 } else if ("SUB1".equals(section)) {
+                    boolean logcatSub1Fresh = st.lastLogcatSubInfoMs > 0L
+                            && nowMs >= st.lastLogcatSubInfoMs
+                            && (nowMs - st.lastLogcatSubInfoMs) <= 5000L;
+                    if (line.startsWith("time type")) {
+                        int tt = extractKeyInt(line, "time\\s+type\\s*=\\s*(-?\\d+)", -1);
+                        if (tt == 1 || tt == 2) st.subInfoTimeType = tt;
+                        else if (tt >= 3) st.subInfoTimeType = 0;
+                    }
                     if (line.startsWith("distance")) {
                         String[] parts = line.split("\\|");
-                        String d = substringAfter(parts[0], "=").trim();
-                        int distM = parseDistanceWithUnitText(d);
-                        if (distM >= 0) st.remainDistM = distM;
                         if (parts.length > 1 && parts[1].contains("time")) {
                             String ttStr = substringAfter(parts[1], "=").trim().toUpperCase(Locale.US);
                             if (ttStr.contains("ESTIMATE") || ttStr.contains("ARRIVAL")) st.subInfoTimeType = 1;
                             else if (ttStr.contains("NECESSARY")) st.subInfoTimeType = 2;
                             else if (ttStr.contains("NONE") || ttStr.contains("INVALID")) st.subInfoTimeType = 0;
                         }
+                        if (!logcatSub1Fresh) {
+                            String d = substringAfter(parts[0], "=").trim();
+                            int distM = parseDumpsysSubInfoDistMeters(d, st.tbtDistM);
+                            if (distM >= 0) st.remainDistM = distM;
+                        }
                     }
-                    if (line.contains("minutes")) {
+                    if (line.contains("minutes") && !logcatSub1Fresh) {
                         int hrs = extractKeyInt(line, "hours\\s*=\\s*(-?\\d+)", -1);
                         int mins = extractKeyInt(line, "minutes\\s*=\\s*(-?\\d+)", -1);
-                        if (hrs >= 0 && mins >= 0) {
+                        if (hrs >= 0 && mins >= 0 && mins < 60) {
                             applySubInfoTimeLocked(st, st.subInfoTimeType > 0 ? st.subInfoTimeType : 2, hrs, mins);
-                        } else if (mins >= 0 && mins < 10000) {
+                        } else if (mins >= 0 && mins < 255 && st.subInfoTimeType != 1) {
                             st.remainTimeSec = mins * 60;
                         }
                     }
@@ -1469,15 +1631,28 @@ public class CarrotBridgeMain {
                         }
                     }
                 } else if ("SUB2".equals(section)) {
+                    boolean logcatSub2Fresh = st.lastLogcatSubInfo2Ms > 0L
+                            && nowMs >= st.lastLogcatSubInfo2Ms
+                            && (nowMs - st.lastLogcatSubInfo2Ms) <= 5000L;
                     if (line.startsWith("next 1")) {
-                        st.subInfo2Dist1M = parseDistanceWithUnitText(substringAfter(line, "=").trim());
+                        int d1 = parseDistanceWithUnitText(substringAfter(line, "=").trim());
+                        if (!logcatSub2Fresh || d1 > 0) {
+                            st.subInfo2Dist1M = d1;
+                        }
                     } else if (line.startsWith("next 2")) {
-                        st.subInfo2Dist2M = parseDistanceWithUnitText(substringAfter(line, "=").trim());
+                        int d2 = parseDistanceWithUnitText(substringAfter(line, "=").trim());
+                        if (!logcatSub2Fresh || d2 > 0) {
+                            st.subInfo2Dist2M = d2;
+                        }
                     }
                 } else if ("STDPOS".equals(section)) {
                     if (line.contains("RangeAvgSpeed")) {
                         int rawAvg = extractKeyInt(line, "RangeAvgSpeed\\s*=\\s*(-?\\d+)", st.stdPosRangeAvgSpeed);
                         st.stdPosRangeAvgSpeed = (rawAvg <= 0 || rawAvg >= 255) ? 0 : rawAvg;
+                    }
+                } else if ("STDSEG".equals(section)) {
+                    if (line.startsWith("Tunnel")) {
+                        st.inTunnel = extractKeyInt(line, "Tunnel\\s*=\\s*(-?\\d+)", 0) == 1;
                     }
                 } else if ("SCC".equals(section)) {
                     if (line.contains("RangeCamInfo")) {
@@ -1729,6 +1904,11 @@ public class CarrotBridgeMain {
                 int nextDist = st.subInfo2Dist2M > 0 ? st.subInfo2Dist2M
                         : ((st.subInfo2Dist1M > 0 && st.subInfo2Dist1M != primaryDist) ? st.subInfo2Dist1M
                         : (st.sccNextTurnDist2 > 0 && st.sccNextTurnDist2 < 4095 ? st.sccNextTurnDist2 : st.turnListDist2M));
+                if (nextTurn < 0 && nextDist > 0 && isGpsFresh(st, nowMs)) {
+                    nextTurn = inferTurnTypeAtDistanceFromPolyline(
+                            st.lat, st.lon, latestRoutePolyline, primaryDist + nextDist);
+                }
+                pkt.nextTurnKnown = (nextTurn > 0);
                 if (nextDist > 0 && nextTurn < 0) {
                     nextTurn = 51; // straight/notification if distance is known
                 }
@@ -2424,6 +2604,7 @@ public class CarrotBridgeMain {
     private static volatile String latestTargetsStr = "[]";
     private static volatile Set<String> latestArpPeers = Collections.emptySet();
     private static volatile int latestRoutePointsCount = 0;
+    private static volatile List<double[]> latestRoutePolyline = Collections.emptyList();
     private static volatile String latestRouteStatus = "idle";
     private static volatile String lastAutoUpdateStatus = "내비 켜질 때 1회 자동 확인 (대기 중)";
     private static volatile long lastWarmWakeUpdateMs = System.currentTimeMillis();
@@ -2783,7 +2964,7 @@ public class CarrotBridgeMain {
 
             if (now - lastStatusWriteMs > 2000L) {
                 lastStatusWriteMs = now;
-                writeStatusFile(statusFile, json, targets);
+                writeStatusFile(statusFile, navState, json, targets);
                 if (navState.isGuidanceActive()) {
                     appendTraceLine(traceFile, "TX7706: " + json);
                 }
@@ -2905,9 +3086,10 @@ public class CarrotBridgeMain {
         return peers;
     }
 
-    private static void writeStatusFile(File statusFile, String lastPacketJson, Set<String> targets) {
+    private static void writeStatusFile(File statusFile, NavState st, String lastPacketJson, Set<String> targets) {
         try {
             String safeRouteStatus = escapeJson(latestRouteStatus == null ? "idle" : latestRouteStatus);
+            String safeGpsStatus = escapeJson(formatGpsChipText(st, System.currentTimeMillis()));
             StringBuilder sb = new StringBuilder(1024);
             sb.append("{\n");
             sb.append("  \"bridgeVersion\": \"").append(BRIDGE_VERSION).append("\",\n");
@@ -2916,6 +3098,7 @@ public class CarrotBridgeMain {
             sb.append("  \"targets\": \"").append(targets.toString()).append("\",\n");
             sb.append("  \"routePoints\": ").append(latestRoutePointsCount).append(",\n");
             sb.append("  \"routeStatus\": \"").append(safeRouteStatus).append("\",\n");
+            sb.append("  \"gpsStatus\": \"").append(safeGpsStatus).append("\",\n");
             sb.append("  \"lastPacket\": ").append(lastPacketJson).append("\n");
             sb.append("}\n");
             writeBytesAtomic(statusFile, sb.toString().getBytes(UTF8));
@@ -3437,6 +3620,107 @@ public class CarrotBridgeMain {
         return minDist;
     }
 
+    private static double[] walkPolylineOffset(double[] xs, double[] ys, int startIdx, int dir, double targetDistM) {
+        int n = xs.length;
+        int cur = startIdx;
+        double accum = 0.0;
+        while (true) {
+            int nxt = cur + dir;
+            if (nxt < 0 || nxt >= n) {
+                return new double[]{xs[cur], ys[cur]};
+            }
+            double segDx = xs[nxt] - xs[cur];
+            double segDy = ys[nxt] - ys[cur];
+            double segLen = Math.hypot(segDx, segDy);
+            if (segLen > 1e-6 && accum + segLen >= targetDistM) {
+                double rem = targetDistM - accum;
+                double frac = Math.max(0.0, Math.min(1.0, rem / segLen));
+                return new double[]{xs[cur] + segDx * frac, ys[cur] + segDy * frac};
+            }
+            accum += segLen;
+            cur = nxt;
+        }
+    }
+
+    /** Infers Carrot turn code (12/13/14/16/19) along the OSRM polyline at targetAheadMeters ahead of vehicle. */
+    public static int inferTurnTypeAtDistanceFromPolyline(
+            double curLat, double curLon, List<double[]> polylineLonLat, double targetAheadMeters) {
+        if (polylineLonLat == null || polylineLonLat.size() < 3 || targetAheadMeters <= 10.0) {
+            return -1;
+        }
+        int n = polylineLonLat.size();
+        double cosLat = Math.cos(Math.toRadians(curLat));
+        double mPerDegLat = 111320.0;
+        double mPerDegLon = 111320.0 * Math.max(0.1, cosLat);
+
+        double[] xs = new double[n];
+        double[] ys = new double[n];
+        double[] cumLen = new double[n];
+        for (int i = 0; i < n; i++) {
+            double[] p = polylineLonLat.get(i);
+            xs[i] = (p[0] - curLon) * mPerDegLon;
+            ys[i] = (p[1] - curLat) * mPerDegLat;
+            if (i > 0) {
+                cumLen[i] = cumLen[i - 1] + Math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]);
+            }
+        }
+
+        double minDist = Double.MAX_VALUE;
+        int bestSeg = 0;
+        double bestT = 0.0;
+        for (int i = 0; i < n - 1; i++) {
+            double dx = xs[i + 1] - xs[i];
+            double dy = ys[i + 1] - ys[i];
+            double len2 = dx * dx + dy * dy;
+            double t = len2 > 1e-9 ? Math.max(0.0, Math.min(1.0, -(xs[i] * dx + ys[i] * dy) / len2)) : 0.0;
+            double px = xs[i] + t * dx;
+            double py = ys[i] + t * dy;
+            double d = Math.hypot(px, py);
+            if (d < minDist) {
+                minDist = d;
+                bestSeg = i;
+                bestT = t;
+            }
+        }
+        if (minDist > 100.0) {
+            return -1;
+        }
+
+        double startArc = cumLen[bestSeg] + bestT * (cumLen[bestSeg + 1] - cumLen[bestSeg]);
+        double targetArc = startArc + targetAheadMeters;
+        double bestAbsDeg = 0.0;
+        double bestRightDeg = 0.0;
+        for (int i = 1; i < n - 1; i++) {
+            if (Math.abs(cumLen[i] - targetArc) > 80.0) {
+                continue;
+            }
+            double[] pIn = walkPolylineOffset(xs, ys, i, -1, 35.0);
+            double[] pOut = walkPolylineOffset(xs, ys, i, 1, 35.0);
+            double inX = xs[i] - pIn[0];
+            double inY = ys[i] - pIn[1];
+            double outX = pOut[0] - xs[i];
+            double outY = pOut[1] - ys[i];
+            if (Math.hypot(inX, inY) < 8.0 || Math.hypot(outX, outY) < 8.0) {
+                continue;
+            }
+            double dot = inX * outX + inY * outY;
+            double cross = inX * outY - inY * outX;
+            double rightDeg = -Math.toDegrees(Math.atan2(cross, dot));
+            double absDeg = Math.abs(rightDeg);
+            if (absDeg > bestAbsDeg) {
+                bestAbsDeg = absDeg;
+                bestRightDeg = rightDeg;
+            }
+        }
+
+        if (bestAbsDeg >= 155.0) return 14;  // U-Turn
+        if (bestRightDeg >= 115.0) return 19; // Sharp Right
+        if (bestRightDeg >= 28.0) return 13;  // Right
+        if (bestRightDeg <= -115.0) return 16;// Sharp Left
+        if (bestRightDeg <= -28.0) return 12; // Left
+        return -1;
+    }
+
     public static boolean sendRouteToCommaTcp7709(String ip, byte[] payload, int connectTimeoutMs, int writeTimeoutMs) {
         return sendRouteToCommaTcp7709(ip, CARROT_ROUTE_TCP_PORT, payload, connectTimeoutMs, writeTimeoutMs);
     }
@@ -3555,6 +3839,7 @@ public class CarrotBridgeMain {
                         currentPolyline = Collections.emptyList();
                         currentPayload = null;
                         latestRoutePointsCount = 0;
+                        latestRoutePolyline = Collections.emptyList();
                         offRouteSinceMs = 0L;
                         consecutiveFailures = 0;
                         nextAllowedRetryMs = 0L;
@@ -3639,6 +3924,7 @@ public class CarrotBridgeMain {
                                 currentPolyline = limited;
                                 currentPayload = payload;
                                 latestRoutePointsCount = limited.size();
+                                latestRoutePolyline = limited;
                                 latestRouteStatus = "osrm ok (" + limited.size() + "pt)";
                                 consecutiveFailures = 0;
                                 nextAllowedRetryMs = 0L;
@@ -4168,14 +4454,14 @@ public class CarrotBridgeMain {
         /** Views of the dashboard that change on refresh (null while hidden). */
         private static final class Dash {
             Object root;
-            Object versionPill, bridgeDot, bridgeText, commaDot, commaText, modeChipText, sysText, countdownText;
+            Object versionPill, bridgeDot, bridgeText, commaDot, commaText, gpsDot, gpsChipText, modeChipText, sysText, countdownText;
             Object guideBadge, guideBlock, emptyBlock, turnIcon, turnDist, turnUnit, turnName, crossroad;
             Object barFill, barRest, nextText, destText;
             Object limitText, roadTypeText, speedText;
             Object camBlock, camIcon, camTitle, camLimit, camDist, camBarFill, camBarRest;
             Object secBlock, secLimit, secRemain, secRemainUnit, secAvg;
             Object noEnfBlock;
-            Object ipText, commaValue, targetsText, radioText;
+            Object ipText, commaValue, targetsText, radioText, gpsValue;
             Object segAp, segWifi, segOff;
             Object txTrack;
             Object messageText;
@@ -4522,19 +4808,19 @@ public class CarrotBridgeMain {
         private static Object[] makeChip(U u, Object parent, String iconKey, int iconColor, boolean last) throws Exception {
             Object chip = u.ll(0, G_CV);
             u.bg(chip, C_CHIP, C_BORDER, 1f, 15f);
-            u.pad(chip, 12f, 0f, 12f, 0f);
+            u.pad(chip, 11f, 0f, 11f, 0f);
             Object lead;
             if (iconKey != null) {
                 lead = u.icon(iconKey, iconColor, 2f);
-                u.add(chip, lead, 15f, 15f);
+                u.add(chip, lead, 14f, 14f);
             } else {
                 lead = u.view();
                 u.bg(lead, C_OK, C_OK, 0f, 4f);
                 u.add(chip, lead, 8f, 8f);
             }
-            Object text = u.text("", 13f, C_TEXT, false);
-            u.add(chip, text, WRAP, WRAP, 0f, 7f, 0f, 0f, 0f);
-            u.add(parent, chip, WRAP, 30f, 0f, 0f, 0f, last ? 0f : 8f, 0f);
+            Object text = u.text("", 12.5f, C_TEXT, false);
+            u.add(chip, text, WRAP, WRAP, 0f, 6f, 0f, 0f, 0f);
+            u.add(parent, chip, WRAP, 30f, 0f, 0f, 0f, last ? 0f : 7f, 0f);
             return new Object[]{lead, text};
         }
 
@@ -4560,9 +4846,9 @@ public class CarrotBridgeMain {
         }
 
         private static Object makeSegment(U u, Object parent, String label, boolean first, Runnable action) throws Exception {
-            Object seg = u.gravity(u.text(label, 14f, C_TEXT_2, false), G_CENTER);
+            Object seg = u.gravity(u.text(label, 13.5f, C_TEXT_2, false), G_CENTER);
             attachClickListener(seg, action);
-            u.add(parent, seg, 0f, 40f, 1f, first ? 0f : 4f, 0f, 0f, 0f);
+            u.add(parent, seg, 0f, 36f, 1f, first ? 0f : 4f, 0f, 0f, 0f);
             return seg;
         }
 
@@ -4611,13 +4897,17 @@ public class CarrotBridgeMain {
             u.add(top, d.versionPill, WRAP, WRAP, 0f, 10f, 0f, 0f, 0f);
 
             Object chips = u.ll(0, G_CV);
-            u.add(top, chips, 0f, WRAP, 1f, 16f, 0f, 12f, 0f);
+            u.add(top, chips, 0f, WRAP, 1f, 14f, 0f, 12f, 0f);
             Object[] bridgeChip = makeChip(u, chips, null, 0, false);
             d.bridgeDot = bridgeChip[0];
             d.bridgeText = bridgeChip[1];
             Object[] commaChip = makeChip(u, chips, null, 0, false);
             d.commaDot = commaChip[0];
             d.commaText = commaChip[1];
+            Object[] gpsChip = makeChip(u, chips, null, 0, false);
+            d.gpsDot = gpsChip[0];
+            d.gpsChipText = gpsChip[1];
+            setBold(d.gpsChipText, true);
             Object[] modeChip = makeChip(u, chips, "wifi_small", C_INFO, true);
             d.modeChipText = modeChip[1];
 
@@ -4782,16 +5072,19 @@ public class CarrotBridgeMain {
 
             // Card 3: connection & settings
             Object card3 = u.card();
+            u.pad(card3, 18f, 15f, 18f, 15f);
             u.add(body, card3, 0f, MATCH, 1.12f, 0f, 0f, 0f, 0f);
             u.add(card3, u.text("연결 · 설정", 13f, C_MUTED, true), WRAP, WRAP);
-            d.ipText = makeKvRow(u, card3, "이 기기 IP", 10f);
+            d.ipText = makeKvRow(u, card3, "이 기기 IP", 8f);
             setTextColor(d.ipText, C_INFO_TEXT);
             setBold(d.ipText, true);
-            d.commaValue = makeKvRow(u, card3, "콤마 기기", 7f);
-            d.targetsText = makeKvRow(u, card3, "전송 대상", 7f);
-            d.radioText = makeKvRow(u, card3, "무선 상태", 7f);
+            d.commaValue = makeKvRow(u, card3, "콤마 기기", 5f);
+            d.targetsText = makeKvRow(u, card3, "전송 대상", 5f);
+            d.radioText = makeKvRow(u, card3, "무선 상태", 5f);
+            d.gpsValue = makeKvRow(u, card3, "차량 GPS", 5f);
+            setBold(d.gpsValue, true);
 
-            u.add(card3, u.text("부팅 시 무선 모드", 13f, C_MUTED, false), WRAP, WRAP, 0f, 0f, 14f, 0f, 0f);
+            u.add(card3, u.text("부팅 시 무선 모드", 13f, C_MUTED, false), WRAP, WRAP, 0f, 0f, 9f, 0f, 0f);
             Object segGroup = u.ll(0, G_CV);
             u.bg(segGroup, C_INSET, C_BORDER, 1f, 12f);
             u.pad(segGroup, 4f, 4f, 4f, 4f);
@@ -4813,13 +5106,13 @@ public class CarrotBridgeMain {
                     setBootWirelessModeFromUi("off");
                 }
             });
-            u.add(card3, segGroup, MATCH, WRAP, 0f, 0f, 6f, 0f, 0f);
+            u.add(card3, segGroup, MATCH, WRAP, 0f, 0f, 5f, 0f, 0f);
             u.vSpacer(card3);
 
             Object txRow = u.ll(0, G_CV);
             u.bg(txRow, C_INSET, C_BORDER, 1f, 12f);
             u.pad(txRow, 14f, 0f, 12f, 0f);
-            u.add(txRow, u.text("콤마 데이터 전송", 15f, C_TEXT, false), 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
+            u.add(txRow, u.text("콤마 데이터 전송", 14.5f, C_TEXT, false), 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
             d.txTrack = u.ll(0, G_RIGHT_CV);
             u.pad(d.txTrack, 3f, 3f, 3f, 3f);
             Object knob = u.view();
@@ -4832,7 +5125,7 @@ public class CarrotBridgeMain {
                     toggleCommaTxFromUi();
                 }
             });
-            u.add(card3, txRow, MATCH, 46f);
+            u.add(card3, txRow, MATCH, 44f);
 
             // ---------------- Status strip (30dp) ----------------
             Object strip = u.ll(0, G_CV);
@@ -5032,6 +5325,12 @@ public class CarrotBridgeMain {
                 setTextIfChanged(d.commaText, !commaTxEnabled ? "콤마 전송 꺼짐" : (commaAlive ? "콤마 연결됨" : "콤마 찾는 중"));
                 u.bg(d.commaDot, commaColor, commaColor, 0f, 4f);
 
+                int gpsState = getGpsStatusState(st, now);
+                int gpsDotCol = (gpsState == 2) ? C_OK : ((gpsState == 1) ? C_INFO : C_WARN);
+                int gpsValCol = (gpsState == 2) ? C_OK : ((gpsState == 1) ? C_INFO_TEXT : C_WARN);
+                u.bg(d.gpsDot, gpsDotCol, gpsDotCol, 0f, 4f);
+                setTextIfChanged(d.gpsChipText, formatGpsChipText(st, now));
+
                 String ip = readWlanIpv4();
                 boolean apMode = isSoftApMode(ip);
                 String radioName = apMode ? "핫스팟(AP)" : (ip.isEmpty() ? "무선 꺼짐" : "WiFi(Client)");
@@ -5065,8 +5364,12 @@ public class CarrotBridgeMain {
                     setTextIfChanged(d.crossroad, cleanGuideText(pkt.szTBTMainText));
                     int bg = st != null ? st.tbtBarGraph : -1;
                     setBar(d.barFill, d.barRest, bg >= 0 ? bg : 0);
-                    setTextIfChanged(d.nextText, (pkt.nTBTTurnTypeNext >= 0 && pkt.nTBTDistNext > 0)
-                            ? describeTurnType(pkt.nTBTTurnTypeNext) + " · " + fmtDist(pkt.nTBTDistNext) : "-");
+                    if (pkt.nTBTDistNext > 0) {
+                        String nextLabel = pkt.nextTurnKnown ? describeTurnType(pkt.nTBTTurnTypeNext) : "다음 구간";
+                        setTextIfChanged(d.nextText, nextLabel + " · " + fmtDist(pkt.nTBTDistNext));
+                    } else {
+                        setTextIfChanged(d.nextText, "-");
+                    }
                     if (pkt.nGoPosDist > 0) {
                         String dest = String.format(Locale.US, "%.1f km", pkt.nGoPosDist / 1000.0);
                         if (pkt.nGoPosTime > 0) dest += " · " + Math.max(1, pkt.nGoPosTime / 60) + "분";
@@ -5144,6 +5447,9 @@ public class CarrotBridgeMain {
                 }
                 if (paused) radio += " · 핫스팟 자동 유지 일시중지";
                 setTextIfChanged(d.radioText, radio);
+
+                setTextIfChanged(d.gpsValue, formatGpsDetailText(st, now));
+                setTextColor(d.gpsValue, gpsValCol);
 
                 styleSegment(u, d.segAp, "ap".equals(bootMode));
                 styleSegment(u, d.segWifi, "wifi".equals(bootMode));
@@ -6246,6 +6552,89 @@ public class CarrotBridgeMain {
         }
         if (!"".equals(StatusDashboardOverlay.cleanGuideText("Unknown display type(0x72)"))) {
             throw new AssertionError("cleanGuideText must suppress Unknown display type fallback");
+        }
+
+        // 8. Test v1.3.1 0.0km blink / SubInfo2 wipeout guards, OSRM 2nd-turn inference, & GPS/DR status
+        if (parseDumpsysSubInfoDistMeters("6.1 METER", 400) != 6100
+                || parseDumpsysSubInfoDistMeters("6.0 METER", 400) != 6000
+                || parseDumpsysSubInfoDistMeters("50.0 METER", 50) != 50
+                || parseDumpsysSubInfoDistMeters("12.4 KILO-METER", 400) != 12400) {
+            throw new AssertionError("parseDumpsysSubInfoDistMeters unit-label repair mismatch");
+        }
+
+        NavState stBlink = new NavState();
+        long tBlink = System.currentTimeMillis();
+        parseLogcatLine("BrdCast: com.mnsoft.navi.GuidStatus Bundle[{bGuid=true}]", stBlink, null, tBlink);
+        parseLogcatLine("I/Java_Layer( 1370): [Cluster] [IL TBT Info - 0x4E] Distance = 60.0 m", stBlink, null, tBlink);
+        parseLogcatLine("D/NavigationCluster( 1370): updateTBTSubInfo() distance: 6.1 unit: 1 arrivalTimeType: 1 hour: 8 min: 30", stBlink, null, tBlink);
+        parseLogcatLine("D/ClusterService(  632): NaviCluster.updateTBTSubInfo2C() distToPoint1_unit: 0 distToPoint1_F: 0 distToPoint1_I: 60 distToPoint2_unit: 0 distToPoint2_F: 0 distToPoint2_I: 300", stBlink, null, tBlink);
+        parseDumpsysCluster(
+                "Navigation Cluster:\n  OperationStatus = 1\n  TBT SubInfo:\n    distance      = 6.1 METER\n    minutes       = 30\n    time type     = 1\n  TBT SubInfo2:\n    next 1        = 0.0 DISTANCE NONE\n    next 2        = 0.0 DISTANCE NONE\n",
+                stBlink, tBlink + 500L);
+        if (stBlink.remainDistM != 6100 || stBlink.subInfo2Dist2M != 300) {
+            throw new AssertionError("Fresh logcat SubInfo/SubInfo2 overwritten by dumpsys: remain="
+                    + stBlink.remainDistM + " sub2=" + stBlink.subInfo2Dist2M);
+        }
+
+        double dLatStep = 50.0 / 111320.0;
+        double dLonStep = 50.0 / (111320.0 * Math.cos(Math.toRadians(37.5)));
+        List<double[]> rightPoly = new ArrayList<double[]>();
+        List<double[]> leftPoly = new ArrayList<double[]>();
+        for (int k = 0; k <= 5; k++) {
+            double[] p = new double[]{127.0, 37.5 + k * dLatStep};
+            rightPoly.add(p);
+            leftPoly.add(p);
+        }
+        for (int k = 1; k <= 5; k++) {
+            rightPoly.add(new double[]{127.0 + k * dLonStep, 37.5 + 5 * dLatStep});
+            leftPoly.add(new double[]{127.0 - k * dLonStep, 37.5 + 5 * dLatStep});
+        }
+        if (inferTurnTypeAtDistanceFromPolyline(37.5, 127.0, rightPoly, 250.0) != 13
+                || inferTurnTypeAtDistanceFromPolyline(37.5, 127.0, leftPoly, 250.0) != 12) {
+            throw new AssertionError("OSRM 2nd-turn polyline angle inference mismatch");
+        }
+        try {
+            latestRoutePolyline = Collections.emptyList();
+            stBlink.lat = 37.5;
+            stBlink.lon = 127.0;
+            stBlink.lastGpsFixMs = tBlink + 500L;
+            stBlink.subInfo2Dist2M = 190;
+            CarrotPacket pktUnknownNext = buildCarrotPacket(stBlink, tBlink + 600L);
+            if (pktUnknownNext.nextTurnKnown || pktUnknownNext.nTBTTurnTypeNext != 51) {
+                throw new AssertionError("Unknown 2nd turn must mark nextTurnKnown=false");
+            }
+            latestRoutePolyline = rightPoly;
+            CarrotPacket pktInferredNext = buildCarrotPacket(stBlink, tBlink + 700L);
+            if (!pktInferredNext.nextTurnKnown || pktInferredNext.nTBTTurnTypeNext != 13) {
+                throw new AssertionError("Inferred 2nd turn from OSRM polyline must mark right (13): " + pktInferredNext.nTBTTurnTypeNext);
+            }
+        } finally {
+            latestRoutePolyline = Collections.emptyList();
+        }
+
+        NavState stGpsUi = new NavState();
+        long tGpsUi = System.currentTimeMillis();
+        applyLocationValues(stGpsUi, 36.63581, 127.48952, 83.0f, 0.0f, 10.0f, 0L, 0L, "gps", tGpsUi, null, 3, 0);
+        if (getGpsStatusState(stGpsUi, tGpsUi + 100L) != 2
+                || !"GPS 위성(3D)".equals(formatGpsChipText(stGpsUi, tGpsUi + 100L))
+                || !formatGpsDetailText(stGpsUi, tGpsUi + 100L).startsWith("위성(3D) · ")) {
+            throw new AssertionError("GPS 3D UI status mismatch: " + formatGpsDetailText(stGpsUi, tGpsUi + 100L));
+        }
+        applyLocationValues(stGpsUi, 36.65120, 127.51200, 240.0f, 0.0f, 10.0f, 0L, 0L, "gps", tGpsUi, null, 0, 1);
+        parseDumpsysCluster("STD SEG E Info:\n  Tunnel = 1\n", stGpsUi, tGpsUi + 50L);
+        if (getGpsStatusState(stGpsUi, tGpsUi + 100L) != 1
+                || !"GPS 터널 DR".equals(formatGpsChipText(stGpsUi, tGpsUi + 100L))
+                || !formatGpsDetailText(stGpsUi, tGpsUi + 100L).startsWith("터널 DR 보정 · ")) {
+            throw new AssertionError("Tunnel DR UI status mismatch: " + formatGpsDetailText(stGpsUi, tGpsUi + 100L));
+        }
+        stGpsUi.inTunnel = false;
+        if (!"GPS 추측(DR)".equals(formatGpsChipText(stGpsUi, tGpsUi + 100L))) {
+            throw new AssertionError("Urban DR chip text mismatch");
+        }
+        if (getGpsStatusState(stGpsUi, tGpsUi + 5000L) != 0
+                || !"GPS 대기 중".equals(formatGpsChipText(stGpsUi, tGpsUi + 5000L))
+                || !"수신 대기 중".equals(formatGpsDetailText(stGpsUi, tGpsUi + 5000L))) {
+            throw new AssertionError("Stale GPS waiting UI status mismatch");
         }
 
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());
