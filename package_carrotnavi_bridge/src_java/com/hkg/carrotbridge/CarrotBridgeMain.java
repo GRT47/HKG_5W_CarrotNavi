@@ -68,7 +68,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.3.3";
+    public static final String BRIDGE_VERSION = "1.3.4";
     public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
@@ -1245,6 +1245,97 @@ public class CarrotBridgeMain {
             return String.format(Locale.US, "%s · %.4f, %.4f · %.0f°",
                     modeLabel, st.lat, st.lon, normalizeHeadingDeg(st.headingDeg));
         }
+    }
+
+    // ---- Dashboard v2 GPS texts (top chip / connection tile / settings diagnostics) ----
+
+    private static String gpsStateLabelLocked(NavState st, int state) {
+        if (state == 2) return st.gpsFixStatus == 2 ? "위성 2D" : "위성 3D";
+        if (state == 1) return st.inTunnel ? "터널 DR" : "추측 DR";
+        return "대기 중";
+    }
+
+    /** Top chip: satellites used in the fix ("9기"), or "--" without fresh satellite data. */
+    public static String formatGpsSatUsedText(NavState st, long nowMs) {
+        if (st == null) return "--";
+        synchronized (st) {
+            if (!isSatFreshLocked(st, nowMs) || st.gpsSatUsed < 0) return "--";
+            return st.gpsSatUsed + "기";
+        }
+    }
+
+    /** Connection tile value: "위성 3D · 9기" / "터널 DR · 0기" / "대기 중 · 0/5기". */
+    public static String formatGpsTileValue(NavState st, long nowMs) {
+        if (st == null) return "대기 중";
+        synchronized (st) {
+            int state = getGpsStatusState(st, nowMs);
+            String label = gpsStateLabelLocked(st, state);
+            if (!isSatFreshLocked(st, nowMs) || st.gpsSatUsed < 0) return label;
+            if (state == 0 && st.gpsSatInView > 0) return label + " · " + st.gpsSatUsed + "/" + st.gpsSatInView + "기";
+            return label + " · " + st.gpsSatUsed + "기";
+        }
+    }
+
+    /** Connection tile sub line. */
+    public static String formatGpsTileSub(NavState st, long nowMs) {
+        if (st == null) return "위성 신호를 기다리는 중";
+        synchronized (st) {
+            int state = getGpsStatusState(st, nowMs);
+            boolean satFresh = isSatFreshLocked(st, nowMs);
+            if (state == 1) return "차속과 방향으로 위치 추정";
+            if (state == 0) {
+                return (satFresh && st.gpsSatInView > 0)
+                        ? ("관측 " + st.gpsSatInView + "기 · 위치 고정 전") : "위성 신호를 기다리는 중";
+            }
+            if (!satFresh || st.gpsSatUsed < 0) {
+                return String.format(Locale.US, "%.4f, %.4f", st.lat, st.lon);
+            }
+            StringBuilder sb = new StringBuilder("사용 ").append(st.gpsSatUsed);
+            if (st.gpsSatInView > 0) sb.append(" / 관측 ").append(Math.max(st.gpsSatUsed, st.gpsSatInView));
+            sb.append("기");
+            if (st.gpsMaxSnr > 0f) sb.append(" · 최대 신호 ").append(Math.round(st.gpsMaxSnr)).append(" dB");
+            return sb.toString();
+        }
+    }
+
+    /** Connection tile meter: satellites used / in view, 0..100. */
+    public static int gpsSatMeterPct(NavState st, long nowMs) {
+        if (st == null) return 0;
+        synchronized (st) {
+            if (!isSatFreshLocked(st, nowMs) || st.gpsSatUsed <= 0) return 0;
+            int view = Math.max(st.gpsSatUsed, st.gpsSatInView);
+            return view > 0 ? Math.min(100, st.gpsSatUsed * 100 / view) : 0;
+        }
+    }
+
+    /** Settings diagnostics: "위성 3D · 사용 9 / 관측 13기 · 41 dB-Hz". */
+    public static String formatGpsDiagStatus(NavState st, long nowMs) {
+        if (st == null) return "대기 중";
+        synchronized (st) {
+            int state = getGpsStatusState(st, nowMs);
+            String label = gpsStateLabelLocked(st, state);
+            if (!isSatFreshLocked(st, nowMs) || st.gpsSatUsed < 0) return label;
+            StringBuilder sb = new StringBuilder(label).append(" · 사용 ").append(st.gpsSatUsed);
+            if (st.gpsSatInView > 0) sb.append(" / 관측 ").append(Math.max(st.gpsSatUsed, st.gpsSatInView));
+            sb.append("기");
+            if (st.gpsMaxSnr > 0f) sb.append(" · ").append(Math.round(st.gpsMaxSnr)).append(" dB-Hz");
+            return sb.toString();
+        }
+    }
+
+    /** Settings diagnostics: "36.6358, 127.4895 · 83°", or "-" while waiting for a fix. */
+    public static String formatGpsPosition(NavState st, long nowMs) {
+        if (st == null) return "-";
+        synchronized (st) {
+            if (getGpsStatusState(st, nowMs) == 0) return "-";
+            return String.format(Locale.US, "%.4f, %.4f · %.0f°", st.lat, st.lon, normalizeHeadingDeg(st.headingDeg));
+        }
+    }
+
+    /** Dashboard v2 overall health chip: 0 = 정상, 1 = 확인 필요 (콤마 미연결 or GPS 대기), 2 = 전송 꺼짐. */
+    static int computeDashHealth(boolean txOn, boolean commaAlive, int gpsState) {
+        if (!txOn) return 2;
+        return (!commaAlive || gpsState == 0) ? 1 : 0;
     }
 
     public static void applySvStatus(
@@ -4694,6 +4785,8 @@ public class CarrotBridgeMain {
         private static volatile String actionBannerMsg = "";
         private static volatile long lastSysBadgeMs = 0L;
         private static volatile String cachedSysBadgeText = "CPU --   RAM --";
+        private static volatile String cachedCpuText = "--";
+        private static volatile String cachedRamText = "--";
         private static volatile long lastCpuTotalTicks = 0L;
         private static volatile long lastCpuIdleTicks = 0L;
         private static volatile int lastCpuLoadPct = 0;
@@ -4944,23 +5037,40 @@ public class CarrotBridgeMain {
         private static final int G_LEFT_CV = 0x13;
         private static final int G_RIGHT_CV = 0x15;
 
-        /** Views of the dashboard that change on refresh (null while hidden). */
+        /** Views of the dashboard that change on refresh (null while hidden). Dashboard v2: 상태 / 설정 tabs. */
         private static final class Dash {
             Object root;
-            Object versionPill, bridgeDot, bridgeText, commaDot, commaText, gpsDot, gpsChipText, modeChipText, sysText, countdownBtn, countdownIcon, countdownText;
+            // Top bar
+            Object versionPill, tabStatus, tabSettings;
+            Object commaChip, commaChipIcon, commaChipText;
+            Object gpsChip, gpsChipIcon, gpsChipText;
+            Object radioChip, radioChipIcon, radioChipText;
+            Object healthChip, healthDot, healthText;
+            Object countdownBtn, countdownIcon, countdownText;
+            Object statusBody, settingsBody;
+            // 상태 tab: route guidance
             Object guideBadge, guideBlock, emptyBlock, turnIcon, turnDist, turnUnit, turnName, crossroad;
             Object barFill, barRest, nextText, destText;
+            // 상태 tab: speed & enforcement
             Object limitText, roadTypeText, speedText;
             Object camBlock, camIcon, camTitle, camLimit, camDist, camBarFill, camBarRest;
             Object secBlock, secLimit, secRemain, secRemainUnit, secAvg;
             Object noEnfBlock;
-            Object ipText, commaValue, targetsText, radioText, gpsValue;
-            Object segAp, segWifi, segOff;
-            Object txTrack;
+            // 상태 tab: connection tiles
+            Object commaTileIcon, commaTileValue, commaTileSub;
+            Object gpsTileIcon, gpsTileValue, gpsTileSub, gpsMeterFill, gpsMeterRest;
+            Object radioTileIcon, radioTileValue, radioTileSub;
+            // 설정 tab
+            Object segAp, segWifi, segOff, modeDesc, txTrack, updateHint;
+            Object diagIp, diagComma, diagTargets, diagRoute, diagGpsStatus, diagGpsPos, diagRadio, diagBridge, diagCpu, diagRam;
             Object messageText;
+            String tab = "status";
             int countdownStyleState = -1;
             String turnIconKey = "";
             String camIconKey = "";
+            // Cached "iconKey#tone" so drawables are only rebuilt when a state actually changes
+            String commaChipKey = "", gpsChipKey = "", radioChipKey = "", healthKey = "";
+            String commaTileKey = "", gpsTileKey = "", radioTileKey = "", gpsDiagKey = "";
         }
 
         private static volatile Dash dash = null;
@@ -5111,12 +5221,15 @@ public class CarrotBridgeMain {
             if ("camera".equals(key)) return "M5 7 L15 7 Q17 7 17 9 L17 15 Q17 17 15 17 L5 17 Q3 17 3 15 L3 9 Q3 7 5 7 Z M17 10 L21 8 L21 16 L17 14";
             if ("section".equals(key)) return "M4 18 L20 18 M4 14 L4 22 M20 14 L20 22 M8 10 L12 4 L16 10";
             if ("bump".equals(key)) return "M2 18 L7 18 Q12 8 17 18 L22 18";
+            if ("comma".equals(key)) return "M4 12 L20 4 L14 20 L11 13 Z";
+            if ("satellite".equals(key)) return "M5 9 L9 5 L13 9 L9 13 Z M11 15 L15 11 L19 15 L15 19 Z M11 9 L13 11 M4 20 Q7.5 19 8 16";
+            if ("chevron".equals(key)) return "M9 6 L15 12 L9 18";
             return "M12 21 L12 4 M6 10 L12 4 L18 10"; // straight
         }
 
         static final String[] ICON_KEYS = {"right", "left", "slight_right", "slight_left", "uturn", "roundabout", "flag",
                 "toll", "nav", "wifi", "wifi_small", "hotspot", "sliders", "refresh", "download", "close", "pause", "play",
-                "camera", "section", "bump", "straight"};
+                "camera", "section", "bump", "comma", "satellite", "chevron", "straight"};
 
         /**
          * Parses an icon spec into {Character cmd, float[] args} entries (absolute coords on a 24x24 grid).
@@ -5301,24 +5414,17 @@ public class CarrotBridgeMain {
             setVisible(fill, p > 0);
         }
 
-        private static Object[] makeChip(U u, Object parent, String iconKey, int iconColor, boolean last) throws Exception {
-            Object chip = u.ll(0, G_CV);
-            u.bg(chip, C_CHIP, C_BORDER, 1f, 15f);
-            u.pad(chip, 10f, 0f, 10f, 0f);
-            Object lead;
-            if (iconKey != null) {
-                lead = u.icon(iconKey, iconColor, 2f);
-                u.add(chip, lead, 14f, 14f);
-            } else {
-                lead = u.view();
-                u.bg(lead, C_OK, C_OK, 0f, 4f);
-                u.add(chip, lead, 8f, 8f);
-            }
-            Object text = u.text("", 12.5f, C_TEXT, false);
-            u.add(chip, text, WRAP, WRAP, 0f, 6f, 0f, 0f, 0f);
-            u.add(parent, chip, WRAP, 30f, 0f, 0f, 0f, last ? 0f : 6f, 0f);
-            return new Object[]{lead, text};
-        }
+        // Status tones {foreground, background, border}: 정상 (green) / 추측항법·무선 (blue) / 확인 필요 (amber) / 꺼짐 (grey)
+        private static final int TONE_OK = 0;
+        private static final int TONE_INFO = 1;
+        private static final int TONE_WARN = 2;
+        private static final int TONE_OFF = 3;
+        private static final int[][] TONES = {
+                {C_OK, 0xFF0F2A22, 0xFF1F5A45},
+                {C_INFO, 0xFF0E2233, 0xFF1D4A66},
+                {C_WARN, 0xFF2A2112, 0xFF6B4F16},
+                {C_FAINT, C_BTN, C_OFF}
+        };
 
         private static Object[] makeBar(U u, Object parent, float heightDp, int fillColor, float marginTop) throws Exception {
             Object track = u.ll(0, 0);
@@ -5332,19 +5438,11 @@ public class CarrotBridgeMain {
             return new Object[]{fill, rest};
         }
 
-        private static Object makeKvRow(U u, Object parent, String label, float marginTop) throws Exception {
-            Object row = u.ll(0, G_CV);
-            u.add(row, u.text(label, 13.5f, C_MUTED, false), WRAP, WRAP);
-            Object value = u.singleLine(u.gravity(u.text("-", 13.5f, C_TEXT, false), G_RIGHT_CV));
-            u.add(row, value, 0f, WRAP, 1f, 10f, 0f, 0f, 0f);
-            u.add(parent, row, MATCH, WRAP, 0f, 0f, marginTop, 0f, 0f);
-            return value;
-        }
-
-        private static Object makeSegment(U u, Object parent, String label, boolean first, Runnable action) throws Exception {
-            Object seg = u.gravity(u.text(label, 13.5f, C_TEXT_2, false), G_CENTER);
+        private static Object makeSegment(U u, Object parent, String label, float heightDp, float textSp,
+                                          boolean first, Runnable action) throws Exception {
+            Object seg = u.gravity(u.text(label, textSp, C_TEXT_2, false), G_CENTER);
             attachClickListener(seg, action);
-            u.add(parent, seg, 0f, 36f, 1f, first ? 0f : 4f, 0f, 0f, 0f);
+            u.add(parent, seg, 0f, heightDp, 1f, first ? 0f : 4f, 0f, 0f, 0f);
             return seg;
         }
 
@@ -5359,25 +5457,127 @@ public class CarrotBridgeMain {
             setBold(seg, active);
         }
 
-        private static void makeActionButton(U u, Object parent, String iconKey, int iconColor, String label,
-                                             boolean first, Runnable action) throws Exception {
-            Object btn = u.ll(0, G_CENTER);
-            u.bg(btn, C_BTN, C_BORDER_STRONG, 1f, 14f);
+        /** Top-bar status chip: tone-colored icon + short value (콤마 IP / GPS 위성 수 / 핫스팟·WiFi). */
+        private static Object[] makeStatusChip(U u, Object parent, String iconKey) throws Exception {
+            Object chip = u.ll(0, G_CV);
+            u.pad(chip, 9f, 0f, 11f, 0f);
+            Object icon = u.icon(iconKey, C_FAINT, 2f);
+            u.add(chip, icon, 20f, 20f);
+            Object text = u.text("", 13f, C_FAINT, true);
+            u.add(chip, text, WRAP, WRAP, 0f, 6f, 0f, 0f, 0f);
+            u.add(parent, chip, WRAP, 36f, 0f, 0f, 0f, 6f, 0f);
+            return new Object[]{chip, icon, text};
+        }
+
+        /** Restyles a status chip only when its icon or tone changed; returns the new cache key. */
+        private static String applyChipTone(U u, Object chip, Object icon, Object text, String iconKey, int tone,
+                                            String prevKey) throws Exception {
+            String key = iconKey + "#" + tone;
+            if (!key.equals(prevKey)) {
+                int[] t = TONES[tone];
+                u.bg(chip, t[1], t[2], 1f, 10f);
+                setIconDrawable(icon, iconKey, t[0], 2f);
+                setTextColor(text, t[0]);
+            }
+            return key;
+        }
+
+        /** 상태 tab connection tile: icon box + label / value / sub line (+ optional satellite meter). */
+        private static Object[] makeConnTile(U u, Object parent, String label, String iconKey, boolean withMeter,
+                                             float marginTop) throws Exception {
+            Object tile = u.inset(0);
+            u.pad(tile, 14f, 12f, 14f, 12f);
+            Object box = u.ll(0, G_CENTER);
+            u.bg(box, C_BTN, C_BTN, 0f, 12f);
+            Object icon = u.icon(iconKey, C_FAINT, 2f);
+            u.add(box, icon, 22f, 22f);
+            u.add(tile, box, 42f, 42f);
+            Object col = u.ll(1, 0);
+            u.add(col, u.text(label, 12f, C_MUTED, false), WRAP, WRAP);
+            Object value = u.singleLine(u.text("-", 19f, C_TEXT, true));
+            u.add(col, value, MATCH, WRAP, 0f, 0f, 3f, 0f, 0f);
+            Object sub = u.singleLine(u.text("", 13f, C_MUTED, false));
+            u.add(col, sub, MATCH, WRAP, 0f, 0f, 3f, 0f, 0f);
+            Object[] meter = withMeter ? makeBar(u, col, 6f, C_OK, 6f) : new Object[]{null, null};
+            u.add(tile, col, 0f, WRAP, 1f, 12f, 0f, 0f, 0f);
+            u.add(parent, tile, MATCH, WRAP, 0f, 0f, marginTop, 0f, 0f);
+            return new Object[]{icon, value, sub, meter[0], meter[1]};
+        }
+
+        /** 설정 tab diagnostics row (label left, value right) with a hairline divider below. */
+        private static Object makeDiagRow(U u, Object parent, String label) throws Exception {
+            Object row = u.ll(0, G_CV);
+            u.pad(row, 0f, 6f, 0f, 6f);
+            u.add(row, u.text(label, 14f, C_MUTED, false), WRAP, WRAP);
+            Object value = u.singleLine(u.gravity(u.text("-", 14f, C_TEXT, false), G_RIGHT_CV));
+            u.add(row, value, 0f, WRAP, 1f, 12f, 0f, 0f, 0f);
+            u.add(parent, row, MATCH, WRAP);
+            Object line = u.view();
+            Class.forName("android.view.View").getMethod("setBackgroundColor", int.class).invoke(line, C_DIVIDER);
+            u.add(parent, line, MATCH, 1f);
+            return value;
+        }
+
+        /** 설정 tab shortcut: icon + label + trailing chevron (hint == null) or a short muted hint. */
+        private static Object makeShortcutButton(U u, Object parent, String iconKey, int iconColor, String label,
+                                                 String hint, boolean first, Runnable action) throws Exception {
+            Object btn = u.ll(0, G_CV);
+            u.bg(btn, C_BTN, C_BORDER_STRONG, 1f, 12f);
+            u.pad(btn, 14f, 0f, 14f, 0f);
             u.add(btn, u.icon(iconKey, iconColor, 2f), 20f, 20f);
-            u.add(btn, u.text(label, 15f, C_TEXT, true), WRAP, WRAP, 0f, 8f, 0f, 0f, 0f);
+            u.add(btn, u.singleLine(u.text(label, 15f, C_TEXT, true)), 0f, WRAP, 1f, 10f, 0f, 8f, 0f);
+            Object trailing;
+            if (hint == null) {
+                trailing = u.icon("chevron", C_FAINT, 2f);
+                u.add(btn, trailing, 16f, 16f);
+            } else {
+                trailing = u.text(hint, 12f, C_MUTED, false);
+                u.add(btn, trailing, WRAP, WRAP);
+            }
             attachClickListener(btn, action);
-            u.add(parent, btn, 0f, 50f, 1f, first ? 0f : 10f, 0f, 0f, 0f);
+            u.add(parent, btn, MATCH, 50f, 0f, 0f, first ? 0f : 8f, 0f, 0f);
+            return trailing;
+        }
+
+        private static Object makeCard(U u, Object parent, float weight, boolean last) throws Exception {
+            Object c = u.ll(1, 0);
+            u.bg(c, C_CARD, C_BORDER, 1f, 18f);
+            u.pad(c, 20f, 18f, 20f, 18f);
+            u.add(parent, c, 0f, MATCH, weight, 0f, 0f, last ? 0f : 14f, 0f);
+            return c;
+        }
+
+        private static void applyTab(U u, Dash d) throws Exception {
+            boolean status = "status".equals(d.tab);
+            styleSegment(u, d.tabStatus, status);
+            styleSegment(u, d.tabSettings, !status);
+            setVisible(d.statusBody, status);
+            setVisible(d.settingsBody, !status);
+        }
+
+        private static void selectTabFromUi(String tab) {
+            Dash d = dash;
+            if (d == null || tab.equals(d.tab)) return;
+            d.tab = tab;
+            try {
+                applyTab(new U(sysContext), d);
+            } catch (Throwable t) {
+                System.out.println("[CarrotBridge] Dashboard tab switch error: " + t);
+            }
+            actionBannerMsg = "";
+            refreshOnUiThread();
         }
 
         private static Object buildDashboard(final Dash d) throws Exception {
             final U u = new U(sysContext);
+            Method setBgColor = Class.forName("android.view.View").getMethod("setBackgroundColor", int.class);
 
             Object root = u.ll(1, 0);
-            Class.forName("android.view.View").getMethod("setBackgroundColor", int.class).invoke(root, C_BG);
+            setBgColor.invoke(root, C_BG);
             disableViewEffects(root, true);
             d.root = root;
 
-            // ---------------- Top bar (56dp) ----------------
+            // ================= Top bar (56dp) =================
             Object top = u.ll(0, G_CV);
             u.pad(top, 20f, 0f, 16f, 0f);
             u.add(root, top, MATCH, 56f);
@@ -5386,43 +5586,67 @@ public class CarrotBridgeMain {
             u.bg(logo, C_ACCENT, C_ACCENT, 0f, 9f);
             u.add(logo, u.icon("nav", C_ON_ACCENT, 2.4f), 18f, 18f);
             u.add(top, logo, 32f, 32f);
-            u.add(top, u.text("CarrotNavi Bridge", 18f, C_TEXT, true), WRAP, WRAP, 0f, 10f, 0f, 0f, 0f);
+            u.add(top, u.text("CarrotNavi Bridge", 18f, C_TEXT, true), WRAP, WRAP, 0f, 12f, 0f, 0f, 0f);
             d.versionPill = u.text("v" + BRIDGE_VERSION, 12f, C_MUTED, false);
             u.bg(d.versionPill, C_BG, C_BORDER_STRONG, 1f, 11f);
             u.pad(d.versionPill, 9f, 3f, 9f, 3f);
-            u.add(top, d.versionPill, WRAP, WRAP, 0f, 10f, 0f, 0f, 0f);
+            u.add(top, d.versionPill, WRAP, WRAP, 0f, 12f, 0f, 0f, 0f);
 
-            Object chips = u.ll(0, G_CV);
-            u.add(top, chips, 0f, WRAP, 1f, 14f, 0f, 12f, 0f);
-            Object[] bridgeChip = makeChip(u, chips, null, 0, false);
-            d.bridgeDot = bridgeChip[0];
-            d.bridgeText = bridgeChip[1];
-            Object[] commaChip = makeChip(u, chips, null, 0, false);
-            d.commaDot = commaChip[0];
-            d.commaText = commaChip[1];
-            Object[] gpsChip = makeChip(u, chips, null, 0, false);
-            d.gpsDot = gpsChip[0];
-            d.gpsChipText = gpsChip[1];
-            setBold(d.gpsChipText, true);
-            Object[] modeChip = makeChip(u, chips, "wifi_small", C_INFO, true);
-            d.modeChipText = modeChip[1];
+            Object tabs = u.ll(0, G_CV);
+            u.bg(tabs, C_INSET, C_BORDER, 1f, 12f);
+            u.pad(tabs, 4f, 4f, 4f, 4f);
+            d.tabStatus = makeSegment(u, tabs, "상태", 36f, 15f, true, new Runnable() {
+                @Override
+                public void run() {
+                    selectTabFromUi("status");
+                }
+            });
+            d.tabSettings = makeSegment(u, tabs, "설정", 36f, 15f, false, new Runnable() {
+                @Override
+                public void run() {
+                    selectTabFromUi("settings");
+                }
+            });
+            u.add(top, tabs, 196f, WRAP, 0f, 28f, 0f, 0f, 0f);
 
-            d.sysText = u.text("", 13f, C_MUTED, false);
-            u.add(top, d.sysText, WRAP, WRAP, 0f, 0f, 0f, 10f, 0f);
+            u.add(top, u.view(), 0f, 1f, 1f, 0f, 0f, 0f, 0f); // spacer
+
+            Object[] commaChip = makeStatusChip(u, top, "comma");
+            d.commaChip = commaChip[0];
+            d.commaChipIcon = commaChip[1];
+            d.commaChipText = commaChip[2];
+            Object[] gpsChip = makeStatusChip(u, top, "satellite");
+            d.gpsChip = gpsChip[0];
+            d.gpsChipIcon = gpsChip[1];
+            d.gpsChipText = gpsChip[2];
+            Object[] radioChip = makeStatusChip(u, top, "hotspot");
+            d.radioChip = radioChip[0];
+            d.radioChipIcon = radioChip[1];
+            d.radioChipText = radioChip[2];
+
+            d.healthChip = u.ll(0, G_CV);
+            u.pad(d.healthChip, 14f, 0f, 14f, 0f);
+            d.healthDot = u.view();
+            u.add(d.healthChip, d.healthDot, 10f, 10f);
+            d.healthText = u.text("", 14f, C_TEXT_2, true);
+            u.add(d.healthChip, d.healthText, WRAP, WRAP, 0f, 8f, 0f, 0f, 0f);
+            u.add(top, d.healthChip, WRAP, 36f, 0f, 6f, 0f, 0f, 0f);
+
             d.countdownBtn = u.ll(0, G_CENTER);
             u.bg(d.countdownBtn, C_BTN, C_BORDER_STRONG, 1f, 11f);
-            u.pad(d.countdownBtn, 10f, 0f, 11f, 0f);
+            u.pad(d.countdownBtn, 10f, 0f, 12f, 0f);
             d.countdownIcon = u.icon("pause", C_MUTED, 2.2f);
             u.add(d.countdownBtn, d.countdownIcon, 13f, 13f);
-            d.countdownText = u.text("", 12.5f, C_TEXT_2, true);
-            u.add(d.countdownBtn, d.countdownText, WRAP, WRAP, 0f, 5f, 0f, 0f, 0f);
+            d.countdownText = u.text("", 13f, C_TEXT_2, true);
+            u.add(d.countdownBtn, d.countdownText, WRAP, WRAP, 0f, 6f, 0f, 0f, 0f);
             attachClickListener(d.countdownBtn, false, new Runnable() {
                 @Override
                 public void run() {
                     toggleAutoClosePauseFromUi();
                 }
             });
-            u.add(top, d.countdownBtn, WRAP, 36f, 0f, 0f, 0f, 10f, 0f);
+            u.add(top, d.countdownBtn, WRAP, 36f, 0f, 12f, 0f, 0f, 0f);
+
             Object closeBtn = u.ll(0, G_CENTER);
             u.bg(closeBtn, C_BTN, C_BORDER_STRONG, 1f, 12f);
             u.add(closeBtn, u.icon("close", C_TEXT, 2.2f), 20f, 20f);
@@ -5432,256 +5656,289 @@ public class CarrotBridgeMain {
                     hide();
                 }
             });
-            u.add(top, closeBtn, 44f, 44f);
+            u.add(top, closeBtn, 44f, 44f, 0f, 12f, 0f, 0f, 0f);
 
             Object divider = u.view();
-            Class.forName("android.view.View").getMethod("setBackgroundColor", int.class).invoke(divider, C_DIVIDER);
+            setBgColor.invoke(divider, C_DIVIDER);
             u.add(root, divider, MATCH, 1f);
 
-            // ---------------- Body: 3 cards (1.45 : 1 : 1.12) ----------------
-            Object body = u.ll(0, 0);
-            u.pad(body, 20f, 14f, 20f, 0f);
-            u.add(root, body, MATCH, 0f, 1f, 0f, 0f, 0f, 0f);
+            // ================= 상태 tab (1.5 : 1 : 0.95) =================
+            d.statusBody = u.ll(0, 0);
+            u.pad(d.statusBody, 20f, 14f, 20f, 0f);
+            u.add(root, d.statusBody, MATCH, 0f, 1f, 0f, 0f, 0f, 0f);
 
-            // Card 1: route guidance
-            Object card1 = u.card();
-            u.add(body, card1, 0f, MATCH, 1.45f, 0f, 0f, 14f, 0f);
-            Object c1Head = u.ll(0, G_CV);
-            u.add(c1Head, u.text("경로 안내", 13f, C_MUTED, true), 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
+            // Card A: route guidance
+            Object cardA = makeCard(u, d.statusBody, 1.5f, false);
+            Object aHead = u.ll(0, G_CV);
+            u.add(aHead, u.text("경로 안내", 13f, C_MUTED, true), 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
             d.guideBadge = u.text("대기", 12f, C_TEXT_2, true);
             u.pad(d.guideBadge, 10f, 3f, 10f, 3f);
-            u.add(c1Head, d.guideBadge, WRAP, WRAP);
-            u.add(card1, c1Head, MATCH, WRAP);
+            u.add(aHead, d.guideBadge, WRAP, WRAP);
+            u.add(cardA, aHead, MATCH, WRAP);
 
             d.guideBlock = u.ll(1, 0);
-            u.add(card1, d.guideBlock, MATCH, 0f, 1f, 0f, 12f, 0f, 0f);
+            u.add(cardA, d.guideBlock, MATCH, 0f, 1f, 0f, 16f, 0f, 0f);
             Object mainRow = u.ll(0, G_CV);
             Object tile = u.ll(0, G_CENTER);
-            u.bg(tile, C_ACCENT, C_ACCENT, 0f, 22f);
+            u.bg(tile, C_ACCENT, C_ACCENT, 0f, 26f);
             d.turnIcon = u.icon("straight", C_ON_ACCENT, 2.6f);
-            u.add(tile, d.turnIcon, 68f, 68f);
-            u.add(mainRow, tile, 112f, 112f);
+            u.add(tile, d.turnIcon, 82f, 82f);
+            u.add(mainRow, tile, 132f, 132f);
             Object turnCol = u.ll(1, 0);
             Object distRow = u.ll(0, 0x53); // BOTTOM | LEFT (baseline aligned by default)
-            d.turnDist = u.text("-", 64f, C_TEXT, true);
+            d.turnDist = u.text("-", 80f, C_TEXT, true);
             u.add(distRow, d.turnDist, WRAP, WRAP);
-            d.turnUnit = u.text("", 26f, C_TEXT_2, false);
+            d.turnUnit = u.text("", 30f, C_TEXT_2, false);
             u.add(distRow, d.turnUnit, WRAP, WRAP, 0f, 6f, 0f, 0f, 0f);
             u.add(turnCol, distRow, MATCH, WRAP);
-            d.turnName = u.singleLine(u.text("", 24f, C_TEXT, true));
+            d.turnName = u.singleLine(u.text("", 28f, C_TEXT, true));
             u.add(turnCol, d.turnName, MATCH, WRAP, 0f, 0f, 8f, 0f, 0f);
-            d.crossroad = u.singleLine(u.text("", 16f, C_MUTED, false));
+            d.crossroad = u.singleLine(u.text("", 18f, C_MUTED, false));
             u.add(turnCol, d.crossroad, MATCH, WRAP, 0f, 0f, 4f, 0f, 0f);
-            u.add(mainRow, turnCol, 0f, WRAP, 1f, 20f, 0f, 0f, 0f);
+            u.add(mainRow, turnCol, 0f, WRAP, 1f, 22f, 0f, 0f, 0f);
             u.add(d.guideBlock, mainRow, MATCH, WRAP);
-            Object[] bar = makeBar(u, d.guideBlock, 8f, C_ACCENT, 12f);
+            Object[] bar = makeBar(u, d.guideBlock, 10f, C_ACCENT, 18f);
             d.barFill = bar[0];
             d.barRest = bar[1];
             u.vSpacer(d.guideBlock);
             Object miniRow = u.ll(0, 0);
             Object nextBox = u.inset(1);
-            u.pad(nextBox, 12f, 10f, 12f, 10f);
-            u.add(nextBox, u.text("다음 안내", 12f, C_MUTED, false), WRAP, WRAP);
-            d.nextText = u.singleLine(u.text("-", 16f, C_TEXT, false));
+            u.pad(nextBox, 14f, 12f, 14f, 12f);
+            u.add(nextBox, u.text("다음 안내", 13f, C_MUTED, false), WRAP, WRAP);
+            d.nextText = u.singleLine(u.text("-", 19f, C_TEXT, false));
             u.add(nextBox, d.nextText, MATCH, WRAP, 0f, 0f, 4f, 0f, 0f);
             u.add(miniRow, nextBox, 0f, WRAP, 1f, 0f, 0f, 5f, 0f);
             Object destBox = u.inset(1);
-            u.pad(destBox, 12f, 10f, 12f, 10f);
-            u.add(destBox, u.text("목적지까지", 12f, C_MUTED, false), WRAP, WRAP);
-            d.destText = u.singleLine(u.text("-", 16f, C_TEXT, false));
+            u.pad(destBox, 14f, 12f, 14f, 12f);
+            u.add(destBox, u.text("목적지까지", 13f, C_MUTED, false), WRAP, WRAP);
+            d.destText = u.singleLine(u.text("-", 19f, C_TEXT, false));
             u.add(destBox, d.destText, MATCH, WRAP, 0f, 0f, 4f, 0f, 0f);
             u.add(miniRow, destBox, 0f, WRAP, 1f, 5f, 0f, 0f, 0f);
             u.add(d.guideBlock, miniRow, MATCH, WRAP);
 
             d.emptyBlock = u.ll(1, G_CENTER);
             Object emptyTile = u.ll(0, G_CENTER);
-            u.bg(emptyTile, C_BTN, C_BTN, 0f, 20f);
-            u.add(emptyTile, u.icon("flag", C_MUTED, 2f), 36f, 36f);
-            u.add(d.emptyBlock, emptyTile, 72f, 72f);
-            u.add(d.emptyBlock, u.text("경로 안내 없음", 20f, C_TEXT, true), WRAP, WRAP, 0f, 0f, 12f, 0f, 0f);
+            u.bg(emptyTile, C_BTN, C_BTN, 0f, 22f);
+            u.add(emptyTile, u.icon("flag", C_MUTED, 2f), 38f, 38f);
+            u.add(d.emptyBlock, emptyTile, 76f, 76f);
+            u.add(d.emptyBlock, u.text("경로 안내 없음", 22f, C_TEXT, true), WRAP, WRAP, 0f, 0f, 12f, 0f, 0f);
             u.add(d.emptyBlock, u.gravity(u.text("순정 내비에서 목적지를 설정하면 회전 안내가 표시됩니다.\n지금은 카메라와 제한속도만 전송합니다.",
-                    14f, C_MUTED, false), G_CENTER), WRAP, WRAP, 0f, 0f, 8f, 0f, 0f);
-            u.add(card1, d.emptyBlock, MATCH, 0f, 1f, 0f, 0f, 0f, 0f);
+                    15f, C_MUTED, false), G_CENTER), WRAP, WRAP, 0f, 0f, 10f, 0f, 0f);
+            u.add(cardA, d.emptyBlock, MATCH, 0f, 1f, 0f, 0f, 0f, 0f);
 
-            // Card 2: speed & enforcement
-            Object card2 = u.card();
-            u.add(body, card2, 0f, MATCH, 1f, 0f, 0f, 14f, 0f);
-            u.add(card2, u.text("속도 · 단속", 13f, C_MUTED, true), WRAP, WRAP);
+            // Card B: speed & enforcement
+            Object cardB = makeCard(u, d.statusBody, 1f, false);
+            u.add(cardB, u.text("속도 · 단속", 13f, C_MUTED, true), WRAP, WRAP);
             Object speedRow = u.ll(0, G_CV);
-            d.limitText = u.gravity(u.text("--", 36f, C_BG, true), G_CENTER);
-            u.bg(d.limitText, C_WHITE, C_SIGN_RED, 10f, 48f);
-            u.add(speedRow, d.limitText, 96f, 96f);
+            d.limitText = u.gravity(u.text("--", 46f, C_BG, true), G_CENTER);
+            u.bg(d.limitText, C_WHITE, C_SIGN_RED, 12f, 60f);
+            u.add(speedRow, d.limitText, 120f, 120f);
             Object speedCol = u.ll(1, 0);
             d.roadTypeText = u.text("제한속도", 13f, C_MUTED, false);
             u.add(speedCol, d.roadTypeText, WRAP, WRAP);
             Object spdRow = u.ll(0, 0x53);
-            d.speedText = u.text("0", 34f, C_TEXT, true);
+            d.speedText = u.text("0", 48f, C_TEXT, true);
             u.add(spdRow, d.speedText, WRAP, WRAP);
-            u.add(spdRow, u.text("km/h", 15f, C_TEXT_2, false), WRAP, WRAP, 0f, 5f, 0f, 0f, 0f);
-            u.add(speedCol, spdRow, WRAP, WRAP, 0f, 0f, 6f, 0f, 0f);
+            u.add(spdRow, u.text("km/h", 17f, C_TEXT_2, false), WRAP, WRAP, 0f, 5f, 0f, 0f, 0f);
+            u.add(speedCol, spdRow, WRAP, WRAP, 0f, 0f, 4f, 0f, 0f);
             u.add(speedCol, u.text("현재 차속", 13f, C_MUTED, false), WRAP, WRAP, 0f, 0f, 6f, 0f, 0f);
-            u.add(speedRow, speedCol, 0f, WRAP, 1f, 18f, 0f, 0f, 0f);
-            u.add(card2, speedRow, MATCH, WRAP, 0f, 0f, 14f, 0f, 0f);
-            u.vSpacer(card2);
+            u.add(speedRow, speedCol, 0f, WRAP, 1f, 20f, 0f, 0f, 0f);
+            u.add(cardB, speedRow, MATCH, WRAP, 0f, 0f, 16f, 0f, 0f);
+            u.vSpacer(cardB);
 
             d.camBlock = u.inset(1);
-            u.pad(d.camBlock, 14f, 12f, 14f, 12f);
+            u.pad(d.camBlock, 14f, 14f, 14f, 14f);
             Object camHead = u.ll(0, G_CV);
             d.camIcon = u.icon("camera", C_WARN, 2f);
             u.add(camHead, d.camIcon, 18f, 18f);
-            d.camTitle = u.singleLine(u.text("", 15f, C_TEXT, false));
+            d.camTitle = u.singleLine(u.text("", 16f, C_TEXT, false));
             u.add(camHead, d.camTitle, 0f, WRAP, 1f, 8f, 0f, 8f, 0f);
-            d.camLimit = u.text("", 15f, C_WARN, true);
+            d.camLimit = u.text("", 16f, C_WARN, true);
             u.add(camHead, d.camLimit, WRAP, WRAP);
             u.add(d.camBlock, camHead, MATCH, WRAP);
             Object camDistRow = u.ll(0, 0x53);
-            d.camDist = u.text("", 28f, C_TEXT, true);
+            d.camDist = u.text("", 32f, C_TEXT, true);
             u.add(camDistRow, d.camDist, WRAP, WRAP);
-            u.add(camDistRow, u.text("m 앞", 15f, C_TEXT_2, false), WRAP, WRAP, 0f, 4f, 0f, 0f, 0f);
+            u.add(camDistRow, u.text("m 앞", 16f, C_TEXT_2, false), WRAP, WRAP, 0f, 4f, 0f, 0f, 0f);
             u.add(d.camBlock, camDistRow, MATCH, WRAP, 0f, 0f, 8f, 0f, 0f);
             Object[] camBar = makeBar(u, d.camBlock, 6f, C_WARN, 8f);
             d.camBarFill = camBar[0];
             d.camBarRest = camBar[1];
-            u.add(card2, d.camBlock, MATCH, WRAP);
+            u.add(cardB, d.camBlock, MATCH, WRAP);
 
             d.secBlock = u.inset(1);
-            u.pad(d.secBlock, 14f, 12f, 14f, 12f);
+            u.pad(d.secBlock, 14f, 14f, 14f, 14f);
             Object secHead = u.ll(0, G_CV);
             u.add(secHead, u.icon("section", C_WARN, 2f), 18f, 18f);
-            u.add(secHead, u.text("구간단속 중", 15f, C_TEXT, false), 0f, WRAP, 1f, 8f, 0f, 8f, 0f);
-            d.secLimit = u.text("", 15f, C_WARN, true);
+            u.add(secHead, u.text("구간단속 중", 16f, C_TEXT, false), 0f, WRAP, 1f, 8f, 0f, 8f, 0f);
+            d.secLimit = u.text("", 16f, C_WARN, true);
             u.add(secHead, d.secLimit, WRAP, WRAP);
             u.add(d.secBlock, secHead, MATCH, WRAP);
             Object secStats = u.ll(0, 0);
             Object secRemainCol = u.ll(1, 0);
-            u.add(secRemainCol, u.text("남은 거리", 12f, C_MUTED, false), WRAP, WRAP);
+            u.add(secRemainCol, u.text("남은 거리", 13f, C_MUTED, false), WRAP, WRAP);
             Object secRemainRow = u.ll(0, 0x53);
-            d.secRemain = u.text("-", 22f, C_TEXT, true);
+            d.secRemain = u.text("-", 26f, C_TEXT, true);
             u.add(secRemainRow, d.secRemain, WRAP, WRAP);
-            d.secRemainUnit = u.text("", 14f, C_TEXT_2, false);
+            d.secRemainUnit = u.text("", 15f, C_TEXT_2, false);
             u.add(secRemainRow, d.secRemainUnit, WRAP, WRAP, 0f, 4f, 0f, 0f, 0f);
             u.add(secRemainCol, secRemainRow, WRAP, WRAP, 0f, 0f, 4f, 0f, 0f);
             u.add(secStats, secRemainCol, 0f, WRAP, 1f, 0f, 0f, 8f, 0f);
             Object secAvgCol = u.ll(1, 0);
-            u.add(secAvgCol, u.text("구간 평균", 12f, C_MUTED, false), WRAP, WRAP);
+            u.add(secAvgCol, u.text("구간 평균", 13f, C_MUTED, false), WRAP, WRAP);
             Object secAvgRow = u.ll(0, 0x53);
-            d.secAvg = u.text("-", 22f, C_OK, true);
+            d.secAvg = u.text("-", 26f, C_OK, true);
             u.add(secAvgRow, d.secAvg, WRAP, WRAP);
-            u.add(secAvgRow, u.text("km/h", 14f, C_TEXT_2, false), WRAP, WRAP, 0f, 4f, 0f, 0f, 0f);
+            u.add(secAvgRow, u.text("km/h", 15f, C_TEXT_2, false), WRAP, WRAP, 0f, 4f, 0f, 0f, 0f);
             u.add(secAvgCol, secAvgRow, WRAP, WRAP, 0f, 0f, 4f, 0f, 0f);
             u.add(secStats, secAvgCol, 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
             u.add(d.secBlock, secStats, MATCH, WRAP, 0f, 0f, 10f, 0f, 0f);
-            u.add(card2, d.secBlock, MATCH, WRAP);
+            u.add(cardB, d.secBlock, MATCH, WRAP);
 
             d.noEnfBlock = u.inset(1);
-            u.pad(d.noEnfBlock, 14f, 14f, 14f, 14f);
-            u.add(d.noEnfBlock, u.gravity(u.text("감지된 단속 카메라 없음", 14f, C_MUTED, false), G_CENTER), MATCH, WRAP);
-            u.add(card2, d.noEnfBlock, MATCH, WRAP);
+            u.pad(d.noEnfBlock, 16f, 16f, 16f, 16f);
+            u.add(d.noEnfBlock, u.gravity(u.text("감지된 단속 카메라 없음", 15f, C_MUTED, false), G_CENTER), MATCH, WRAP);
+            u.add(cardB, d.noEnfBlock, MATCH, WRAP);
 
-            // Card 3: connection & settings
-            Object card3 = u.card();
-            u.pad(card3, 18f, 15f, 18f, 15f);
-            u.add(body, card3, 0f, MATCH, 1.12f, 0f, 0f, 0f, 0f);
-            u.add(card3, u.text("연결 · 설정", 13f, C_MUTED, true), WRAP, WRAP);
-            d.ipText = makeKvRow(u, card3, "이 기기 IP", 8f);
-            setTextColor(d.ipText, C_INFO_TEXT);
-            setBold(d.ipText, true);
-            d.commaValue = makeKvRow(u, card3, "콤마 기기", 5f);
-            d.targetsText = makeKvRow(u, card3, "전송 대상", 5f);
-            d.radioText = makeKvRow(u, card3, "무선 상태", 5f);
-            d.gpsValue = makeKvRow(u, card3, "차량 GPS", 5f);
-            setBold(d.gpsValue, true);
+            // Card C: connection summary (콤마 기기 / 차량 GPS / 무선)
+            Object cardC = makeCard(u, d.statusBody, 0.95f, true);
+            u.pad(cardC, 18f, 18f, 18f, 18f);
+            u.add(cardC, u.text("연결", 13f, C_MUTED, true), WRAP, WRAP);
+            Object[] commaTile = makeConnTile(u, cardC, "콤마 기기", "comma", false, 10f);
+            d.commaTileIcon = commaTile[0];
+            d.commaTileValue = commaTile[1];
+            d.commaTileSub = commaTile[2];
+            Object[] gpsTile = makeConnTile(u, cardC, "차량 GPS", "satellite", true, 10f);
+            d.gpsTileIcon = gpsTile[0];
+            d.gpsTileValue = gpsTile[1];
+            d.gpsTileSub = gpsTile[2];
+            d.gpsMeterFill = gpsTile[3];
+            d.gpsMeterRest = gpsTile[4];
+            Object[] radioTile = makeConnTile(u, cardC, "무선", "hotspot", false, 10f);
+            d.radioTileIcon = radioTile[0];
+            d.radioTileValue = radioTile[1];
+            d.radioTileSub = radioTile[2];
 
-            u.add(card3, u.text("부팅 시 무선 모드", 13f, C_MUTED, false), WRAP, WRAP, 0f, 0f, 9f, 0f, 0f);
+            // ================= 설정 tab (1.1 : 0.9 : 1.1) =================
+            d.settingsBody = u.ll(0, 0);
+            u.pad(d.settingsBody, 20f, 14f, 20f, 0f);
+            u.add(root, d.settingsBody, MATCH, 0f, 1f, 0f, 0f, 0f, 0f);
+
+            // Card S1: wireless & transmit
+            Object cardS1 = makeCard(u, d.settingsBody, 1.1f, false);
+            u.add(cardS1, u.text("무선 · 전송", 13f, C_MUTED, true), WRAP, WRAP);
+            u.add(cardS1, u.text("부팅 시 무선 모드", 15f, C_TEXT, false), WRAP, WRAP, 0f, 0f, 14f, 0f, 0f);
             Object segGroup = u.ll(0, G_CV);
             u.bg(segGroup, C_INSET, C_BORDER, 1f, 12f);
             u.pad(segGroup, 4f, 4f, 4f, 4f);
-            d.segAp = makeSegment(u, segGroup, "핫스팟(AP)", true, new Runnable() {
+            d.segAp = makeSegment(u, segGroup, "핫스팟(AP)", 44f, 15f, true, new Runnable() {
                 @Override
                 public void run() {
                     setBootWirelessModeFromUi("ap");
                 }
             });
-            d.segWifi = makeSegment(u, segGroup, "WiFi(Client)", false, new Runnable() {
+            d.segWifi = makeSegment(u, segGroup, "WiFi(Client)", 44f, 15f, false, new Runnable() {
                 @Override
                 public void run() {
                     setBootWirelessModeFromUi("wifi");
                 }
             });
-            d.segOff = makeSegment(u, segGroup, "끄기(수동)", false, new Runnable() {
+            d.segOff = makeSegment(u, segGroup, "끄기(수동)", 44f, 15f, false, new Runnable() {
                 @Override
                 public void run() {
                     setBootWirelessModeFromUi("off");
                 }
             });
-            u.add(card3, segGroup, MATCH, WRAP, 0f, 0f, 5f, 0f, 0f);
-            u.vSpacer(card3);
-
+            u.add(cardS1, segGroup, MATCH, WRAP, 0f, 0f, 8f, 0f, 0f);
+            d.modeDesc = u.text("", 14f, C_TEXT_2, false);
+            u.add(cardS1, d.modeDesc, MATCH, WRAP, 0f, 0f, 10f, 0f, 0f);
+            u.add(cardS1, u.text("핫스팟과 WiFi(Client)는 동시에 쓸 수 없습니다.", 13f, C_FAINT, false),
+                    MATCH, WRAP, 0f, 0f, 6f, 0f, 0f);
+            u.vSpacer(cardS1);
             Object txRow = u.ll(0, G_CV);
             u.bg(txRow, C_INSET, C_BORDER, 1f, 12f);
-            u.pad(txRow, 14f, 0f, 12f, 0f);
-            u.add(txRow, u.text("콤마 데이터 전송", 14.5f, C_TEXT, false), 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
+            u.pad(txRow, 16f, 0f, 12f, 0f);
+            u.add(txRow, u.text("콤마 데이터 전송", 16f, C_TEXT, false), 0f, WRAP, 1f, 0f, 0f, 0f, 0f);
             d.txTrack = u.ll(0, G_RIGHT_CV);
             u.pad(d.txTrack, 3f, 3f, 3f, 3f);
             Object knob = u.view();
-            u.bg(knob, C_WHITE, C_WHITE, 0f, 11f);
-            u.add(d.txTrack, knob, 22f, 22f);
-            u.add(txRow, d.txTrack, 50f, 28f);
+            u.bg(knob, C_WHITE, C_WHITE, 0f, 12f);
+            u.add(d.txTrack, knob, 24f, 24f);
+            u.add(txRow, d.txTrack, 54f, 30f);
             attachClickListener(txRow, new Runnable() {
                 @Override
                 public void run() {
                     toggleCommaTxFromUi();
                 }
             });
-            u.add(card3, txRow, MATCH, 44f);
+            u.add(cardS1, txRow, MATCH, 52f);
+            u.add(cardS1, u.text("끄면 UDP 7706 · TCP 7709 전송과 콤마 탐색을 멈춥니다.", 13f, C_FAINT, false),
+                    MATCH, WRAP, 0f, 0f, 8f, 0f, 0f);
 
-            // ---------------- Status strip (30dp) ----------------
-            Object strip = u.ll(0, G_CV);
-            u.pad(strip, 22f, 0f, 22f, 0f);
-            u.add(strip, u.text("MAP 버튼 3번 누르면 열기 / 닫기", 13f, C_FAINT, false), WRAP, WRAP);
-            d.messageText = u.singleLine(u.gravity(u.text("", 13f, C_INFO_TEXT, false), G_RIGHT_CV));
-            u.add(strip, d.messageText, 0f, WRAP, 1f, 16f, 0f, 0f, 0f);
-            u.add(root, strip, MATCH, 30f);
-
-            // ---------------- Action bar (50dp buttons) ----------------
-            Object actions = u.ll(0, G_CV);
-            u.pad(actions, 20f, 0f, 20f, 14f);
-            makeActionButton(u, actions, "hotspot", C_ACCENT, "핫스팟(AP) 설정", true, new Runnable() {
+            // Card S2: shortcuts
+            Object cardS2 = makeCard(u, d.settingsBody, 0.9f, false);
+            u.pad(cardS2, 18f, 18f, 18f, 18f);
+            u.add(cardS2, u.text("바로가기", 13f, C_MUTED, true), WRAP, WRAP, 0f, 0f, 0f, 0f, 12f);
+            makeShortcutButton(u, cardS2, "hotspot", C_ACCENT, "핫스팟(AP) 설정", null, true, new Runnable() {
                 @Override
                 public void run() {
                     openHotspotSettingsFromUi();
                 }
             });
-            makeActionButton(u, actions, "wifi", C_INFO, "WiFi(Client) 설정", false, new Runnable() {
+            makeShortcutButton(u, cardS2, "wifi", C_INFO, "WiFi(Client) 설정", null, false, new Runnable() {
                 @Override
                 public void run() {
                     openWifiClientSettingsFromUi();
                 }
             });
-            makeActionButton(u, actions, "sliders", C_MUTED, "엔지니어링 WiFi", false, new Runnable() {
+            makeShortcutButton(u, cardS2, "sliders", C_MUTED, "엔지니어링 WiFi", null, false, new Runnable() {
                 @Override
                 public void run() {
                     openEngineeringWifiFromUi();
                 }
             });
-            makeActionButton(u, actions, "refresh", C_OK, "업데이트", false, new Runnable() {
+            d.updateHint = makeShortcutButton(u, cardS2, "refresh", C_OK, "업데이트", "v" + BRIDGE_VERSION, false, new Runnable() {
                 @Override
                 public void run() {
                     triggerManualUpdateFromUi();
                 }
             });
-            makeActionButton(u, actions, "download", C_VIOLET, "TBT 정밀 덤프", false, new Runnable() {
+            makeShortcutButton(u, cardS2, "download", C_VIOLET, "TBT 정밀 덤프", "USB 저장", false, new Runnable() {
                 @Override
                 public void run() {
                     triggerManualDumpFromUi();
                 }
             });
-            u.add(root, actions, MATCH, 64f);
 
-            // Initial state for the one-shot styled parts
+            // Card S3: diagnostics
+            Object cardS3 = makeCard(u, d.settingsBody, 1.1f, true);
+            u.add(cardS3, u.text("점검 정보", 13f, C_MUTED, true), WRAP, WRAP, 0f, 0f, 0f, 0f, 4f);
+            d.diagIp = makeDiagRow(u, cardS3, "이 기기 IP");
+            setTextColor(d.diagIp, C_INFO_TEXT);
+            setBold(d.diagIp, true);
+            d.diagComma = makeDiagRow(u, cardS3, "콤마 기기");
+            d.diagTargets = makeDiagRow(u, cardS3, "전송 대상");
+            d.diagRoute = makeDiagRow(u, cardS3, "경로 전송 (TCP 7709)");
+            d.diagGpsStatus = makeDiagRow(u, cardS3, "GPS 상태");
+            d.diagGpsPos = makeDiagRow(u, cardS3, "GPS 위치");
+            d.diagRadio = makeDiagRow(u, cardS3, "무선 상태");
+            d.diagBridge = makeDiagRow(u, cardS3, "브릿지");
+            d.diagCpu = makeDiagRow(u, cardS3, "CPU");
+            d.diagRam = makeDiagRow(u, cardS3, "RAM");
+
+            // ================= Status strip (34dp) =================
+            Object strip = u.ll(0, G_CV);
+            u.pad(strip, 22f, 0f, 22f, 0f);
+            u.add(strip, u.text("MAP 버튼 3번 누르면 열기 / 닫기", 13f, C_FAINT, false), WRAP, WRAP);
+            d.messageText = u.singleLine(u.gravity(u.text("", 13f, C_INFO_TEXT, false), G_RIGHT_CV));
+            u.add(strip, d.messageText, 0f, WRAP, 1f, 16f, 0f, 0f, 0f);
+            u.add(root, strip, MATCH, 34f);
+
             styleSegment(u, d.segAp, false);
             styleSegment(u, d.segWifi, false);
             styleSegment(u, d.segOff, false);
+            d.tab = "status";
+            applyTab(u, d);
             return root;
         }
 
@@ -5815,8 +6072,9 @@ public class CarrotBridgeMain {
                     pkt = buildCarrotPacket(st);
                 }
                 if (pkt == null) pkt = new CarrotPacket();
+                boolean statusTab = "status".equals(d.tab);
 
-                // ---------- Top bar ----------
+                // ---------- Shared state ----------
                 String autoUpdText = lastAutoUpdateStatus;
                 try {
                     File updNote = new File(installDir, "config/last_update_status.txt");
@@ -5826,28 +6084,41 @@ public class CarrotBridgeMain {
                     }
                 } catch (Throwable ignored) {
                 }
-                setTextIfChanged(d.versionPill, "v" + BRIDGE_VERSION + shortUpdateStatus(autoUpdText));
-
-                setTextIfChanged(d.bridgeText, commaTxEnabled ? "브릿지 정상 · 5Hz" : "브릿지 전송 일시정지");
-                u.bg(d.bridgeDot, commaTxEnabled ? C_OK : C_FAINT, commaTxEnabled ? C_OK : C_FAINT, 0f, 4f);
-
-                boolean commaAlive = commaTxEnabled && !discoveredCarrotIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
-                int commaColor = !commaTxEnabled ? C_FAINT : (commaAlive ? C_OK : C_WARN);
-                setTextIfChanged(d.commaText, !commaTxEnabled ? "콤마 전송 꺼짐" : (commaAlive ? "콤마 연결됨" : "콤마 찾는 중"));
-                u.bg(d.commaDot, commaColor, commaColor, 0f, 4f);
-
+                String versionText = "v" + BRIDGE_VERSION + shortUpdateStatus(autoUpdText);
+                boolean txOn = commaTxEnabled;
+                String commaIp = discoveredCarrotIp;
+                boolean commaAlive = txOn && !commaIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
+                int commaTone = !txOn ? TONE_OFF : (commaAlive ? TONE_OK : TONE_WARN);
                 int gpsState = getGpsStatusState(st, now);
-                int gpsDotCol = (gpsState == 2) ? C_OK : ((gpsState == 1) ? C_INFO : C_WARN);
-                int gpsValCol = (gpsState == 2) ? C_OK : ((gpsState == 1) ? C_INFO_TEXT : C_WARN);
-                u.bg(d.gpsDot, gpsDotCol, gpsDotCol, 0f, 4f);
-                setTextIfChanged(d.gpsChipText, formatGpsChipText(st, now));
-
+                int gpsTone = gpsState == 2 ? TONE_OK : (gpsState == 1 ? TONE_INFO : TONE_WARN);
                 String ip = readWlanIpv4();
                 boolean apMode = isSoftApMode(ip);
-                String radioName = apMode ? "핫스팟(AP)" : (ip.isEmpty() ? "무선 꺼짐" : "WiFi(Client)");
-                setTextIfChanged(d.modeChipText, ip.isEmpty() ? radioName : (radioName + " · " + ip));
+                boolean radioOn = apMode || !ip.isEmpty();
+                String radioIcon = apMode ? "hotspot" : "wifi";
+                int radioTone = radioOn ? TONE_INFO : TONE_OFF;
+                String bootMode = currentBootWirelessMode();
+                int routePts = latestRoutePointsCount;
 
-                setTextIfChanged(d.sysText, updateSystemResourceBadge(now));
+                // ---------- Top bar ----------
+                setTextIfChanged(d.versionPill, versionText);
+                d.commaChipKey = applyChipTone(u, d.commaChip, d.commaChipIcon, d.commaChipText, "comma", commaTone, d.commaChipKey);
+                setTextIfChanged(d.commaChipText, !txOn ? "꺼짐" : (commaAlive ? commaIp : "찾는 중"));
+                d.gpsChipKey = applyChipTone(u, d.gpsChip, d.gpsChipIcon, d.gpsChipText, "satellite", gpsTone, d.gpsChipKey);
+                setTextIfChanged(d.gpsChipText, formatGpsSatUsedText(st, now));
+                d.radioChipKey = applyChipTone(u, d.radioChip, d.radioChipIcon, d.radioChipText, radioIcon, radioTone, d.radioChipKey);
+                setTextIfChanged(d.radioChipText, apMode ? "핫스팟" : (ip.isEmpty() ? "꺼짐" : "WiFi"));
+
+                int health = computeDashHealth(txOn, commaAlive, gpsState);
+                String healthKey = "h" + health;
+                if (!healthKey.equals(d.healthKey)) {
+                    int[] t = TONES[health == 0 ? TONE_OK : (health == 1 ? TONE_WARN : TONE_OFF)];
+                    u.bg(d.healthChip, t[1], t[2], 1f, 18f);
+                    u.bg(d.healthDot, t[0], t[0], 0f, 5f);
+                    setTextColor(d.healthText, health == 0 ? 0xFF6EE7B7 : (health == 1 ? 0xFFFCD34D : C_TEXT_2));
+                    d.healthKey = healthKey;
+                }
+                setTextIfChanged(d.healthText, health == 0 ? "정상" : (health == 1 ? "확인 필요" : "전송 꺼짐"));
+
                 boolean timerPaused = autoClosePaused;
                 int wantedCountdownStyle = timerPaused ? 1 : 0;
                 if (d.countdownStyleState != wantedCountdownStyle) {
@@ -5864,126 +6135,179 @@ public class CarrotBridgeMain {
                 }
                 setTextIfChanged(d.countdownText, formatCountdownText(shownAtMs, timerPaused, autoCloseRemainingMs, now));
 
-                // ---------- Card 1: route guidance ----------
-                boolean guiding = pkt.nTBTTurnType >= 0 || pkt.nGoPosDist > 0;
-                setVisible(d.guideBlock, guiding);
-                setVisible(d.emptyBlock, !guiding);
-                setTextIfChanged(d.guideBadge, guiding ? "안내 중" : "대기");
-                setTextColor(d.guideBadge, guiding ? C_ON_ACCENT : C_TEXT_2);
-                u.bg(d.guideBadge, guiding ? C_ACCENT : C_TRACK, guiding ? C_ACCENT : C_TRACK, 0f, 11f);
-                if (guiding) {
-                    String key = turnIconKey(pkt.nTBTTurnType);
-                    if (!key.equals(d.turnIconKey)) {
-                        setIconDrawable(d.turnIcon, key, C_ON_ACCENT, 2.6f);
-                        d.turnIconKey = key;
-                    }
-                    if (pkt.nTBTDist > 0) {
-                        setTextIfChanged(d.turnDist, fmtDistNum(pkt.nTBTDist));
-                        setTextIfChanged(d.turnUnit, fmtDistUnit(pkt.nTBTDist));
-                    } else {
-                        setTextIfChanged(d.turnDist, "-");
-                        setTextIfChanged(d.turnUnit, "");
-                    }
-                    setTextIfChanged(d.turnName, pkt.nTBTTurnType >= 0 ? describeTurnType(pkt.nTBTTurnType) : "경로 안내 중");
-                    setTextIfChanged(d.crossroad, cleanGuideText(pkt.szTBTMainText));
-                    int bg = st != null ? st.tbtBarGraph : -1;
-                    setBar(d.barFill, d.barRest, bg >= 0 ? bg : 0);
-                    if (pkt.nTBTDistNext > 0) {
-                        String nextLabel = pkt.nextTurnKnown ? describeTurnType(pkt.nTBTTurnTypeNext) : "다음 구간";
-                        setTextIfChanged(d.nextText, nextLabel + " · " + fmtDist(pkt.nTBTDistNext));
-                    } else {
-                        setTextIfChanged(d.nextText, "-");
-                    }
-                    if (pkt.nGoPosDist > 0) {
-                        String dest = String.format(Locale.US, "%.1f km", pkt.nGoPosDist / 1000.0);
-                        if (pkt.nGoPosTime > 0) dest += " · " + Math.max(1, pkt.nGoPosTime / 60) + "분";
-                        setTextIfChanged(d.destText, dest);
-                    } else {
-                        setTextIfChanged(d.destText, "-");
-                    }
-                }
-
-                // ---------- Card 2: speed & enforcement ----------
-                setTextIfChanged(d.limitText, String.valueOf(pkt.nRoadLimitSpeed));
-                setTextIfChanged(d.roadTypeText, "제한속도 · " + (pkt.roadcate == 1 ? "고속도로" : "일반도로"));
-                setTextIfChanged(d.speedText, String.valueOf(Math.round(pkt.nPosSpeed)));
-
-                boolean section = pkt.nSdiBlockType > 0;
-                int camType = pkt.nSdiType >= 0 ? pkt.nSdiType : pkt.nSdiPlusType;
-                int camLimit = pkt.nSdiType >= 0 ? pkt.nSdiSpeedLimit : pkt.nSdiPlusSpeedLimit;
-                int camDist = pkt.nSdiType >= 0 ? pkt.nSdiDist : pkt.nSdiPlusDist;
-                boolean camera = !section && camType >= 0;
-                setVisible(d.secBlock, section);
-                setVisible(d.camBlock, camera);
-                setVisible(d.noEnfBlock, !section && !camera);
-                if (section) {
-                    setTextIfChanged(d.secLimit, pkt.nSdiBlockSpeed > 0 ? pkt.nSdiBlockSpeed + " km/h" : "");
-                    if (pkt.nSdiBlockDist > 0) {
-                        setTextIfChanged(d.secRemain, fmtDistNum(pkt.nSdiBlockDist));
-                        setTextIfChanged(d.secRemainUnit, fmtDistUnit(pkt.nSdiBlockDist));
-                    } else {
-                        setTextIfChanged(d.secRemain, "-");
-                        setTextIfChanged(d.secRemainUnit, "");
-                    }
-                    int avg = pkt.nSdiBlockAverageSpeed;
-                    setTextIfChanged(d.secAvg, avg > 0 ? String.valueOf(avg) : "-");
-                    setTextColor(d.secAvg, (avg > 0 && pkt.nSdiBlockSpeed > 0 && avg > pkt.nSdiBlockSpeed) ? C_WARN : C_OK);
-                } else if (camera) {
-                    String camKey = (camType == 22) ? "bump" : "camera";
-                    if (!camKey.equals(d.camIconKey)) {
-                        setIconDrawable(d.camIcon, camKey, C_WARN, 2f);
-                        d.camIconKey = camKey;
-                    }
-                    setTextIfChanged(d.camTitle, describeSdiType(camType));
-                    setTextIfChanged(d.camLimit, camLimit > 0 ? camLimit + " km/h" : "");
-                    setTextIfChanged(d.camDist, camDist >= 0 ? String.valueOf(camDist) : "-");
-                    setBar(d.camBarFill, d.camBarRest, camDist > 0 ? Math.min(100, camDist * 100 / 600) : 0);
-                }
-
-                // ---------- Card 3: connection & settings ----------
-                setTextIfChanged(d.ipText, ip.isEmpty() ? "연결 없음" : ip + (apMode ? " (wlan0 · AP)" : " (wlan0 · WiFi)"));
-                String commaStr;
-                if (!commaTxEnabled) {
-                    commaStr = "전송 중지됨";
-                } else if (commaAlive) {
-                    int routePts = latestRoutePointsCount;
-                    commaStr = discoveredCarrotIp + " · " + String.format(Locale.US, "%.0f", carrotVEgoKph) + " km/h";
-                    if (routePts > 0) {
-                        commaStr += " · 경로 " + routePts + "pt";
-                    }
-                } else {
-                    commaStr = discoveredCarrotIp.isEmpty() ? "찾는 중 (브로드캐스트)" : discoveredCarrotIp + " (대기 중)";
-                }
-                setTextIfChanged(d.commaValue, commaStr);
-                setTextColor(d.commaValue, commaAlive ? C_TEXT : C_WARN);
-                String targets = latestTargetsStr == null ? "" : latestTargetsStr.replace("[", "").replace("]", "");
-                setTextIfChanged(d.targetsText, targets.isEmpty() ? "-" : targets);
-
-                String bootMode = currentBootWirelessMode();
-                boolean paused = new File(HOTSPOT_PAUSE_FILE).isFile() && "ap".equals(bootMode);
-                String radio;
+                // Wireless status line (shared by the 무선 tile and the 무선 상태 diagnostics row)
+                boolean hotspotPaused = new File(HOTSPOT_PAUSE_FILE).isFile() && "ap".equals(bootMode);
+                String radioDetail;
                 if (apMode) {
-                    radio = "핫스팟 켜짐 · 기기 " + scanWlanArpPeers().size() + "대";
+                    radioDetail = (ip.isEmpty() ? "" : ip + " · ") + "접속 기기 " + scanWlanArpPeers().size() + "대";
                 } else if (!ip.isEmpty()) {
-                    radio = "WiFi(Client) 연결됨";
+                    radioDetail = ip;
                 } else {
-                    radio = "연결 없음";
+                    radioDetail = "무선 연결 없음";
                 }
-                if (paused) radio += " · 핫스팟 자동 유지 일시중지";
-                setTextIfChanged(d.radioText, radio);
+                if (hotspotPaused) radioDetail += " · 핫스팟 자동 유지 일시중지";
 
-                setTextIfChanged(d.gpsValue, formatGpsDetailText(st, now));
-                setTextColor(d.gpsValue, gpsValCol);
+                if (statusTab) {
+                    // ---------- 상태: route guidance ----------
+                    boolean guiding = pkt.nTBTTurnType >= 0 || pkt.nGoPosDist > 0;
+                    setVisible(d.guideBlock, guiding);
+                    setVisible(d.emptyBlock, !guiding);
+                    setTextIfChanged(d.guideBadge, guiding ? "안내 중" : "대기");
+                    setTextColor(d.guideBadge, guiding ? C_ON_ACCENT : C_TEXT_2);
+                    u.bg(d.guideBadge, guiding ? C_ACCENT : C_TRACK, guiding ? C_ACCENT : C_TRACK, 0f, 11f);
+                    if (guiding) {
+                        String key = turnIconKey(pkt.nTBTTurnType);
+                        if (!key.equals(d.turnIconKey)) {
+                            setIconDrawable(d.turnIcon, key, C_ON_ACCENT, 2.6f);
+                            d.turnIconKey = key;
+                        }
+                        if (pkt.nTBTDist > 0) {
+                            setTextIfChanged(d.turnDist, fmtDistNum(pkt.nTBTDist));
+                            setTextIfChanged(d.turnUnit, fmtDistUnit(pkt.nTBTDist));
+                        } else {
+                            setTextIfChanged(d.turnDist, "-");
+                            setTextIfChanged(d.turnUnit, "");
+                        }
+                        setTextIfChanged(d.turnName, pkt.nTBTTurnType >= 0 ? describeTurnType(pkt.nTBTTurnType) : "경로 안내 중");
+                        setTextIfChanged(d.crossroad, cleanGuideText(pkt.szTBTMainText));
+                        int bg = st != null ? st.tbtBarGraph : -1;
+                        setBar(d.barFill, d.barRest, bg >= 0 ? bg : 0);
+                        if (pkt.nTBTDistNext > 0) {
+                            String nextLabel = pkt.nextTurnKnown ? describeTurnType(pkt.nTBTTurnTypeNext) : "다음 구간";
+                            setTextIfChanged(d.nextText, nextLabel + " · " + fmtDist(pkt.nTBTDistNext));
+                        } else {
+                            setTextIfChanged(d.nextText, "-");
+                        }
+                        if (pkt.nGoPosDist > 0) {
+                            String dest = String.format(Locale.US, "%.1f km", pkt.nGoPosDist / 1000.0);
+                            if (pkt.nGoPosTime > 0) dest += " · " + Math.max(1, pkt.nGoPosTime / 60) + "분";
+                            setTextIfChanged(d.destText, dest);
+                        } else {
+                            setTextIfChanged(d.destText, "-");
+                        }
+                    }
 
-                styleSegment(u, d.segAp, "ap".equals(bootMode));
-                styleSegment(u, d.segWifi, "wifi".equals(bootMode));
-                styleSegment(u, d.segOff, "off".equals(bootMode));
+                    // ---------- 상태: speed & enforcement ----------
+                    setTextIfChanged(d.limitText, String.valueOf(pkt.nRoadLimitSpeed));
+                    setTextIfChanged(d.roadTypeText, "제한속도 · " + (pkt.roadcate == 1 ? "고속도로" : "일반도로"));
+                    setTextIfChanged(d.speedText, String.valueOf(Math.round(pkt.nPosSpeed)));
 
-                u.bg(d.txTrack, commaTxEnabled ? C_OK : C_OFF, commaTxEnabled ? C_OK : C_OFF, 0f, 14f);
-                setLayoutGravity(d.txTrack, commaTxEnabled ? G_RIGHT_CV : G_LEFT_CV);
+                    boolean section = pkt.nSdiBlockType > 0;
+                    int camType = pkt.nSdiType >= 0 ? pkt.nSdiType : pkt.nSdiPlusType;
+                    int camLimit = pkt.nSdiType >= 0 ? pkt.nSdiSpeedLimit : pkt.nSdiPlusSpeedLimit;
+                    int camDist = pkt.nSdiType >= 0 ? pkt.nSdiDist : pkt.nSdiPlusDist;
+                    boolean camera = !section && camType >= 0;
+                    setVisible(d.secBlock, section);
+                    setVisible(d.camBlock, camera);
+                    setVisible(d.noEnfBlock, !section && !camera);
+                    if (section) {
+                        setTextIfChanged(d.secLimit, pkt.nSdiBlockSpeed > 0 ? pkt.nSdiBlockSpeed + " km/h" : "");
+                        if (pkt.nSdiBlockDist > 0) {
+                            setTextIfChanged(d.secRemain, fmtDistNum(pkt.nSdiBlockDist));
+                            setTextIfChanged(d.secRemainUnit, fmtDistUnit(pkt.nSdiBlockDist));
+                        } else {
+                            setTextIfChanged(d.secRemain, "-");
+                            setTextIfChanged(d.secRemainUnit, "");
+                        }
+                        int avg = pkt.nSdiBlockAverageSpeed;
+                        setTextIfChanged(d.secAvg, avg > 0 ? String.valueOf(avg) : "-");
+                        setTextColor(d.secAvg, (avg > 0 && pkt.nSdiBlockSpeed > 0 && avg > pkt.nSdiBlockSpeed) ? C_WARN : C_OK);
+                    } else if (camera) {
+                        String camKey = (camType == 22) ? "bump" : "camera";
+                        if (!camKey.equals(d.camIconKey)) {
+                            setIconDrawable(d.camIcon, camKey, C_WARN, 2f);
+                            d.camIconKey = camKey;
+                        }
+                        setTextIfChanged(d.camTitle, describeSdiType(camType));
+                        setTextIfChanged(d.camLimit, camLimit > 0 ? camLimit + " km/h" : "");
+                        setTextIfChanged(d.camDist, camDist >= 0 ? String.valueOf(camDist) : "-");
+                        setBar(d.camBarFill, d.camBarRest, camDist > 0 ? Math.min(100, camDist * 100 / 600) : 0);
+                    }
+
+                    // ---------- 상태: connection tiles ----------
+                    int commaFg = TONES[commaTone][0];
+                    String cKey = "comma#" + commaTone;
+                    if (!cKey.equals(d.commaTileKey)) {
+                        setIconDrawable(d.commaTileIcon, "comma", commaFg, 2f);
+                        setTextColor(d.commaTileValue, commaFg);
+                        d.commaTileKey = cKey;
+                    }
+                    setTextIfChanged(d.commaTileValue, !txOn ? "전송 꺼짐" : (commaAlive ? "연결됨" : "찾는 중"));
+                    String commaSub;
+                    if (!txOn) {
+                        commaSub = "설정 탭에서 다시 켤 수 있습니다";
+                    } else if (commaAlive) {
+                        commaSub = commaIp + " · " + String.format(Locale.US, "%.0f", carrotVEgoKph) + " km/h"
+                                + (routePts > 0 ? " · 경로 " + routePts + "pt" : "");
+                    } else {
+                        commaSub = commaIp.isEmpty() ? "같은 네트워크에 연결되면 자동으로 찾습니다" : commaIp + " (대기 중)";
+                    }
+                    setTextIfChanged(d.commaTileSub, commaSub);
+
+                    int gpsFg = TONES[gpsTone][0];
+                    String gKey = "gps#" + gpsTone;
+                    if (!gKey.equals(d.gpsTileKey)) {
+                        setIconDrawable(d.gpsTileIcon, "satellite", gpsFg, 2f);
+                        setTextColor(d.gpsTileValue, gpsFg);
+                        u.bg(d.gpsMeterFill, gpsFg, gpsFg, 0f, 3f);
+                        d.gpsTileKey = gKey;
+                    }
+                    setTextIfChanged(d.gpsTileValue, formatGpsTileValue(st, now));
+                    setTextIfChanged(d.gpsTileSub, formatGpsTileSub(st, now));
+                    setBar(d.gpsMeterFill, d.gpsMeterRest, gpsSatMeterPct(st, now));
+
+                    String rKey = radioIcon + "#" + radioTone;
+                    if (!rKey.equals(d.radioTileKey)) {
+                        int radioFg = TONES[radioTone][0];
+                        setIconDrawable(d.radioTileIcon, radioIcon, radioFg, 2f);
+                        setTextColor(d.radioTileValue, radioOn ? C_TEXT : C_FAINT);
+                        d.radioTileKey = rKey;
+                    }
+                    setTextIfChanged(d.radioTileValue, apMode ? "핫스팟(AP)" : (ip.isEmpty() ? "꺼짐" : "WiFi(Client)"));
+                    setTextIfChanged(d.radioTileSub, radioDetail);
+                } else {
+                    // ---------- 설정: wireless & transmit ----------
+                    styleSegment(u, d.segAp, "ap".equals(bootMode));
+                    styleSegment(u, d.segWifi, "wifi".equals(bootMode));
+                    styleSegment(u, d.segOff, "off".equals(bootMode));
+                    String desc;
+                    if ("ap".equals(bootMode)) {
+                        desc = "부팅할 때 핫스팟을 켜고 계속 유지합니다. 콤마 기기가 이 핫스팟에 연결됩니다.";
+                    } else if ("wifi".equals(bootMode)) {
+                        desc = "부팅할 때 핫스팟을 끄고 WiFi에 연결합니다. 무선 CarPlay/Android Auto는 쓸 수 없습니다.";
+                    } else {
+                        desc = "부팅할 때 핫스팟과 WiFi를 자동으로 켜지 않습니다.";
+                    }
+                    setTextIfChanged(d.modeDesc, desc);
+                    u.bg(d.txTrack, txOn ? C_OK : C_OFF, txOn ? C_OK : C_OFF, 0f, 15f);
+                    setLayoutGravity(d.txTrack, txOn ? G_RIGHT_CV : G_LEFT_CV);
+                    setTextIfChanged(d.updateHint, versionText);
+
+                    // ---------- 설정: diagnostics ----------
+                    setTextIfChanged(d.diagIp, ip.isEmpty() ? "연결 없음" : ip + (apMode ? " (wlan0 · AP)" : " (wlan0 · WiFi)"));
+                    setTextIfChanged(d.diagComma, !txOn ? "전송 꺼짐" : (commaAlive ? commaIp : "찾는 중"));
+                    setTextColor(d.diagComma, commaAlive ? C_TEXT : C_WARN);
+                    String targets = latestTargetsStr == null ? "" : latestTargetsStr.replace("[", "").replace("]", "");
+                    setTextIfChanged(d.diagTargets, targets.isEmpty() ? "-" : targets);
+                    setTextIfChanged(d.diagRoute, routePts > 0 ? routePts + "pt · OSRM" : "대기");
+                    String gdKey = "gd#" + gpsTone;
+                    if (!gdKey.equals(d.gpsDiagKey)) {
+                        setTextColor(d.diagGpsStatus, TONES[gpsTone][0]);
+                        d.gpsDiagKey = gdKey;
+                    }
+                    setTextIfChanged(d.diagGpsStatus, formatGpsDiagStatus(st, now));
+                    setTextIfChanged(d.diagGpsPos, formatGpsPosition(st, now));
+                    setTextIfChanged(d.diagRadio, (apMode ? "핫스팟(AP) · " : (ip.isEmpty() ? "" : "WiFi(Client) · ")) + radioDetail);
+                    setTextIfChanged(d.diagBridge, txOn ? ("UDP 7706 · 5Hz · #" + pkt.carrotIndex) : "전송 일시정지");
+                    updateSystemResourceBadge(now);
+                    setTextIfChanged(d.diagCpu, cachedCpuText);
+                    setTextIfChanged(d.diagRam, cachedRamText);
+                }
 
                 // ---------- Status strip ----------
-                setTextIfChanged(d.messageText, stripLeadingSymbols(actionBannerMsg));
+                String msg = stripLeadingSymbols(actionBannerMsg);
+                if (msg.isEmpty() && !statusTab) msg = "설정은 바로 저장됩니다";
+                setTextIfChanged(d.messageText, msg);
             } catch (Throwable t) {
                 Throwable cause = (t.getCause() != null) ? t.getCause() : t;
                 System.out.println("[CarrotBridge] Dashboard refresh error: " + cause);
@@ -6113,6 +6437,8 @@ public class CarrotBridgeMain {
                 }
                 String ramPart = readRamUsageSummary();
                 cachedSysBadgeText = cpuPart + "    " + ramPart;
+                cachedCpuText = cpuPart.startsWith("CPU ") ? cpuPart.substring(4) : cpuPart;
+                cachedRamText = ramPart.startsWith("RAM ") ? ramPart.substring(4) : ramPart;
             } catch (Throwable ignored) {
             }
             return cachedSysBadgeText;
@@ -7187,6 +7513,46 @@ public class CarrotBridgeMain {
         if (!"60초 후 닫힘".equals(StatusDashboardOverlay.formatCountdownText(tReopen, false, StatusDashboardOverlay.AUTO_CLOSE_DURATION_MS, tReopen))
                 || !StatusDashboardOverlay.shouldAutoClose(tReopen, false, tReopen + 60000L)) {
             throw new AssertionError("Auto-close countdown reopen reset mismatch");
+        }
+
+        // Dashboard v2: top-bar GPS chip, connection tile, settings diagnostics and overall health chip
+        NavState stV2 = new NavState();
+        long nowV2 = System.currentTimeMillis();
+        applySvStatus(stV2, 13, new float[]{32.5f, 41.0f, 28.0f}, 0x1F, 0x0F, nowV2);
+        stV2.lat = 36.63581;
+        stV2.lon = 127.48952;
+        stV2.headingDeg = 83.0;
+        stV2.lastGpsFixMs = nowV2;
+        stV2.gpsFixStatus = 3;
+        if (!"9기".equals(formatGpsSatUsedText(stV2, nowV2 + 50L))
+                || !"위성 3D · 9기".equals(formatGpsTileValue(stV2, nowV2 + 50L))
+                || !"사용 9 / 관측 13기 · 최대 신호 41 dB".equals(formatGpsTileSub(stV2, nowV2 + 50L))
+                || gpsSatMeterPct(stV2, nowV2 + 50L) != 69
+                || !"위성 3D · 사용 9 / 관측 13기 · 41 dB-Hz".equals(formatGpsDiagStatus(stV2, nowV2 + 50L))
+                || !"36.6358, 127.4895 · 83°".equals(formatGpsPosition(stV2, nowV2 + 50L))) {
+            throw new AssertionError("Dashboard v2 3D GPS texts mismatch: " + formatGpsTileSub(stV2, nowV2 + 50L));
+        }
+        applySvStatus(stV2, 12, new float[]{18.0f}, 0, 0, nowV2);
+        stV2.gpsFixStatus = 0;
+        stV2.gpsDrStatus = 1;
+        stV2.inTunnel = true;
+        if (!"0기".equals(formatGpsSatUsedText(stV2, nowV2 + 50L))
+                || !"터널 DR · 0기".equals(formatGpsTileValue(stV2, nowV2 + 50L))
+                || !"차속과 방향으로 위치 추정".equals(formatGpsTileSub(stV2, nowV2 + 50L))) {
+            throw new AssertionError("Dashboard v2 tunnel DR GPS texts mismatch: " + formatGpsTileValue(stV2, nowV2 + 50L));
+        }
+        NavState stWait = new NavState();
+        applySvStatus(stWait, 5, null, 0, 0, nowV2);
+        if (!"대기 중 · 0/5기".equals(formatGpsTileValue(stWait, nowV2 + 50L))
+                || !"관측 5기 · 위치 고정 전".equals(formatGpsTileSub(stWait, nowV2 + 50L))
+                || !"-".equals(formatGpsPosition(stWait, nowV2 + 50L))
+                || !"--".equals(formatGpsSatUsedText(new NavState(), nowV2))) {
+            throw new AssertionError("Dashboard v2 waiting GPS texts mismatch: " + formatGpsTileValue(stWait, nowV2 + 50L));
+        }
+        if (computeDashHealth(true, true, 2) != 0 || computeDashHealth(true, true, 1) != 0
+                || computeDashHealth(true, false, 2) != 1 || computeDashHealth(true, true, 0) != 1
+                || computeDashHealth(false, true, 2) != 2) {
+            throw new AssertionError("Dashboard v2 health chip mapping mismatch");
         }
 
         NavState stSat = new NavState();

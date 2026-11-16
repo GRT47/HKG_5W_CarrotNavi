@@ -45,13 +45,17 @@
      - 무선 모드 진단: `wireless_state.txt`(무선 모드 설정 파일, STA/AP 상태, 관련 시스템 속성, `hostapd`/`wpa_supplicant`/`dnsmasq` 프로세스), `logcat_wifi_recent.txt`(`WifiService`/`WifiStateMachine`/`WifiSettings`/`CarrotBridge`)
      - 브릿지·네트워크: `carrotbridge_status.json`, `carrotbridge_svc.log`, `carrotbridge_updater.log`, `getprop.txt`, `ip_addr.txt`, `ip_route_all.txt`, `arp_table.txt`
 
-5. **MAP 버튼 3연타 & NEMESIS 대시보드 상태 오버레이 (`StatusDashboardOverlay`, v1.3.3)**
-   - 전면 물리 `MAP` 버튼을 연속 3번 누르거나(`ivi_mode_broadcast` `KEYCODE_SHORTCUT_MAP` / `com.hkmc.intent.action.MAP_SHORTCUT` 감지), NEMESIS 대시보드에서 `CarrotNavi 7706 Bridge`를 선택하면 **전체화면(1920×720, 1280×480dp) 상태 대시보드**가 즉시 표시됨 (다시 MAP 3연타 또는 `닫기`로 닫힘)
-   - **상단 바**: 패키지 버전·업데이트 상태(`v1.3.3 · 최신`), 상태 칩(브릿지 동작 / 콤마 연결 / GPS 위성·DR·사용 위성 수 `GPS 위성(3D) · 9기`·`GPS 터널 DR · 0기` / 현재 무선 모드·`wlan0` IP), CPU 온도·사용률, RAM, 자동 닫힘 카운터(`58초 후 닫힘`, 터치 시 `일시정지`/`재개`, 다시 열면 초기화), 닫기 버튼
-   - **경로 안내 카드**: 회전 아이콘(좌·우·완만한 좌우·U턴·회전교차로·톨게이트·도착), 남은 거리, 회전명, 한글 교차로명, 진행 막대, 다음 안내, 목적지까지 거리·시간 (미안내 시 `경로 안내 없음` 표시)
-   - **속도·단속 카드**: 제한속도 표지판, 도로 종별, 현재 차속, 전방 단속카메라/방지턱 거리 또는 구간단속 남은 거리·구간 평균속도
-   - **연결·설정 카드**: 이 기기 IP(`wlan0 · AP`/`wlan0 · WiFi`), 콤마(캐럿파일럿) 연결 IP·수신 차속·`TCP 7709` 경로 포인트 수, 전송 대상, 무선 상태(핫스팟 접속 기기 수 등), 차량 GPS 상태·위성 수(사용/관측)·좌표, `부팅 시 무선 모드` 3단 선택(`핫스팟(AP)` / `WiFi(Client)` / `끄기(수동)`), `콤마 데이터 전송` ON/OFF 스위치
-   - **하단 버튼**: `[핫스팟(AP) 설정]`(`com.hkmc.wifisettings/.WifiHotspot`), `[WiFi(Client) 설정]`(`com.hkmc.wifisettings/.WifiClientSettings`), `[엔지니어링 WiFi]`(`com.hkmc.system.app.engineering/.module.WifiInfo`), `[업데이트]`(GitHub 최신 버전 확인), `[TBT 정밀 덤프]`
+5. **MAP 버튼 3연타 & NEMESIS 대시보드 상태 오버레이 (`StatusDashboardOverlay`, 대시보드 v2)**
+   - 전면 물리 `MAP` 버튼을 연속 3번 누르거나(`ivi_mode_broadcast` `KEYCODE_SHORTCUT_MAP` / `com.hkmc.intent.action.MAP_SHORTCUT` 감지), NEMESIS 대시보드에서 `CarrotNavi 7706 Bridge`를 선택하면 **전체화면(1920×720, 1280×480dp) 상태 대시보드**가 즉시 표시됨 (다시 MAP 3연타 또는 `닫기`로 닫힘, 항상 `상태` 탭으로 열림)
+   - **상단 바**: 패키지 버전·업데이트 상태(`v1.3.4 · 최신`), `상태 | 설정` 탭, 상태 아이콘 3개(콤마 기기 IP / 차량 GPS 사용 위성 수 `9기` / 무선 `핫스팟`·`WiFi`, 색상: 초록 정상 · 파랑 추측항법(DR)·무선 · 노랑 확인 필요 · 회색 꺼짐), 종합 상태(`정상` / `확인 필요` / `전송 꺼짐`), 자동 닫힘 카운터(`58초 후 닫힘`, 터치 시 `일시정지`/`재개`, 다시 열면 초기화), 닫기 버튼
+   - **상태 탭**
+     - **경로 안내**: 회전 아이콘(좌·우·완만한 좌우·U턴·회전교차로·톨게이트·도착), 남은 거리, 회전명, 한글 교차로명, 진행 막대, 다음 안내, 목적지까지 거리·시간 (미안내 시 `경로 안내 없음` 표시)
+     - **속도·단속**: 제한속도 표지판, 도로 종별, 현재 차속, 전방 단속카메라/방지턱 거리 또는 구간단속 남은 거리·구간 평균속도
+     - **연결**: 콤마 기기(연결 IP·수신 차속·`TCP 7709` 경로 포인트 수), 차량 GPS(`위성 3D · 9기` / `터널 DR · 0기` / `대기 중 · 0/5기`, 사용/관측 위성 수·최대 신호, 위성 사용 비율 막대), 무선(핫스팟/WiFi, `wlan0` IP, 접속 기기 수)
+   - **설정 탭**
+     - **무선·전송**: `부팅 시 무선 모드` 3단 선택(`핫스팟(AP)` / `WiFi(Client)` / `끄기(수동)`)과 모드별 설명, `콤마 데이터 전송` ON/OFF 스위치
+     - **바로가기**: `[핫스팟(AP) 설정]`(`com.hkmc.wifisettings/.WifiHotspot`), `[WiFi(Client) 설정]`(`com.hkmc.wifisettings/.WifiClientSettings`), `[엔지니어링 WiFi]`(`com.hkmc.system.app.engineering/.module.WifiInfo`), `[업데이트]`(GitHub 최신 버전 확인), `[TBT 정밀 덤프]`
+     - **점검 정보**: 이 기기 IP, 콤마 기기, 전송 대상, 경로 전송(`TCP 7709`), GPS 상태(사용/관측 위성·`dB-Hz`), GPS 위치·방위, 무선 상태, 브릿지(`UDP 7706` 패킷 번호), CPU 온도·사용률, RAM
    - 아이콘은 이모지 대신 `ShapeDrawable(PathShape)` 선 아이콘으로 그려 Android 4.4(API 19)에서도 동일하게 표시
 
 ---
