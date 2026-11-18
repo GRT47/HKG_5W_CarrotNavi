@@ -11,27 +11,40 @@ else
     INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
 fi
 mkdir -p /data/dalvik-cache 2>/dev/null
-SVC_PID_FILE="/data/local/tmp/carrotbridge_svc.pid"
+RAM_TMP="/dev/hkg_tmp"
+mkdir -p "$RAM_TMP" 2>/dev/null && chmod 777 "$RAM_TMP" 2>/dev/null
+SVC_PID_FILE="$RAM_TMP/carrotbridge_svc.pid"
+SVC_LOG_FILE="$RAM_TMP/carrotbridge_svc.log"
 
 # 1. Immediately signal the Status Dashboard Overlay to appear on screen
-echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
+echo 1 > "$RAM_TMP/carrotbridge_show_ui" 2>/dev/null
 
 # 2. Ensure carrot-7706-bridge background service is running (use busybox tr to handle NUL bytes in /proc/<pid>/cmdline)
 svc_alive=0
-if [ -f "$SVC_PID_FILE" ]; then
-    svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
-    if [ -n "$svc_pid" ] && kill -0 "$svc_pid" 2>/dev/null; then
-        svc_cmdline="$(/system/bin/busybox tr '\0' ' ' < "/proc/$svc_pid/cmdline" 2>/dev/null)"
-        case "$svc_cmdline" in
-            *bridge-daemon.sh*)
-                svc_alive=1
-                ;;
-        esac
+for _chk_pid_file in "$SVC_PID_FILE" "/data/local/tmp/carrotbridge_svc.pid"; do
+    if [ -f "$_chk_pid_file" ]; then
+        svc_pid="$(cat "$_chk_pid_file" 2>/dev/null)"
+        if [ -n "$svc_pid" ] && kill -0 "$svc_pid" 2>/dev/null; then
+            svc_cmdline="$(/system/bin/busybox tr '\0' ' ' < "/proc/$svc_pid/cmdline" 2>/dev/null)"
+            case "$svc_cmdline" in
+                *bridge-daemon.sh*)
+                    svc_alive=1
+                    break
+                    ;;
+            esac
+        fi
     fi
-fi
+done
 if [ "$svc_alive" = "0" ]; then
     rm -f "$SVC_PID_FILE" 2>/dev/null
-    /system/bin/sh "$INSTALL_DIR/svc/bridge-daemon.sh" </dev/null >>/data/local/tmp/carrotbridge_svc.log 2>&1 &
+    if [ -f "$SVC_LOG_FILE" ]; then
+        svc_log_sz="$(/system/bin/busybox wc -c < "$SVC_LOG_FILE" 2>/dev/null)"
+        if [ -n "$svc_log_sz" ] && [ "$svc_log_sz" -ge 262144 ] 2>/dev/null; then
+            cp "$SVC_LOG_FILE" "${SVC_LOG_FILE}.old" 2>/dev/null
+            : > "$SVC_LOG_FILE" 2>/dev/null
+        fi
+    fi
+    /system/bin/sh "$INSTALL_DIR/svc/bridge-daemon.sh" </dev/null >>"$SVC_LOG_FILE" 2>&1 &
 fi
 
 # 3. Run Hotspot assertion, TBT logger wakeup, and signal the running daemon to check GitHub Auto-Update (avoids concurrent dexopt SIGABRT)
@@ -62,7 +75,7 @@ fi
         /system/bin/sh "$INSTALL_DIR/scripts/tbt-dump.sh" >/dev/null 2>&1 &
     fi
 
-    echo 1 > /data/local/tmp/carrotbridge_check_update 2>/dev/null
+    echo 1 > "$RAM_TMP/carrotbridge_check_update" 2>/dev/null
 ) </dev/null >/dev/null 2>&1 &
 
 exit 0

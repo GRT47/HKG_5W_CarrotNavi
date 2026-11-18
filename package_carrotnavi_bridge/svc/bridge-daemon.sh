@@ -11,8 +11,15 @@ else
     INSTALL_DIR="/data/nemesis/packages/carrotnavi.bridge"
 fi
 mkdir -p /data/dalvik-cache 2>/dev/null
-SVC_PID_FILE="/data/local/tmp/carrotbridge_svc.pid"
-JAVA_PID_FILE="/data/local/tmp/carrotbridge_java.pid"
+RAM_TMP="/dev/hkg_tmp"
+mkdir -p "$RAM_TMP" 2>/dev/null && chmod 777 "$RAM_TMP" 2>/dev/null
+SVC_PID_FILE="$RAM_TMP/carrotbridge_svc.pid"
+JAVA_PID_FILE="$RAM_TMP/carrotbridge_java.pid"
+SVC_LOG_FILE="$RAM_TMP/carrotbridge_svc.log"
+UPDATER_LOG_FILE="$RAM_TMP/carrotbridge_updater.log"
+OTA_RESTART_FILE="$RAM_TMP/carrotbridge_ota_restart"
+CHECK_UPDATE_FILE="$RAM_TMP/carrotbridge_check_update"
+HOTSPOT_PAUSE_FILE="$RAM_TMP/carrotbridge_hotspot_pause"
 
 is_pid_matching() {
     _chk_pid="$1"
@@ -39,10 +46,24 @@ if [ -f "$SVC_PID_FILE" ]; then
     fi
 fi
 echo "$$" > "$SVC_PID_FILE" 2>/dev/null
+if [ -e /data/local/tmp/carrotbridge_status.json ] || [ -d /data/local/tmp/hkg_tbt_dump ] || [ -e /data/local/tmp/carrotbridge_svc.pid ]; then
+    rm -rf /data/local/tmp/hkg_tbt_dump /data/local/tmp/carrotbridge_* 2>/dev/null
+fi
 ENG_PREF="/data/data/com.hkmc.system.app.engineering/shared_prefs/com.hkmc.system.app.engineering_preferences.xml"
 BRIDGE_PID=""
 LOOP_COUNT=0
 BRIDGE_START_LOOP=0
+
+rotate_ram_log() {
+    _lf="$1"
+    if [ -f "$_lf" ]; then
+        _sz="$(/system/bin/busybox wc -c < "$_lf" 2>/dev/null)"
+        if [ -n "$_sz" ] && [ "$_sz" -ge 262144 ] 2>/dev/null; then
+            cp "$_lf" "${_lf}.old" 2>/dev/null
+            : > "$_lf" 2>/dev/null
+        fi
+    fi
+}
 
 log_info() {
     echo "[CarrotBridge] $*"
@@ -56,12 +77,13 @@ kill_bridge_java() {
     fi
     if [ -f "$JAVA_PID_FILE" ]; then
         _old_jpid="$(cat "$JAVA_PID_FILE" 2>/dev/null)"
-        if is_pid_matching "$_old_jpid" "CarrotBridgeMain" || is_pid_matching "$_old_jpid" "carrotbridge.jar"; then
+        if is_pid_matching "$_old_jpid" "com.hkg.carrotbridge" || is_pid_matching "$_old_jpid" "CarrotBridgeMain" || is_pid_matching "$_old_jpid" "carrotbridge.jar"; then
             kill "$_old_jpid" >/dev/null 2>&1
         fi
         rm -f "$JAVA_PID_FILE" 2>/dev/null
     fi
     /system/bin/busybox pkill -f "com.hkg.carrotbridge.CarrotBridgeMain daemon" >/dev/null 2>&1
+    /system/bin/busybox pkill -f "^com\.hkg\.carrotbridge" >/dev/null 2>&1
 }
 
 disable_adb_tcp() {
@@ -159,7 +181,7 @@ start_bridge_java() {
     fi
     if [ -f "$JAVA_PID_FILE" ]; then
         saved_jpid="$(cat "$JAVA_PID_FILE" 2>/dev/null)"
-        if is_pid_matching "$saved_jpid" "CarrotBridgeMain" || is_pid_matching "$saved_jpid" "carrotbridge.jar"; then
+        if is_pid_matching "$saved_jpid" "com.hkg.carrotbridge" || is_pid_matching "$saved_jpid" "CarrotBridgeMain" || is_pid_matching "$saved_jpid" "carrotbridge.jar"; then
             BRIDGE_PID="$saved_jpid"
             return 0
         fi
@@ -175,8 +197,8 @@ start_bridge_java() {
 check_bridge_java_watchdog() {
     if [ -z "$BRIDGE_PID" ] || ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
         elapsed_loops=$((LOOP_COUNT - ${BRIDGE_START_LOOP:-0}))
-        if [ -f "/data/local/tmp/carrotbridge_ota_restart" ]; then
-            rm -f "/data/local/tmp/carrotbridge_ota_restart" 2>/dev/null
+        if [ -f "$OTA_RESTART_FILE" ] || [ -f "/data/local/tmp/carrotbridge_ota_restart" ]; then
+            rm -f "$OTA_RESTART_FILE" "/data/local/tmp/carrotbridge_ota_restart" 2>/dev/null
         elif [ "$elapsed_loops" -ge 0 ] && [ "$elapsed_loops" -le 3 ] && [ -f "$INSTALL_DIR/bin/carrotbridge.jar.bak" ]; then
             log_info "Daemon exited within ${elapsed_loops} loops! Rolling back carrotbridge.jar.bak -> carrotbridge.jar"
             cp "$INSTALL_DIR/bin/carrotbridge.jar.bak" "$INSTALL_DIR/bin/carrotbridge.jar" 2>/dev/null
@@ -189,9 +211,9 @@ check_bridge_java_watchdog() {
 run_github_update_check() {
     log_info "Triggering GitHub Auto-Update check (GRT47/HKG_5W_CarrotNavi)..."
     if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
-        echo 1 > /data/local/tmp/carrotbridge_check_update 2>/dev/null
+        echo 1 > "$CHECK_UPDATE_FILE" 2>/dev/null
     else
-        CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" 2>&1
+        CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" >>"$UPDATER_LOG_FILE" 2>&1
     fi
 }
 
@@ -208,8 +230,7 @@ log_info "Service started (pid=$$)"
 HOTSPOT_CONF="$INSTALL_DIR/config/hotspot_auto.conf"
 WIFI_CONF="$INSTALL_DIR/config/wifi_auto.conf"
 # Created by the dashboard "WiFi(Client) 설정" button to pause auto-hotspot maintenance until the next boot
-HOTSPOT_PAUSE_FILE="/data/local/tmp/carrotbridge_hotspot_pause"
-rm -f "$HOTSPOT_PAUSE_FILE" 2>/dev/null
+rm -f "$HOTSPOT_PAUSE_FILE" "/data/local/tmp/carrotbridge_hotspot_pause" 2>/dev/null
 if [ -f "$HOTSPOT_CONF" ]; then
     raw_conf="$(cat "$HOTSPOT_CONF" 2>/dev/null)"
     case "$raw_conf" in
@@ -314,8 +335,12 @@ while true; do
         fi
     fi
 
-    # 2. Supervise Java 7706 Bridge Daemon
+    # 2. Supervise Java 7706 Bridge Daemon & enforce RAM log size cap (256 KB + .old)
     check_bridge_java_watchdog
+    if [ $((LOOP_COUNT % 12)) -eq 0 ]; then
+        rotate_ram_log "$SVC_LOG_FILE"
+        rotate_ram_log "$UPDATER_LOG_FILE"
+    fi
 
     # 3. Automatic USB TBT Dump when USB stick is mounted
     if grep -qE "/storage/usb0|/mnt/media_rw/usb0" /proc/mounts 2>/dev/null; then

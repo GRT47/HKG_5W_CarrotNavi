@@ -56,7 +56,9 @@ am startservice -n com.hkmc.wifisettings/.service.HotspotService >/dev/null 2>&1
 am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 >/dev/null 2>&1
 
 # 5. Clear any stale PID files from previous boots/installs and request Status Dashboard UI to open immediately
-rm -f /data/local/tmp/carrotbridge_svc.pid /data/local/tmp/carrotbridge_java.pid >/dev/null 2>&1
-echo 1 > /data/local/tmp/carrotbridge_show_ui 2>/dev/null
+mkdir -p /dev/hkg_tmp 2>/dev/null && chmod 777 /dev/hkg_tmp 2>/dev/null
+rm -f /dev/hkg_tmp/carrotbridge_svc.pid /dev/hkg_tmp/carrotbridge_java.pid >/dev/null 2>&1
+rm -rf /data/local/tmp/hkg_tbt_dump /data/local/tmp/carrotbridge_* >/dev/null 2>&1
+echo 1 > /dev/hkg_tmp/carrotbridge_show_ui 2>/dev/null
 
 exit 0

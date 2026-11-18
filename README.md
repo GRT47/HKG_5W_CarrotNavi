@@ -39,7 +39,7 @@
 
 4. **USB / 로컬 TBT 정밀 덤프 (`scripts/tbt-dump.sh`)**
    - `am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0` 브로드캐스트로 `com.mnsoft.navi` 내부 `[Cluster]` 평문 TBT 로거 자동 활성화
-   - 경로안내 중 모든 TBT 이벤트와 `dumpsys` 스냅샷을 `/data/local/tmp/hkg_tbt_dump/tbt_live_trace.log`에 기록하며, USB 메모리(`/storage/usb0`) 장착 시 `/storage/usb0/HKG_TBT_Dump/`로 자동 복사
+   - 경로안내 중 모든 TBT 이벤트와 `dumpsys` 스냅샷을 RAM 디스크(`/dev/hkg_tmp/hkg_tbt_dump/tbt_live_trace.log`, 512 KB 상한 + `.old` 로테이션)에 기록하며, USB 메모리(`/storage/usb0`) 장착 시 `/storage/usb0/HKG_TBT_Dump/`로 자동 복사
    - 대시보드 `TBT 정밀 덤프` 버튼 또는 USB 장착 시 함께 수집되는 파일:
      - 내비·클러스터: `dumpsys_cluster_latest.txt`, `logcat_navi_recent.txt`, `dumpsys_navi_broadcasts.txt`(`DestinationInfo`/`Route_Guide_Status`/`GuidStatus`), `dumpsys_location.txt`
      - 무선 모드 진단: `wireless_state.txt`(무선 모드 설정 파일, STA/AP 상태, 관련 시스템 속성, `hostapd`/`wpa_supplicant`/`dnsmasq` 프로세스), `logcat_wifi_recent.txt`(`WifiService`/`WifiStateMachine`/`WifiSettings`/`CarrotBridge`)
@@ -47,7 +47,7 @@
 
 5. **MAP 버튼 3연타 & NEMESIS 대시보드 상태 오버레이 (`StatusDashboardOverlay`, 대시보드 v2)**
    - 전면 물리 `MAP` 버튼을 연속 3번 누르거나(`ivi_mode_broadcast` `KEYCODE_SHORTCUT_MAP` / `com.hkmc.intent.action.MAP_SHORTCUT` 감지), NEMESIS 대시보드에서 `CarrotNavi 7706 Bridge`를 선택하면 **전체화면(1920×720, 1280×480dp) 상태 대시보드**가 즉시 표시됨 (다시 MAP 3연타 또는 `닫기`로 닫힘, 항상 `상태` 탭으로 열림)
-   - **상단 바**: 패키지 버전·업데이트 상태(`v1.3.4 · 최신`), `상태 | 설정` 탭, 상태 아이콘 3개(콤마 기기 IP / 차량 GPS 사용 위성 수 `9기` / 무선 `핫스팟`·`WiFi`, 색상: 초록 정상 · 파랑 추측항법(DR)·무선 · 노랑 확인 필요 · 회색 꺼짐), 종합 상태(`정상` / `확인 필요` / `전송 꺼짐`), 자동 닫힘 카운터(`58초 후 닫힘`, 터치 시 `일시정지`/`재개`, 다시 열면 초기화), 닫기 버튼
+   - **상단 바**: 패키지 버전·업데이트 상태(`v1.3.5 · 최신`), `상태 | 설정` 탭, 상태 아이콘 3개(콤마 기기 IP / 차량 GPS 사용 위성 수 `9기` / 무선 `핫스팟`·`WiFi`, 색상: 초록 정상 · 파랑 추측항법(DR)·무선 · 노랑 확인 필요 · 회색 꺼짐), 종합 상태(`정상` / `확인 필요` / `전송 꺼짐`), 자동 닫힘 카운터(`58초 후 닫힘`, 터치 시 `일시정지`/`재개`, 다시 열면 초기화), 닫기 버튼
    - **상태 탭**
      - **경로 안내**: 회전 아이콘(좌·우·완만한 좌우·U턴·회전교차로·톨게이트·도착), 남은 거리, 회전명, 한글 교차로명, 진행 막대, 다음 안내, 목적지까지 거리·시간 (미안내 시 `경로 안내 없음` 표시)
      - **속도·단속**: 제한속도 표지판, 도로 종별, 현재 차속, 전방 단속카메라/방지턱 거리 또는 구간단속 남은 거리·구간 평균속도

@@ -5,7 +5,9 @@ export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
 export ANDROID_DATA=/data
 
-LOCAL_DUMP_DIR="/data/local/tmp/hkg_tbt_dump"
+RAM_TMP="/dev/hkg_tmp"
+mkdir -p "$RAM_TMP" 2>/dev/null && chmod 777 "$RAM_TMP" 2>/dev/null
+LOCAL_DUMP_DIR="$RAM_TMP/hkg_tbt_dump"
 mkdir -p "$LOCAL_DUMP_DIR" 2>/dev/null
 
 # Wake up com.mnsoft.navi [Cluster] logger
@@ -21,12 +23,17 @@ ip addr > "$LOCAL_DUMP_DIR/ip_addr.txt" 2>&1
 ip route show table all > "$LOCAL_DUMP_DIR/ip_route_all.txt" 2>&1
 cat /proc/net/arp > "$LOCAL_DUMP_DIR/arp_table.txt" 2>&1
 
-if [ -f "/data/local/tmp/carrotbridge_status.json" ]; then
+if [ -f "$RAM_TMP/carrotbridge_status.json" ]; then
+    cp "$RAM_TMP/carrotbridge_status.json" "$LOCAL_DUMP_DIR/carrotbridge_status.json" 2>/dev/null
+elif [ -f "/data/local/tmp/carrotbridge_status.json" ]; then
     cp "/data/local/tmp/carrotbridge_status.json" "$LOCAL_DUMP_DIR/carrotbridge_status.json" 2>/dev/null
 fi
-if [ -f "/data/local/tmp/carrotbridge_updater.log" ]; then
+if [ -f "$RAM_TMP/carrotbridge_updater.log" ]; then
+    cp "$RAM_TMP/carrotbridge_updater.log" "$LOCAL_DUMP_DIR/carrotbridge_updater.log" 2>/dev/null
+elif [ -f "/data/local/tmp/carrotbridge_updater.log" ]; then
     cp "/data/local/tmp/carrotbridge_updater.log" "$LOCAL_DUMP_DIR/carrotbridge_updater.log" 2>/dev/null
 fi
+[ -f "$RAM_TMP/carrotbridge_updater.log.old" ] && cp "$RAM_TMP/carrotbridge_updater.log.old" "$LOCAL_DUMP_DIR/carrotbridge_updater.log.old" 2>/dev/null
 
 # 1b. Boot wireless auto-activation diagnostics (핫스팟(AP) / WiFi(Client) / 끄기(수동))
 if [ -d "/data/nemesis/apps/carrotnavi.bridge" ]; then
@@ -39,7 +46,7 @@ fi
     for f in hotspot_auto.conf wifi_auto.conf comma_tx_enabled.conf; do
         echo "config/$f: $(cat "$INSTALL_DIR/config/$f" 2>/dev/null)"
     done
-    if [ -f /data/local/tmp/carrotbridge_hotspot_pause ]; then
+    if [ -f "$RAM_TMP/carrotbridge_hotspot_pause" ] || [ -f "/data/local/tmp/carrotbridge_hotspot_pause" ]; then
         echo "hotspot_pause_file: present"
     else
         echo "hotspot_pause_file: absent"
@@ -56,9 +63,12 @@ fi
 } > "$LOCAL_DUMP_DIR/wireless_state.txt" 2>&1
 logcat -d -v time WifiService:V WifiStateMachine:V WifiController:V WifiSettings:V SoftapController:V \
     Tethering:V PhoneProjection:I CarrotBridge:I *:S > "$LOCAL_DUMP_DIR/logcat_wifi_recent.txt" 2>&1
-if [ -f "/data/local/tmp/carrotbridge_svc.log" ]; then
+if [ -f "$RAM_TMP/carrotbridge_svc.log" ]; then
+    cp "$RAM_TMP/carrotbridge_svc.log" "$LOCAL_DUMP_DIR/carrotbridge_svc.log" 2>/dev/null
+elif [ -f "/data/local/tmp/carrotbridge_svc.log" ]; then
     cp "/data/local/tmp/carrotbridge_svc.log" "$LOCAL_DUMP_DIR/carrotbridge_svc.log" 2>/dev/null
 fi
+[ -f "$RAM_TMP/carrotbridge_svc.log.old" ] && cp "$RAM_TMP/carrotbridge_svc.log.old" "$LOCAL_DUMP_DIR/carrotbridge_svc.log.old" 2>/dev/null
 for nlog in /data/nemesis/logs/carrotnavi.bridge/*.log /data/nemesis/log/carrotnavi.bridge/*.log; do
     [ -f "$nlog" ] && cp "$nlog" "$LOCAL_DUMP_DIR/nemesis_$(basename "$nlog")" 2>/dev/null
 done

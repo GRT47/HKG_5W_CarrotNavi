@@ -59,7 +59,7 @@ import javax.net.ssl.X509TrustManager;
  * 2. Full 7-item Speed Camera & Safety Zone (SDI) + Turn-By-Turn (TBT v1) mapping to CarrotPilot's
  *    UDP 7706 JSON schema (CarrotServ.update).
  * 3. Automatic discovery of CarrotPilot via UDP 7705 broadcast listener + /proc/net/arp scan on wlan0.
- * 4. Automatic live TBT trace logging (/data/local/tmp/hkg_tbt_dump/tbt_live_trace.log) whenever route
+ * 4. Automatic live TBT trace logging (/dev/hkg_tmp/hkg_tbt_dump/tbt_live_trace.log) whenever route
  *    guidance is active, enabling precision TBT reverse engineering via USB or local dump.
  * 5. Android 4.4.2 GitHub Auto-Updater with custom UDP DNS (8.8.8.8 / 1.1.1.1 to bypass rmnet1 private DNS),
  *    explicit TLSv1.2 + SNI via conscrypt.odex, HTTP redirect support, and SHA-256 verification.
@@ -68,7 +68,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.3.4";
+    public static final String BRIDGE_VERSION = "1.3.5";
     public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
@@ -79,7 +79,17 @@ public class CarrotBridgeMain {
     private static final int CARROT_TARGET_PORT = 7706;
     private static final int CARROT_ROUTE_TCP_PORT = 7709;
     public static final int NAVI_ROUTE_MAX_POINTS = 4096;
-    private static final long TRACE_MAX_BYTES = 4L * 1024L * 1024L; // 4 MB cap with rotation
+    public static final String RAM_TMP_DIR = "/dev/hkg_tmp";
+    public static final String DUMP_DIR_PATH = RAM_TMP_DIR + "/hkg_tbt_dump";
+    public static final String STATUS_FILE_PATH = RAM_TMP_DIR + "/carrotbridge_status.json";
+    public static final String SHOW_UI_TRIGGER_PATH = RAM_TMP_DIR + "/carrotbridge_show_ui";
+    public static final String CHECK_UPDATE_TRIGGER_PATH = RAM_TMP_DIR + "/carrotbridge_check_update";
+    public static final String OTA_RESTART_FLAG_PATH = RAM_TMP_DIR + "/carrotbridge_ota_restart";
+    public static final String SVC_PID_FILE_PATH = RAM_TMP_DIR + "/carrotbridge_svc.pid";
+    public static final String JAVA_PID_FILE_PATH = RAM_TMP_DIR + "/carrotbridge_java.pid";
+    public static final String HOTSPOT_PAUSE_FILE_PATH = RAM_TMP_DIR + "/carrotbridge_hotspot_pause";
+    public static final String PROCESS_ARGV0 = "com.hkg.carrotbridge";
+    static final long TRACE_MAX_BYTES = 512L * 1024L; // 512 KB cap (+ 1 .old generation) in /dev/hkg_tmp
 
     /**
      * Thread-safe navigation state model aggregated from logcat + dumpsys.
@@ -3050,12 +3060,35 @@ public class CarrotBridgeMain {
     // TRACE FILE & SHELL HELPERS
     // =========================================================================
 
-    private static synchronized void appendTraceLine(File traceFile, String line) {
+    public static void setProcessArgV0(String name) {
+        if (name == null || name.isEmpty()) return;
+        try {
+            Class.forName("android.os.Process")
+                    .getMethod("setArgV0", String.class)
+                    .invoke(null, name);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void ensureRamTmpDir() {
+        try {
+            File ramDir = new File(RAM_TMP_DIR);
+            if (!ramDir.exists()) {
+                ramDir.mkdirs();
+            }
+            ramDir.setReadable(true, false);
+            ramDir.setWritable(true, false);
+            ramDir.setExecutable(true, false);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    static synchronized void appendTraceLine(File traceFile, String line) {
         if (traceFile == null) return;
         try {
             File parent = traceFile.getParentFile();
             if (parent != null && !parent.exists()) parent.mkdirs();
-            if (traceFile.exists() && traceFile.length() > TRACE_MAX_BYTES) {
+            if (traceFile.exists() && traceFile.length() >= TRACE_MAX_BYTES) {
                 File old = new File(traceFile.getAbsolutePath() + ".old");
                 if (old.exists()) old.delete();
                 traceFile.renameTo(old);
@@ -3148,7 +3181,8 @@ public class CarrotBridgeMain {
                             StatusDashboardOverlay.notifyUpdateResult(10, nowStr);
                         }
                         try {
-                            writeBytesAtomic(new File("/data/local/tmp/carrotbridge_ota_restart"), "1".getBytes(UTF8));
+                            ensureRamTmpDir();
+                            writeBytesNoSync(new File(OTA_RESTART_FLAG_PATH), "1".getBytes(UTF8));
                         } catch (Exception ignored) {
                         }
                         try { Thread.sleep(1200L); } catch (InterruptedException ignored) {}
@@ -3239,13 +3273,15 @@ public class CarrotBridgeMain {
     }
 
     public static void runDaemon(final String installDir) throws Exception {
+        setProcessArgV0(PROCESS_ARGV0);
+        ensureRamTmpDir();
         final NavState navState = new NavState();
-        final File dumpDir = new File("/data/local/tmp/hkg_tbt_dump");
+        final File dumpDir = new File(DUMP_DIR_PATH);
         if (!dumpDir.exists()) dumpDir.mkdirs();
         final File traceFile = new File(dumpDir, "tbt_live_trace.log");
-        final File statusFile = new File("/data/local/tmp/carrotbridge_status.json");
-        final File showUiTriggerFile = new File("/data/local/tmp/carrotbridge_show_ui");
-        final File checkUpdateTriggerFile = new File("/data/local/tmp/carrotbridge_check_update");
+        final File statusFile = new File(STATUS_FILE_PATH);
+        final File showUiTriggerFile = new File(SHOW_UI_TRIGGER_PATH);
+        final File checkUpdateTriggerFile = new File(CHECK_UPDATE_TRIGGER_PATH);
 
         System.out.println("[CarrotBridge] Starting daemon v" + BRIDGE_VERSION + " (installDir=" + installDir + ")");
         commaTxEnabled = loadCommaTxEnabledConfig(installDir);
@@ -3636,7 +3672,7 @@ public class CarrotBridgeMain {
             sb.append("  \"gpsSatInView\": ").append(satInView).append(",\n");
             sb.append("  \"lastPacket\": ").append(lastPacketJson).append("\n");
             sb.append("}\n");
-            writeBytesAtomic(statusFile, sb.toString().getBytes(UTF8));
+            writeBytesNoSync(statusFile, sb.toString().getBytes(UTF8));
         } catch (Exception ignored) {
         }
     }
@@ -4690,9 +4726,11 @@ public class CarrotBridgeMain {
 
     private static void healStaleServicePidFile(String installDir) {
         try {
-            File svcPidFile = new File("/data/local/tmp/carrotbridge_svc.pid");
-            if (!svcPidFile.isFile()) return;
-            String pidStr = new String(readAllBytes(new FileInputStream(svcPidFile)), UTF8).trim();
+            File svcPidFile = new File(SVC_PID_FILE_PATH);
+            File legacySvcPidFile = new File("/data/local/tmp/carrotbridge_svc.pid");
+            File targetPidFile = svcPidFile.isFile() ? svcPidFile : (legacySvcPidFile.isFile() ? legacySvcPidFile : null);
+            if (targetPidFile == null) return;
+            String pidStr = new String(readAllBytes(new FileInputStream(targetPidFile)), UTF8).trim();
             if (pidStr.isEmpty()) return;
             File cmdlineFile = new File("/proc/" + pidStr + "/cmdline");
             boolean isReallyBridgeDaemon = false;
@@ -4704,7 +4742,9 @@ public class CarrotBridgeMain {
             }
             if (!isReallyBridgeDaemon) {
                 System.out.println("[AutoUpdate] Removing stale carrotbridge_svc.pid (" + pidStr + ") and starting bridge-daemon.sh");
-                svcPidFile.delete();
+                targetPidFile.delete();
+                legacySvcPidFile.delete();
+                new File(JAVA_PID_FILE_PATH).delete();
                 new File("/data/local/tmp/carrotbridge_java.pid").delete();
                 File daemonScript = new File(installDir, "svc/bridge-daemon.sh");
                 if (daemonScript.isFile()) {
@@ -4735,13 +4775,23 @@ public class CarrotBridgeMain {
     }
 
     private static void writeBytesAtomic(File target, byte[] content) throws IOException {
+        writeBytesInternal(target, content, true);
+    }
+
+    static void writeBytesNoSync(File target, byte[] content) throws IOException {
+        writeBytesInternal(target, content, false);
+    }
+
+    private static void writeBytesInternal(File target, byte[] content, boolean syncDisk) throws IOException {
         File parent = target.getParentFile();
         if (parent != null && !parent.exists()) parent.mkdirs();
         File tmp = new File(target.getAbsolutePath() + ".tmp");
         FileOutputStream fos = new FileOutputStream(tmp);
         try {
             fos.write(content);
-            fos.getFD().sync();
+            if (syncDisk) {
+                fos.getFD().sync();
+            }
         } finally {
             fos.close();
         }
@@ -4776,7 +4826,7 @@ public class CarrotBridgeMain {
         private static volatile Object rootOverlayView = null;
         // Created when the user opens WiFi(Client) settings: bridge-daemon.sh skips auto-hotspot maintenance while it
         // exists (AP and STA cannot run concurrently on this Broadcom firmware). Deleted by the daemon on every boot.
-        private static final String HOTSPOT_PAUSE_FILE = "/data/local/tmp/carrotbridge_hotspot_pause";
+        private static final String HOTSPOT_PAUSE_FILE = HOTSPOT_PAUSE_FILE_PATH;
         static final long AUTO_CLOSE_DURATION_MS = 60000L;
         private static volatile boolean isVisible = false;
         private static volatile long shownAtMs = 0L;
@@ -6631,7 +6681,7 @@ public class CarrotBridgeMain {
                         if (usbDir.exists()) {
                             actionBannerMsg = "✅ USB(/storage/usb0/HKG_TBT_Dump) 및 로컬 덤프 저장 완료! (" + nowStr + ")";
                         } else {
-                            actionBannerMsg = "✅ 로컬(/data/local/tmp/hkg_tbt_dump) 덤프 완료! (USB 꽂으면 자동 복사됨)";
+                            actionBannerMsg = "✅ 로컬(" + DUMP_DIR_PATH + ") 덤프 완료! (USB 꽂으면 자동 복사됨)";
                         }
                     } catch (Throwable t) {
                         actionBannerMsg = "⚠️ 덤프 실행 중 오류: " + t.getMessage();
@@ -6693,7 +6743,8 @@ public class CarrotBridgeMain {
             // While auto-hotspot is ON, bridge-daemon.sh re-enables the AP every 5 s, which would kill any WiFi(Client)
             // connection made here. Pause that maintenance until the next boot (the daemon deletes this file at startup).
             try {
-                writeBytesAtomic(new File(HOTSPOT_PAUSE_FILE), "1\n".getBytes(UTF8));
+                ensureRamTmpDir();
+                writeBytesNoSync(new File(HOTSPOT_PAUSE_FILE), "1\n".getBytes(UTF8));
             } catch (Throwable ignored) {
             }
             hideOnUiThread();
@@ -7620,12 +7671,73 @@ public class CarrotBridgeMain {
             throw new AssertionError("dumpsys location stale sample (>20s) must be rejected");
         }
 
+        if (!DUMP_DIR_PATH.startsWith("/dev/hkg_tmp/")
+                || !STATUS_FILE_PATH.startsWith("/dev/hkg_tmp/")
+                || !SHOW_UI_TRIGGER_PATH.startsWith("/dev/hkg_tmp/")
+                || !CHECK_UPDATE_TRIGGER_PATH.startsWith("/dev/hkg_tmp/")
+                || !OTA_RESTART_FLAG_PATH.startsWith("/dev/hkg_tmp/")
+                || !SVC_PID_FILE_PATH.startsWith("/dev/hkg_tmp/")
+                || !JAVA_PID_FILE_PATH.startsWith("/dev/hkg_tmp/")
+                || !HOTSPOT_PAUSE_FILE_PATH.startsWith("/dev/hkg_tmp/")) {
+            throw new AssertionError("All volatile runtime paths must live under /dev/hkg_tmp/");
+        }
+        if (TRACE_MAX_BYTES < 256L * 1024L || TRACE_MAX_BYTES > 512L * 1024L) {
+            throw new AssertionError("TRACE_MAX_BYTES out of 256~512 KB range: " + TRACE_MAX_BYTES);
+        }
+        setProcessArgV0(PROCESS_ARGV0);
+
+        File testTmpRoot = new File(System.getProperty("java.io.tmpdir"),
+                "carrotbridge_ramdisk_test_" + System.nanoTime());
+        testTmpRoot.mkdirs();
+        try {
+            File noSyncFile = new File(testTmpRoot, "status.json");
+            byte[] sampleBytes = "{\"ok\":true}\n".getBytes(UTF8);
+            writeBytesNoSync(noSyncFile, sampleBytes);
+            File leftoverTmp = new File(noSyncFile.getAbsolutePath() + ".tmp");
+            if (!noSyncFile.isFile() || noSyncFile.length() != sampleBytes.length || leftoverTmp.exists()) {
+                throw new AssertionError("writeBytesNoSync verification failed");
+            }
+
+            File testTrace = new File(testTmpRoot, "tbt_live_trace.log");
+            FileOutputStream padFos = new FileOutputStream(testTrace);
+            try {
+                byte[] chunk = new byte[4096];
+                long remaining = TRACE_MAX_BYTES;
+                while (remaining > 0L) {
+                    int n = (int) Math.min(chunk.length, remaining);
+                    padFos.write(chunk, 0, n);
+                    remaining -= n;
+                }
+            } finally {
+                padFos.close();
+            }
+            appendTraceLine(testTrace, "ROTATE_CHECK");
+            File oldTrace = new File(testTrace.getAbsolutePath() + ".old");
+            if (!oldTrace.isFile() || oldTrace.length() != TRACE_MAX_BYTES
+                    || !testTrace.isFile() || testTrace.length() >= 256L) {
+                throw new AssertionError("Trace rotation test failed: cur=" + testTrace.length() + " old=" + oldTrace.length());
+            }
+            String curLine = new String(readAllBytes(new FileInputStream(testTrace)), UTF8);
+            if (!curLine.contains("ROTATE_CHECK")) {
+                throw new AssertionError("Rotated trace missing new log line");
+            }
+        } finally {
+            File[] children = testTmpRoot.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    child.delete();
+                }
+            }
+            testTmpRoot.delete();
+        }
+
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());
         return 0;
     }
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0 || "daemon".equals(args[0])) {
+            setProcessArgV0(PROCESS_ARGV0);
             String installDir = args.length >= 2 ? args[1] : "/data/nemesis/apps/carrotnavi.bridge";
             runDaemon(installDir);
         } else if ("update".equals(args[0])) {
@@ -7637,7 +7749,8 @@ public class CarrotBridgeMain {
             int code = runAutoUpdate(owner, repo, branch, installDir, force);
             System.exit(code);
         } else if ("show-ui".equals(args[0])) {
-            writeBytesAtomic(new File("/data/local/tmp/carrotbridge_show_ui"), "1".getBytes(UTF8));
+            ensureRamTmpDir();
+            writeBytesNoSync(new File(SHOW_UI_TRIGGER_PATH), "1".getBytes(UTF8));
         } else if ("test-self".equals(args[0])) {
             System.exit(runSelfTest());
         } else {
