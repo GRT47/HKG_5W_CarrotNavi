@@ -324,11 +324,18 @@ def build(require_keys: bool = False) -> None:
         stage_hooks_jar = STAGE_DIR / hooks_jar_rel
         build_hooks_jar(javac, java, d8, android_jar, hook_stub_classes, hook_classes, hook_dex_dir, stage_hooks_jar)
 
-        # 5. Stage mod.json + settings.json (normalized LF) & sign mod directory with HMG-API ECDSA P-256 key
+        # 5. Stage mod.json + settings.json + icons/* (normalized LF) & sign mod directory with HMG-API ECDSA P-256 key
         (STAGE_DIR / "mod.json").write_bytes((BASE_DIR / "mod.json").read_bytes().replace(b"\r\n", b"\n"))
         settings_src = BASE_DIR / "settings.json"
         if settings_src.is_file():
             (STAGE_DIR / "settings.json").write_bytes(settings_src.read_bytes().replace(b"\r\n", b"\n"))
+        icons_src = BASE_DIR / "icons"
+        if icons_src.is_dir():
+            for icon_fp in sorted(icons_src.iterdir()):
+                if icon_fp.is_file():
+                    dst = STAGE_DIR / "icons" / icon_fp.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(icon_fp, dst)
 
         subprocess.run([
             javac, "--release", "8", "-encoding", "UTF-8",

@@ -1,12 +1,12 @@
 {
   "id": "carrotbridge-panel",
-  "name": "CarrotNavi 분할화면 · WiFi+LTE 공존",
-  "version": "1.1.0",
+  "name": "CarrotNavi 분할화면 · 앱 메뉴 · WiFi+LTE 공존",
+  "version": "1.2.0",
   "hmgapi": ">=1.0.0",
   "authors": ["GRT47"],
   "license": "MIT",
   "repo": "https://github.com/GRT47/HKG_5W_CarrotNavi",
-  "description": "HKG 5W CarrotNavi 연결 상태를 순정 우측 분할화면 페이지로 표시하고, WiFi(Client) 연결 시에도 순정 LTE(rmnet0) 기본 회선이 끊어지지 않도록 유지합니다(keep_lte_on_wifi).",
+  "description": "HKG 5W CarrotNavi를 순정 전체 앱 메뉴와 사용자 버튼(★)에 추가하고, 연결 상태 위젯을 우측 분할화면 페이지로 표시하며 WiFi(Client) 연결 시에도 순정 LTE 기본 회선을 유지합니다.",
   "live": false,
   "hooks": {
     "jar": "hooks.jar",
@@ -19,6 +19,28 @@
     }
   ],
   "provides": {
+    "launcher": [
+      {
+        "id": "carrotnavi",
+        "title": "CarrotNavi",
+        "package": "com.hkg.carrotbridge.panel",
+        "class": ".OpenDashboardActivity",
+        "icon": "icons/icon.png",
+        "icon_night": "icons/icon_night.png",
+        "icon_disabled": "icons/icon_disabled.png",
+        "icon_disabled_night": "icons/icon_disabled_night.png"
+      }
+    ],
+    "star_key": [
+      {
+        "id": "open",
+        "title": "CarrotNavi",
+        "activity": {
+          "package": "com.hkg.carrotbridge.panel",
+          "class": ".OpenDashboardActivity"
+        }
+      }
+    ],
     "panel": [
       {
         "title": "CarrotNavi",

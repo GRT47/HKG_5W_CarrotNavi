@@ -5003,6 +5003,15 @@ public class CarrotBridgeMain {
                     return -1;
                 }
 
+                CommandResult appsRes = execCommandWithStatus(
+                        new String[]{HMGAPI_DAEMON_BIN, "engine", "apps"},
+                        60000L
+                );
+                if (appsRes.exitCode != 0) {
+                    System.out.println("[AutoUpdate] HMG-API panel apps sync warning rc=" + appsRes.exitCode
+                            + (appsRes.output.isEmpty() ? "" : ": " + appsRes.output.trim()));
+                }
+
                 StatusDashboardOverlay.invalidatePanelPackageCache();
                 System.out.println("[AutoUpdate] HMG-API panel installed and applied (sha256="
                         + expectedPanelSha.substring(0, 12) + "...)");

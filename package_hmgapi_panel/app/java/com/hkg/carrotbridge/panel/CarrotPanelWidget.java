@@ -270,7 +270,7 @@ public class CarrotPanelWidget extends AppWidgetProvider {
         return s;
     }
 
-    private static void triggerDashboardOverlay() {
+    static void triggerDashboardOverlay() {
         try {
             File f = new File(SHOW_UI_TRIGGER_PATH);
             File p = f.getParentFile();
