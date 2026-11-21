@@ -36,6 +36,7 @@
    - `rmnet1`(블루링크 폐쇄망 DNS `172.19.140.37`) 함정을 우회하기 위해 공용 LTE(`rmnet0`)를 통한 직접 UDP DNS 쿼리(`8.8.8.8` / `1.1.1.1`) 수행
    - Android 4.4.2 `conscrypt.odex`의 `TLSv1.2` + SNI(`setHostname`) 명시적 활성화
    - [`version.json`](version.json) 및 `carrotbridge.jar.sha256` 기반 `SHA-256` 무결성 검증과 데몬 비정상 종료 시 `.bak` 자동 롤백 워치독 내장
+   - `/system/bin/hmgapid`가 있는 차량(또는 추후 HMG-API를 설치한 차량)은 다음 내비 ON 확인 시 `carrotbridge-panel.zip`을 자동 다운로드·무결성 검증 후 `hmgapid engine install` + `apply`까지 자동 동기화 (미설치 차량은 완전히 건너뜀)
 
 4. **USB / 로컬 TBT 정밀 덤프 (`scripts/tbt-dump.sh`)**
    - `am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0` 브로드캐스트로 `com.mnsoft.navi` 내부 `[Cluster]` 평문 TBT 로거 자동 활성화
@@ -47,7 +48,7 @@
 
 5. **MAP 버튼 3연타 & NEMESIS 대시보드 상태 오버레이 (`StatusDashboardOverlay`, 대시보드 v2)**
    - 전면 물리 `MAP` 버튼을 연속 3번 누르거나(`ivi_mode_broadcast` `KEYCODE_SHORTCUT_MAP` / `com.hkmc.intent.action.MAP_SHORTCUT` 감지), NEMESIS 대시보드에서 `CarrotNavi 7706 Bridge`를 선택하면 **전체화면(1920×720, 1280×480dp) 상태 대시보드**가 즉시 표시됨 (다시 MAP 3연타 또는 `닫기`로 닫힘, 항상 `상태` 탭으로 열림)
-   - **상단 바**: 패키지 버전·업데이트 상태(`v1.3.5 · 최신`), `상태 | 설정` 탭, 상태 아이콘 3개(콤마 기기 IP / 차량 GPS 사용 위성 수 `9기` / 무선 `핫스팟`·`WiFi`, 색상: 초록 정상 · 파랑 추측항법(DR)·무선 · 노랑 확인 필요 · 회색 꺼짐), 종합 상태(`정상` / `확인 필요` / `전송 꺼짐`), 자동 닫힘 카운터(`58초 후 닫힘`, 터치 시 `일시정지`/`재개`, 다시 열면 초기화), 닫기 버튼
+   - **상단 바**: 패키지 버전·업데이트 상태(`v1.3.6 · 최신`), `상태 | 설정` 탭, 상태 아이콘 3개(콤마 기기 IP / 차량 GPS 사용 위성 수 `9기` / 무선 `핫스팟`·`WiFi`, 색상: 초록 정상 · 파랑 추측항법(DR)·무선 · 노랑 확인 필요 · 회색 꺼짐), 종합 상태(`정상` / `확인 필요` / `전송 꺼짐`), 자동 닫힘 카운터(`58초 후 닫힘`, 터치 시 `일시정지`/`재개`, 다시 열면 초기화), 닫기 버튼
    - **상태 탭**
      - **경로 안내**: 회전 아이콘(좌·우·완만한 좌우·U턴·회전교차로·톨게이트·도착), 남은 거리, 회전명, 한글 교차로명, 진행 막대, 다음 안내, 목적지까지 거리·시간 (미안내 시 `경로 안내 없음` 표시)
      - **속도·단속**: 제한속도 표지판, 도로 종별, 현재 차속, 전방 단속카메라/방지턱 거리 또는 구간단속 남은 거리·구간 평균속도
@@ -58,6 +59,12 @@
      - **점검 정보**: 이 기기 IP, 콤마 기기, 전송 대상, 경로 전송(`TCP 7709`), GPS 상태(사용/관측 위성·`dB-Hz`), GPS 위치·방위, 무선 상태, 브릿지(`UDP 7706` 패킷 번호), CPU 온도·사용률, RAM
    - 아이콘은 이모지 대신 `ShapeDrawable(PathShape)` 선 아이콘으로 그려 Android 4.4(API 19)에서도 동일하게 표시
 
+6. **HMG-API 순정 우측 분할화면 위젯 (`package_hmgapi_panel`)**
+   - `Open-HMG/HMG-API`(`>= 1.0.0`)가 설치된 차량에서 순정 `설정 → 화면 → 분할 화면` 목록에 **`CarrotNavi`** 페이지를 추가하는 애드온 모드(`carrotbridge-panel.zip`)
+   - 연결 카드 3종(콤마 기기 · 차량 GPS 및 위성 사용 막대 · 무선)을 순정 우측 분할화면(`com.mobis.splitscreen.right`)에 실시간 표시하며, 카드를 탭하면 전체화면 대시보드가 열림
+   - **OTA 자동 설치·업데이트**: `/system/bin/hmgapid`가 감지되면 브릿지 OTA 확인 시 `carrotbridge-panel.zip`을 자동으로 다운로드·설치·적용(`"live": true`로 재부팅 불필요). HMG-API 미설치 차량은 무시하고, 나중에 HMG-API를 설치하면 그다음 내비 ON 확인 때 자동으로 목록에 추가됨. 사용자가 HMG-API 앱에서 모드를 OFF(`.disabled`)해 둔 상태는 그대로 유지하며, 최초 등록 후 순정 `설정 → 화면 → 분할 화면`에서 `CarrotNavi` 체크만 1회 켜면 화면에 표시됨
+   - **수동 USB 설치**: 인터넷 없이 설치할 경우 USB 루트 `HMGAPI/updates/` 폴더에 `carrotbridge-panel-1.0.0.zip` 복사 → 헤드유닛 `HMG-API` 앱 **Check USB updates** → 설치 후 **Apply changes** → 순정 `설정 → 화면 → 분할 화면`에서 `CarrotNavi` 체크
+
 ---
 
 ## 빌드 방법
@@ -65,6 +72,9 @@
 ```bash
 # CarrotNavi 7706 Bridge 패키지 및 USB 번들(HKG_5W_CarrotNavi_USB.zip) 빌드
 python package_carrotnavi_bridge/build_package.py
+
+# HMG-API 순정 분할화면 위젯 모드(carrotbridge-panel-1.0.0.zip) 빌드
+python package_hmgapi_panel/build_mod.py
 
 # Engineering WiFi Info 단독 패키지 빌드
 python package_engineering_wifiinfo/build_package.py

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.hkg.carrotbridge.panel"
+    android:versionCode="1"
+    android:versionName="1.0.0">
+
+    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="19" />
+
+    <application android:label="CarrotNavi 분할화면" android:allowBackup="false">
+        <receiver
+            android:name=".CarrotPanelWidget"
+            android:label="CarrotNavi"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.hkg.carrotbridge.panel.ACTION_UPDATE" />
+                <action android:name="com.hkg.carrotbridge.panel.ACTION_OPEN_DASHBOARD" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/carrot_panel_widget_info" />
+        </receiver>
+    </application>
+</manifest>

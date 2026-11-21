@@ -1,9 +1,12 @@
 {
-  "version": "1.3.5",
+  "version": "1.3.6",
   "repository": "https://github.com/GRT47/HKG_5W_CarrotNavi.git",
   "branch": "main",
   "release_jar_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar",
   "release_jar_sha256_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar.sha256",
+  "release_panel_version": "1.0.0",
+  "release_panel_zip_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge-panel.zip",
+  "release_panel_zip_sha256_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge-panel.zip.sha256",
   "files": {
     "svc/bridge-daemon.sh": {
       "remote": "package_carrotnavi_bridge/svc/bridge-daemon.sh",

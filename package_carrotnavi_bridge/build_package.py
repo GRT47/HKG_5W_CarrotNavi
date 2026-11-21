@@ -23,7 +23,7 @@ USB_ROOT_DIR = BUILD_DIR / "usb_root"
 OUTER_ZIP_PATH = REPO_ROOT / "HKG_5W_CarrotNavi_USB.zip"
 VERSION_JSON_PATH = REPO_ROOT / "version.json"
 
-BRIDGE_VERSION = "1.3.5"
+BRIDGE_VERSION = "1.3.6"
 GITHUB_OWNER = "GRT47"
 GITHUB_REPO = "HKG_5W_CarrotNavi"
 GITHUB_BRANCH = "main"
@@ -163,12 +163,20 @@ def build() -> None:
             "sha256": sha256_bytes(data),
         }
 
+    panel_mod_path = REPO_ROOT / "package_hmgapi_panel" / "mod.json"
+    panel_version = ""
+    if panel_mod_path.is_file():
+        panel_version = str(json.loads(panel_mod_path.read_text(encoding="utf-8")).get("version", "")).strip()
+
     version_doc = {
         "version": BRIDGE_VERSION,
         "repository": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git",
         "branch": GITHUB_BRANCH,
         "release_jar_url": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/carrotbridge.jar",
         "release_jar_sha256_url": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/carrotbridge.jar.sha256",
+        "release_panel_version": panel_version,
+        "release_panel_zip_url": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/carrotbridge-panel.zip",
+        "release_panel_zip_sha256_url": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/carrotbridge-panel.zip.sha256",
         "files": files_manifest,
     }
     version_bytes = (json.dumps(version_doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")

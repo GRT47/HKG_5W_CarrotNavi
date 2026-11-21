@@ -24,25 +24,48 @@ jobs:
           ls -lh package_carrotnavi_bridge/build/carrotbridge.jar package_carrotnavi_bridge/build/carrotbridge.jar.sha256 HKG_5W_CarrotNavi_USB.zip
           cat package_carrotnavi_bridge/build/carrotbridge.jar.sha256
 
+      - name: Build HMG-API Split-Screen Panel Mod
+        id: build_panel
+        env:
+          HMGAPI_AUTHOR_KEY: ${{ secrets.HMGAPI_AUTHOR_KEY }}
+          HMGAPI_AUTHOR_PUB: ${{ secrets.HMGAPI_AUTHOR_PUB }}
+          HMGAPI_APK_KEYSTORE_B64: ${{ secrets.HMGAPI_APK_KEYSTORE_B64 }}
+          HMGAPI_APK_KEY_PASS: ${{ secrets.HMGAPI_APK_KEY_PASS }}
+        run: |
+          if [ -n "${HMGAPI_AUTHOR_KEY}" ] && [ -n "${HMGAPI_AUTHOR_PUB}" ] && [ -n "${HMGAPI_APK_KEYSTORE_B64}" ]; then
+            python3 package_hmgapi_panel/build_mod.py --require-keys
+            ls -lh package_hmgapi_panel/build/carrotbridge-panel.zip package_hmgapi_panel/build/carrotbridge-panel.zip.sha256
+            cat package_hmgapi_panel/build/carrotbridge-panel.zip.sha256
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::HMG-API panel signing secrets (HMGAPI_AUTHOR_KEY, HMGAPI_AUTHOR_PUB, HMGAPI_APK_KEYSTORE_B64) are not set; skipping carrotbridge-panel.zip upload."
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish GitHub Release Assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PANEL_BUILT: ${{ steps.build_panel.outputs.built }}
         run: |
           VER=$(python3 -c "import json; print(json.load(open('version.json'))['version'])")
           TAG="v${VER}"
           echo "Publishing release ${TAG}..."
+          ASSETS=(
+            package_carrotnavi_bridge/build/carrotbridge.jar
+            package_carrotnavi_bridge/build/carrotbridge.jar.sha256
+            HKG_5W_CarrotNavi_USB.zip
+          )
+          if [ "${PANEL_BUILT}" = "true" ]; then
+            ASSETS+=(
+              package_hmgapi_panel/build/carrotbridge-panel.zip
+              package_hmgapi_panel/build/carrotbridge-panel.zip.sha256
+            )
+          fi
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" \
-              package_carrotnavi_bridge/build/carrotbridge.jar \
-              package_carrotnavi_bridge/build/carrotbridge.jar.sha256 \
-              HKG_5W_CarrotNavi_USB.zip \
-              --clobber
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber
             gh release edit "${TAG}" --latest
           else
-            gh release create "${TAG}" \
-              package_carrotnavi_bridge/build/carrotbridge.jar \
-              package_carrotnavi_bridge/build/carrotbridge.jar.sha256 \
-              HKG_5W_CarrotNavi_USB.zip \
+            gh release create "${TAG}" "${ASSETS[@]}" \
               --title "HKG 5W CarrotNavi Bridge ${TAG}" \
               --notes "Automated build and release of ${TAG} from pure source." \
               --latest

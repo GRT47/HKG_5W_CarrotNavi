@@ -23,9 +23,11 @@ mkdir -p /data/dalvik-cache 2>/dev/null
 mkdir -p /data/local/tmp/dalvik-cache 2>/dev/null
 
 # 1. Disable ADB TCP to prevent eth0 (192.168.0.123/24) routing conflict with wlan0 (192.168.0.1/24)
-setprop persist.service.adb.tcp.enable 0
-if [ "$(getprop persist.sys.usb.config)" != "adb" ]; then
-    stop adbd >/dev/null 2>&1
+if [ "$(getprop persist.service.adb.tcp.enable)" = "1" ]; then
+    setprop persist.service.adb.tcp.enable 0
+    if [ "$(getprop persist.sys.usb.config)" != "adb" ]; then
+        stop adbd >/dev/null 2>&1
+    fi
 fi
 ENG_PREF="/data/data/com.hkmc.system.app.engineering/shared_prefs/com.hkmc.system.app.engineering_preferences.xml"
 if [ -f "$ENG_PREF" ]; then

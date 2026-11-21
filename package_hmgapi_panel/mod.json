@@ -1,0 +1,25 @@
+{
+  "id": "carrotbridge-panel",
+  "name": "CarrotNavi 분할화면",
+  "version": "1.0.0",
+  "hmgapi": ">=1.0.0",
+  "authors": ["GRT47"],
+  "license": "MIT",
+  "repo": "https://github.com/GRT47/HKG_5W_CarrotNavi",
+  "description": "HKG 5W CarrotNavi 연결 상태(콤마 기기 · 차량 GPS · 무선)를 순정 우측 분할화면 페이지로 표시합니다. 카드를 누르면 전체 대시보드가 열립니다.",
+  "live": true,
+  "apps": [
+    {
+      "apk": "app/CarrotPanel.apk",
+      "package": "com.hkg.carrotbridge.panel"
+    }
+  ],
+  "provides": {
+    "panel": [
+      {
+        "title": "CarrotNavi",
+        "widget": "com.hkg.carrotbridge.panel/.CarrotPanelWidget"
+      }
+    ]
+  }
+}

@@ -8,6 +8,7 @@ pkg_stage/
 package_engineering_wifiinfo/src/
 package_engineering_wifiinfo/usb_root/
 package_carrotnavi_bridge/build/
+package_hmgapi_panel/build/
 .gradle/
 .externalNativeBuild/
 .cxx/
@@ -18,6 +19,7 @@ package_carrotnavi_bridge/build/
 *.jar
 *.jar.sha256
 *.zip
+*.zip.sha256
 *.o
 *.os
 *.a

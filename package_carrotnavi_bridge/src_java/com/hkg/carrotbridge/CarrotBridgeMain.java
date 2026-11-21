@@ -68,7 +68,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.3.5";
+    public static final String BRIDGE_VERSION = "1.3.6";
     public static final long GPS_STALE_TIMEOUT_MS = 2500L;
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
@@ -88,8 +88,12 @@ public class CarrotBridgeMain {
     public static final String SVC_PID_FILE_PATH = RAM_TMP_DIR + "/carrotbridge_svc.pid";
     public static final String JAVA_PID_FILE_PATH = RAM_TMP_DIR + "/carrotbridge_java.pid";
     public static final String HOTSPOT_PAUSE_FILE_PATH = RAM_TMP_DIR + "/carrotbridge_hotspot_pause";
+    public static final String PANEL_TMP_ZIP_PATH = RAM_TMP_DIR + "/carrotbridge_panel_ota.zip";
     public static final String PROCESS_ARGV0 = "com.hkg.carrotbridge";
     static final long TRACE_MAX_BYTES = 512L * 1024L; // 512 KB cap (+ 1 .old generation) in /dev/hkg_tmp
+    private static final String HMGAPI_DAEMON_BIN = "/system/bin/hmgapid";
+    private static final String HMGAPI_PANEL_MOD_ID = "carrotbridge-panel";
+    private static final String HMGAPI_PANEL_MOD_JSON = "/data/hmgapi/mods/carrotbridge-panel/mod.json";
 
     /**
      * Thread-safe navigation state model aggregated from logcat + dumpsys.
@@ -3127,6 +3131,74 @@ public class CarrotBridgeMain {
         }
     }
 
+    public static final class CommandResult {
+        public final int exitCode;
+        public final String output;
+        public final boolean timedOut;
+
+        public CommandResult(int exitCode, String output, boolean timedOut) {
+            this.exitCode = exitCode;
+            this.output = output != null ? output : "";
+            this.timedOut = timedOut;
+        }
+    }
+
+    public static CommandResult execCommandWithStatus(String[] cmd, final long timeoutMs) {
+        Process proc = null;
+        Thread timerThread = null;
+        final boolean[] timedOut = new boolean[]{false};
+        StringBuilder sb = new StringBuilder();
+        try {
+            proc = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            final Process pRef = proc;
+            if (timeoutMs > 0L) {
+                timerThread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            Thread.sleep(timeoutMs);
+                            timedOut[0] = true;
+                            try { pRef.destroy(); } catch (Throwable ignored) {}
+                        } catch (InterruptedException ignored) {
+                        }
+                    }
+                }, "CmdTimeout");
+                timerThread.setDaemon(true);
+                timerThread.start();
+            }
+            BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), UTF8));
+            try {
+                String line;
+                int keptLines = 0;
+                while ((line = br.readLine()) != null) {
+                    if (keptLines < 200) {
+                        sb.append(line).append('\n');
+                        keptLines++;
+                    }
+                }
+            } finally {
+                try { br.close(); } catch (Exception ignored) {}
+            }
+            int code = proc.waitFor();
+            if (timerThread != null) timerThread.interrupt();
+            if (timedOut[0]) {
+                return new CommandResult(-2, sb.toString(), true);
+            }
+            return new CommandResult(code, sb.toString(), false);
+        } catch (Exception e) {
+            if (timerThread != null) timerThread.interrupt();
+            if (sb.length() == 0 && e.getMessage() != null) {
+                sb.append(e.getClass().getSimpleName()).append(": ").append(e.getMessage());
+            }
+            return new CommandResult(timedOut[0] ? -2 : -1, sb.toString(), timedOut[0]);
+        } finally {
+            if (timerThread != null) timerThread.interrupt();
+            if (proc != null) {
+                try { proc.destroy(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
     public static void enableMnsoftClusterLogging() {
         execCommandCapture(new String[]{
                 "/system/bin/am", "broadcast",
@@ -3187,6 +3259,11 @@ public class CarrotBridgeMain {
                         }
                         try { Thread.sleep(1200L); } catch (InterruptedException ignored) {}
                         System.exit(0); // Watchdog in bridge-daemon.sh immediately restarts updated JAR
+                    } else if (rc == 11) {
+                        lastAutoUpdateStatus = "분할화면 패널 자동 설치 완료 (v" + BRIDGE_VERSION + ", 확인: " + nowStr + ")";
+                        if (fromUi) {
+                            StatusDashboardOverlay.notifyUpdateResult(11, nowStr);
+                        }
                     } else if (fromUi) {
                         StatusDashboardOverlay.notifyUpdateResult(rc, nowStr);
                     }
@@ -3458,6 +3535,21 @@ public class CarrotBridgeMain {
         // 3b. Route Sync Manager: Query keyless OSRM & push polyline over TCP 7709
         RouteSyncManager.start(navState, traceFile);
 
+        // 3c. One-shot HMG-API panel auto-install check (handles v1.3.5->v1.3.6 mid-trip OTA & fresh USB installs)
+        if (isHmgApiInstalled() && !isHmgApiPanelModInstalled()) {
+            Thread panelCheckThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try { Thread.sleep(8000L); } catch (InterruptedException ignored) {}
+                    if (isHmgApiInstalled() && !isHmgApiPanelModInstalled()) {
+                        triggerBackgroundAutoUpdate(installDir, 0L, false);
+                    }
+                }
+            }, "HmgApiPanelStartupCheck");
+            panelCheckThread.setDaemon(true);
+            panelCheckThread.start();
+        }
+
         // 4. Main Loop: Send UDP 7706 packets at 5Hz (every 200ms)
         DatagramSocket txSock = new DatagramSocket();
         txSock.setBroadcast(true);
@@ -3466,6 +3558,9 @@ public class CarrotBridgeMain {
         long lastArpScanMs = 0L;
         long lastLocationPollMs = 0L;
         long lastStatusWriteMs = 0L;
+        long lastPanelCheckMs = 0L;
+        long lastPanelBroadcastMs = 0L;
+        String lastPanelSig = "";
 
         while (true) {
             long now = System.currentTimeMillis();
@@ -3520,11 +3615,23 @@ public class CarrotBridgeMain {
                 latestTargetsStr = "[전송 중지됨 (OFF)]";
             }
 
-            if (now - lastStatusWriteMs > 2000L) {
-                lastStatusWriteMs = now;
-                writeStatusFile(statusFile, navState, json, targets);
-                if (navState.isGuidanceActive()) {
-                    appendTraceLine(traceFile, "TX7706: " + json);
+            boolean statusNeedDisk = (now - lastStatusWriteMs > 2000L);
+            if (statusNeedDisk || (now - lastPanelCheckMs >= 1000L)) {
+                lastPanelCheckMs = now;
+                PanelSnapshot panelSnap = buildPanelSnapshot(navState, installDir, arpPeers.size(), now);
+                String sig = panelSnap.signature();
+                boolean changed = !sig.equals(lastPanelSig);
+                if (statusNeedDisk || changed) {
+                    lastStatusWriteMs = now;
+                    writeStatusFile(statusFile, navState, json, targets, panelSnap);
+                    if (statusNeedDisk && navState.isGuidanceActive()) {
+                        appendTraceLine(traceFile, "TX7706: " + json);
+                    }
+                }
+                if (changed || (now - lastPanelBroadcastMs) >= 15000L) {
+                    lastPanelSig = sig;
+                    lastPanelBroadcastMs = now;
+                    StatusDashboardOverlay.notifyPanelWidget(panelSnap);
                 }
             }
 
@@ -3644,35 +3751,165 @@ public class CarrotBridgeMain {
         return peers;
     }
 
-    private static void writeStatusFile(File statusFile, NavState st, String lastPacketJson, Set<String> targets) {
-        try {
-            long nowMs = System.currentTimeMillis();
-            String safeRouteStatus = escapeJson(latestRouteStatus == null ? "idle" : latestRouteStatus);
-            String safeGpsStatus = escapeJson(formatGpsChipText(st, nowMs));
-            int satUsed = -1;
-            int satInView = -1;
-            if (st != null) {
-                synchronized (st) {
-                    if (isSatFreshLocked(st, nowMs)) {
-                        satUsed = st.gpsSatUsed;
-                        satInView = st.gpsSatInView;
-                    }
+    /** Snapshot of the "연결" (Connection) card shared by the full dashboard and HMG-API split-screen widget. */
+    public static final class PanelSnapshot {
+        public boolean txOn;
+        public boolean commaAlive;
+        public boolean apMode;
+        public boolean radioOn;
+        public boolean hotspotPaused;
+        public String commaIp = "";
+        public String wlanIp = "";
+        public int routePts;
+        public int commaTone;
+        public int gpsState;
+        public int gpsTone;
+        public int radioTone;
+        public String commaValue = "";
+        public String commaSub = "";
+        public String gpsValue = "";
+        public String gpsSub = "";
+        public int gpsMeterPct;
+        public String radioIcon = "hotspot";
+        public String radioValue = "";
+        public String radioSub = "";
+        public long timestampMs;
+
+        public String signature() {
+            return commaTone + "|" + commaValue + "|" + commaSub + "|"
+                    + gpsTone + "|" + gpsValue + "|" + gpsSub + "|" + gpsMeterPct + "|"
+                    + radioTone + "|" + radioIcon + "|" + radioValue + "|" + radioSub;
+        }
+    }
+
+    public static PanelSnapshot buildPanelSnapshot(NavState st, String installDir, int arpPeerCount, long nowMs) {
+        String ip = readWlanNetInfo().localIp;
+        boolean apMode = StatusDashboardOverlay.isSoftApMode(ip);
+        String bootMode = StatusDashboardOverlay.currentBootWirelessMode(installDir);
+        boolean hotspotPaused = new File(HOTSPOT_PAUSE_FILE_PATH).isFile() && "ap".equals(bootMode);
+        return buildPanelSnapshot(
+                st, nowMs, commaTxEnabled, discoveredCarrotIp, discoveredCarrotTimeMs,
+                carrotVEgoKph, latestRoutePointsCount, ip, apMode, arpPeerCount, hotspotPaused);
+    }
+
+    public static PanelSnapshot buildPanelSnapshot(NavState st, long nowMs,
+                                                   boolean txOn, String commaIpRaw, long commaSeenMs,
+                                                   double egoKph, int routePts,
+                                                   String wlanIpRaw, boolean apMode, int arpPeerCount,
+                                                   boolean hotspotPaused) {
+        PanelSnapshot p = new PanelSnapshot();
+        String commaIp = commaIpRaw == null ? "" : commaIpRaw;
+        String ip = wlanIpRaw == null ? "" : wlanIpRaw;
+        boolean commaAlive = txOn && !commaIp.isEmpty() && (nowMs - commaSeenMs) < 30000L;
+        int commaTone = !txOn ? StatusDashboardOverlay.TONE_OFF
+                : (commaAlive ? StatusDashboardOverlay.TONE_OK : StatusDashboardOverlay.TONE_WARN);
+        int gpsState = getGpsStatusState(st, nowMs);
+        int gpsTone = gpsState == 2 ? StatusDashboardOverlay.TONE_OK
+                : (gpsState == 1 ? StatusDashboardOverlay.TONE_INFO : StatusDashboardOverlay.TONE_WARN);
+        boolean radioOn = apMode || !ip.isEmpty();
+        String radioIcon = apMode ? "hotspot" : "wifi";
+        int radioTone = radioOn ? StatusDashboardOverlay.TONE_INFO : StatusDashboardOverlay.TONE_OFF;
+
+        p.txOn = txOn;
+        p.commaAlive = commaAlive;
+        p.apMode = apMode;
+        p.radioOn = radioOn;
+        p.hotspotPaused = hotspotPaused;
+        p.commaIp = commaIp;
+        p.wlanIp = ip;
+        p.routePts = routePts;
+        p.commaTone = commaTone;
+        p.gpsState = gpsState;
+        p.gpsTone = gpsTone;
+        p.radioTone = radioTone;
+        p.timestampMs = nowMs;
+
+        p.commaValue = !txOn ? "전송 꺼짐" : (commaAlive ? "연결됨" : "찾는 중");
+        if (!txOn) {
+            p.commaSub = "설정 탭에서 다시 켤 수 있습니다";
+        } else if (commaAlive) {
+            p.commaSub = commaIp + " · " + String.format(Locale.US, "%.0f", egoKph) + " km/h"
+                    + (routePts > 0 ? " · 경로 " + routePts + "pt" : "");
+        } else {
+            p.commaSub = commaIp.isEmpty() ? "같은 네트워크에 연결되면 자동으로 찾습니다" : commaIp + " (대기 중)";
+        }
+
+        p.gpsValue = formatGpsTileValue(st, nowMs);
+        p.gpsSub = formatGpsTileSub(st, nowMs);
+        p.gpsMeterPct = gpsSatMeterPct(st, nowMs);
+
+        p.radioIcon = radioIcon;
+        p.radioValue = apMode ? "핫스팟(AP)" : (ip.isEmpty() ? "꺼짐" : "WiFi(Client)");
+        String radioDetail;
+        if (apMode) {
+            radioDetail = (ip.isEmpty() ? "" : ip + " · ") + "접속 기기 " + Math.max(0, arpPeerCount) + "대";
+        } else if (!ip.isEmpty()) {
+            radioDetail = ip;
+        } else {
+            radioDetail = "무선 연결 없음";
+        }
+        if (hotspotPaused) {
+            radioDetail += " · 핫스팟 자동 유지 일시중지";
+        }
+        p.radioSub = radioDetail;
+        return p;
+    }
+
+    static String buildStatusJsonString(NavState st, String lastPacketJson, Set<String> targets, PanelSnapshot panel) {
+        long nowMs = System.currentTimeMillis();
+        if (panel == null) {
+            panel = buildPanelSnapshot(st, "/data/nemesis/apps/carrotnavi.bridge", 0, nowMs);
+        }
+        String safeRouteStatus = escapeJson(latestRouteStatus == null ? "idle" : latestRouteStatus);
+        String safeGpsStatus = escapeJson(formatGpsChipText(st, nowMs));
+        int satUsed = -1;
+        int satInView = -1;
+        if (st != null) {
+            synchronized (st) {
+                if (isSatFreshLocked(st, nowMs)) {
+                    satUsed = st.gpsSatUsed;
+                    satInView = st.gpsSatInView;
                 }
             }
-            StringBuilder sb = new StringBuilder(1024);
-            sb.append("{\n");
-            sb.append("  \"bridgeVersion\": \"").append(BRIDGE_VERSION).append("\",\n");
-            sb.append("  \"timestampMs\": ").append(nowMs).append(",\n");
-            sb.append("  \"discoveredCarrotIp\": \"").append(discoveredCarrotIp).append("\",\n");
-            sb.append("  \"targets\": \"").append(targets.toString()).append("\",\n");
-            sb.append("  \"routePoints\": ").append(latestRoutePointsCount).append(",\n");
-            sb.append("  \"routeStatus\": \"").append(safeRouteStatus).append("\",\n");
-            sb.append("  \"gpsStatus\": \"").append(safeGpsStatus).append("\",\n");
-            sb.append("  \"gpsSatUsed\": ").append(satUsed).append(",\n");
-            sb.append("  \"gpsSatInView\": ").append(satInView).append(",\n");
-            sb.append("  \"lastPacket\": ").append(lastPacketJson).append("\n");
-            sb.append("}\n");
-            writeBytesNoSync(statusFile, sb.toString().getBytes(UTF8));
+        }
+        StringBuilder sb = new StringBuilder(1400);
+        sb.append("{\n");
+        sb.append("  \"bridgeVersion\": \"").append(BRIDGE_VERSION).append("\",\n");
+        sb.append("  \"timestampMs\": ").append(nowMs).append(",\n");
+        sb.append("  \"discoveredCarrotIp\": \"").append(escapeJson(discoveredCarrotIp)).append("\",\n");
+        sb.append("  \"targets\": \"").append(escapeJson(targets == null ? "[]" : targets.toString())).append("\",\n");
+        sb.append("  \"routePoints\": ").append(latestRoutePointsCount).append(",\n");
+        sb.append("  \"routeStatus\": \"").append(safeRouteStatus).append("\",\n");
+        sb.append("  \"gpsStatus\": \"").append(safeGpsStatus).append("\",\n");
+        sb.append("  \"gpsSatUsed\": ").append(satUsed).append(",\n");
+        sb.append("  \"gpsSatInView\": ").append(satInView).append(",\n");
+        sb.append("  \"commaTxEnabled\": ").append(panel.txOn).append(",\n");
+        sb.append("  \"commaAlive\": ").append(panel.commaAlive).append(",\n");
+        sb.append("  \"commaTone\": ").append(panel.commaTone).append(",\n");
+        sb.append("  \"commaValue\": \"").append(escapeJson(panel.commaValue)).append("\",\n");
+        sb.append("  \"commaSub\": \"").append(escapeJson(panel.commaSub)).append("\",\n");
+        sb.append("  \"gpsTone\": ").append(panel.gpsTone).append(",\n");
+        sb.append("  \"gpsTileValue\": \"").append(escapeJson(panel.gpsValue)).append("\",\n");
+        sb.append("  \"gpsTileSub\": \"").append(escapeJson(panel.gpsSub)).append("\",\n");
+        sb.append("  \"gpsMeterPct\": ").append(panel.gpsMeterPct).append(",\n");
+        sb.append("  \"radioTone\": ").append(panel.radioTone).append(",\n");
+        sb.append("  \"radioIcon\": \"").append(escapeJson(panel.radioIcon)).append("\",\n");
+        sb.append("  \"radioValue\": \"").append(escapeJson(panel.radioValue)).append("\",\n");
+        sb.append("  \"radioSub\": \"").append(escapeJson(panel.radioSub)).append("\",\n");
+        sb.append("  \"lastPacket\": ").append(lastPacketJson).append("\n");
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    private static void writeStatusFile(File statusFile, NavState st, String lastPacketJson, Set<String> targets) {
+        writeStatusFile(statusFile, st, lastPacketJson, targets, null);
+    }
+
+    private static void writeStatusFile(File statusFile, NavState st, String lastPacketJson,
+                                        Set<String> targets, PanelSnapshot panel) {
+        try {
+            String jsonText = buildStatusJsonString(st, lastPacketJson, targets, panel);
+            writeBytesNoSync(statusFile, jsonText.getBytes(UTF8));
         } catch (Exception ignored) {
         }
     }
@@ -4614,6 +4851,173 @@ public class CarrotBridgeMain {
         return sb.toString();
     }
 
+    static boolean isHmgApiInstalled() {
+        return new File(HMGAPI_DAEMON_BIN).isFile();
+    }
+
+    static boolean isHmgApiPanelModInstalled() {
+        return new File(HMGAPI_PANEL_MOD_JSON).isFile();
+    }
+
+    static String readInstalledHmgApiPanelVersion() {
+        File mf = new File(HMGAPI_PANEL_MOD_JSON);
+        if (!mf.isFile()) return "";
+        try {
+            String raw = new String(readAllBytes(new FileInputStream(mf)), UTF8);
+            return extractJsonString(raw, "version");
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    static int compareSemver(String a, String b) {
+        String sa = a == null ? "" : a.trim();
+        String sb = b == null ? "" : b.trim();
+        if (sa.startsWith("v") || sa.startsWith("V")) sa = sa.substring(1);
+        if (sb.startsWith("v") || sb.startsWith("V")) sb = sb.substring(1);
+        int dashA = sa.indexOf('-');
+        if (dashA >= 0) sa = sa.substring(0, dashA);
+        int dashB = sb.indexOf('-');
+        if (dashB >= 0) sb = sb.substring(0, dashB);
+        String[] pa = sa.isEmpty() ? new String[0] : sa.split("\\.");
+        String[] pb = sb.isEmpty() ? new String[0] : sb.split("\\.");
+        int len = Math.max(pa.length, pb.length);
+        for (int i = 0; i < len; i++) {
+            int va = i < pa.length ? parseSemverComponent(pa[i]) : 0;
+            int vb = i < pb.length ? parseSemverComponent(pb[i]) : 0;
+            if (va != vb) return va < vb ? -1 : 1;
+        }
+        return 0;
+    }
+
+    private static int parseSemverComponent(String part) {
+        if (part == null) return 0;
+        StringBuilder digits = new StringBuilder();
+        for (int i = 0; i < part.length(); i++) {
+            char c = part.charAt(i);
+            if (c >= '0' && c <= '9') {
+                digits.append(c);
+            } else {
+                break;
+            }
+        }
+        if (digits.length() == 0) return 0;
+        try {
+            return Integer.parseInt(digits.toString());
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+    }
+
+    static String parseSha256Text(String raw) {
+        if (raw == null) return "";
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) return "";
+        String tok = trimmed.split("\\s+")[0].toLowerCase(Locale.US);
+        if (tok.length() != 64) return "";
+        for (int i = 0; i < 64; i++) {
+            char c = tok.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            if (!hex) return "";
+        }
+        return tok;
+    }
+
+    static boolean needsHmgApiPanelSync(
+            boolean hmgApiInstalled, boolean modInstalled, boolean force, String remotePanelVer, String installedPanelVer) {
+        if (!hmgApiInstalled) return false;
+        if (!modInstalled) return true;
+        if (force) return true;
+        if (remotePanelVer == null || remotePanelVer.trim().isEmpty()) return false;
+        if (installedPanelVer == null || installedPanelVer.trim().isEmpty()) return true;
+        return compareSemver(remotePanelVer.trim(), installedPanelVer.trim()) > 0;
+    }
+
+    private static int syncHmgApiPanelIfNeeded(String verJson, boolean force) {
+        if (!isHmgApiInstalled()) {
+            return 0;
+        }
+        String releasePanelVer = extractJsonString(verJson, "release_panel_version");
+        String releasePanelUrl = extractJsonString(verJson, "release_panel_zip_url");
+        String releasePanelShaUrl = extractJsonString(verJson, "release_panel_zip_sha256_url");
+        if (releasePanelUrl.isEmpty() || releasePanelShaUrl.isEmpty()) {
+            return 0;
+        }
+        boolean modInstalled = isHmgApiPanelModInstalled();
+        String installedPanelVer = modInstalled ? readInstalledHmgApiPanelVersion() : "";
+        if (!needsHmgApiPanelSync(true, modInstalled, force, releasePanelVer, installedPanelVer)) {
+            return 0;
+        }
+        try {
+            byte[] shaBytes = httpsDownloadWithTls12(releasePanelShaUrl, 5);
+            String expectedPanelSha = parseSha256Text(new String(shaBytes, UTF8));
+            if (expectedPanelSha.isEmpty()) {
+                throw new IOException("Invalid release panel SHA-256");
+            }
+
+            System.out.println("[AutoUpdate] HMG-API detected; syncing panel mod "
+                    + (releasePanelVer.isEmpty() ? "" : "v" + releasePanelVer + " ")
+                    + "(installed=" + (installedPanelVer.isEmpty() ? "none" : installedPanelVer) + ")");
+            byte[] zipBytes = httpsDownloadWithTls12(releasePanelUrl, 5);
+            String actualSha = sha256Hex(zipBytes);
+            if (!actualSha.equals(expectedPanelSha)) {
+                throw new IOException("Panel ZIP SHA-256 mismatch: expected=" + expectedPanelSha + " actual=" + actualSha);
+            }
+
+            ensureRamTmpDir();
+            File tmpZip = new File(PANEL_TMP_ZIP_PATH);
+            writeBytesNoSync(tmpZip, zipBytes);
+            try {
+                CommandResult pingRes = execCommandWithStatus(new String[]{HMGAPI_DAEMON_BIN, "ping"}, 10000L);
+                if (pingRes.exitCode != 0) {
+                    CommandResult daemonRes = execCommandWithStatus(new String[]{HMGAPI_DAEMON_BIN, "daemon"}, 15000L);
+                    System.out.println("[AutoUpdate] hmgapid daemon start rc=" + daemonRes.exitCode
+                            + (daemonRes.output.isEmpty() ? "" : " (" + daemonRes.output.trim() + ")"));
+                    try { Thread.sleep(1500L); } catch (InterruptedException ignored) {}
+                }
+
+                boolean wasNewInstall = !isHmgApiPanelModInstalled();
+                CommandResult instRes = execCommandWithStatus(
+                        new String[]{HMGAPI_DAEMON_BIN, "engine", "install", tmpZip.getAbsolutePath()},
+                        30000L
+                );
+                if (instRes.exitCode != 0) {
+                    System.out.println("[AutoUpdate] HMG-API panel install failed rc=" + instRes.exitCode
+                            + ": " + instRes.output.trim());
+                    return -1;
+                }
+
+                CommandResult applyRes = execCommandWithStatus(
+                        new String[]{HMGAPI_DAEMON_BIN, "engine", "apply"},
+                        60000L
+                );
+                if (applyRes.exitCode != 0) {
+                    System.out.println("[AutoUpdate] HMG-API panel apply failed rc=" + applyRes.exitCode
+                            + ": " + applyRes.output.trim());
+                    if (wasNewInstall) {
+                        execCommandWithStatus(
+                                new String[]{HMGAPI_DAEMON_BIN, "engine", "remove", HMGAPI_PANEL_MOD_ID},
+                                15000L
+                        );
+                    }
+                    return -1;
+                }
+
+                StatusDashboardOverlay.invalidatePanelPackageCache();
+                System.out.println("[AutoUpdate] HMG-API panel installed and applied (sha256="
+                        + expectedPanelSha.substring(0, 12) + "...)");
+                return 1;
+            } finally {
+                if (tmpZip.exists()) {
+                    tmpZip.delete();
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[AutoUpdate] HMG-API panel sync skipped/failed: " + e.getMessage());
+            return -1;
+        }
+    }
+
     public static int runAutoUpdate(String owner, String repo, String branch, String installDir, boolean force) {
         String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
         File statusNoteFile = new File(installDir, "config/last_update_status.txt");
@@ -4642,6 +5046,14 @@ public class CarrotBridgeMain {
 
             System.out.println("[AutoUpdate] Local version=" + localVersion + " (jar=" + BRIDGE_VERSION + "), Remote version=" + remoteVersion);
             if (!force && remoteVersion.equals(localVersion) && !jarNeedsUpdate) {
+                int panelRes = syncHmgApiPanelIfNeeded(verJson, false);
+                if (panelRes == 1) {
+                    String panelMsg = "분할화면 패널 자동 설치·적용 완료 (v" + BRIDGE_VERSION + ", " + nowStr + ")";
+                    lastAutoUpdateStatus = panelMsg;
+                    try { writeBytesAtomic(statusNoteFile, (panelMsg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
+                    healStaleServicePidFile(installDir);
+                    return 11;
+                }
                 System.out.println("[AutoUpdate] Already up to date.");
                 String msg = "최신 버전 유지 중 (v" + BRIDGE_VERSION + ", 내비ON 확인: " + nowStr + ")";
                 lastAutoUpdateStatus = msg;
@@ -4705,15 +5117,27 @@ public class CarrotBridgeMain {
                 }
             }
 
+            // 3. Optional HMG-API split-screen panel mod install/update (no-op when HMG-API is absent)
+            int panelRes = syncHmgApiPanelIfNeeded(verJson, force);
+
             writeBytesAtomic(localVerFile, verBytes);
             System.out.println("[AutoUpdate] Update completed successfully (" + updatedCount + " files updated to v" + remoteVersion + ").");
-            String doneMsg = updatedCount > 0
-                    ? ("새 버전(v" + remoteVersion + ") 업데이트 완료 (" + nowStr + ")")
-                    : ("최신 버전 유지 중 (v" + remoteVersion + ", 내비ON 확인: " + nowStr + ")");
+            String doneMsg;
+            if (updatedCount > 0) {
+                doneMsg = "새 버전(v" + remoteVersion + ") 업데이트 완료"
+                        + (panelRes == 1 ? " · 분할화면 패널 적용" : "")
+                        + " (" + nowStr + ")";
+            } else if (panelRes == 1) {
+                doneMsg = "분할화면 패널 자동 설치·적용 완료 (v" + remoteVersion + ", " + nowStr + ")";
+            } else {
+                doneMsg = "최신 버전 유지 중 (v" + remoteVersion + ", 내비ON 확인: " + nowStr + ")";
+            }
             lastAutoUpdateStatus = doneMsg;
             try { writeBytesAtomic(statusNoteFile, (doneMsg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
             healStaleServicePidFile(installDir);
-            return updatedCount > 0 ? 10 : 0; // 10 signals caller to restart daemon
+            if (updatedCount > 0) return 10; // 10 signals caller to restart daemon
+            if (panelRes == 1) return 11;    // 11 signals panel mod installed/applied live (no daemon restart)
+            return 0;
         } catch (Exception e) {
             System.out.println("[AutoUpdate] Error: " + e.getMessage());
             String errMsg = "내비 켜질 때 1회 자동 확인 (최근 확인 실패: " + nowStr + ")";
@@ -4795,11 +5219,17 @@ public class CarrotBridgeMain {
         } finally {
             fos.close();
         }
+        if (!syncDisk) {
+            tmp.setReadable(true, false);
+        }
         if (target.exists() && !tmp.renameTo(target)) {
             target.delete();
             tmp.renameTo(target);
         } else {
             tmp.renameTo(target);
+        }
+        if (!syncDisk) {
+            target.setReadable(true, false);
         }
     }
 
@@ -5046,6 +5476,70 @@ public class CarrotBridgeMain {
             if (h == null) return;
             try {
                 h.getClass().getMethod("removeCallbacks", Runnable.class).invoke(h, r);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private static final String PANEL_PKG = "com.hkg.carrotbridge.panel";
+        private static final String PANEL_RECEIVER = "com.hkg.carrotbridge.panel.CarrotPanelWidget";
+        private static final String ACTION_PANEL_UPDATE = "com.hkg.carrotbridge.panel.ACTION_UPDATE";
+        private static final int FLAG_INCLUDE_STOPPED_PACKAGES = 0x00000020;
+        private static volatile long lastPanelPkgCheckMs = 0L;
+        private static volatile boolean panelPkgInstalled = false;
+
+        public static void invalidatePanelPackageCache() {
+            lastPanelPkgCheckMs = 0L;
+        }
+
+        public static void notifyPanelWidget(final PanelSnapshot snap) {
+            if (snap == null) return;
+            postToUi(new Runnable() {
+                @Override
+                public void run() {
+                    sendPanelUpdateOnUiThread(snap);
+                }
+            });
+        }
+
+        private static void sendPanelUpdateOnUiThread(PanelSnapshot snap) {
+            if (!ensureUiContextOnUiThread() || sysContext == null) return;
+            long now = System.currentTimeMillis();
+            if (lastPanelPkgCheckMs == 0L || (now - lastPanelPkgCheckMs) > 30000L) {
+                lastPanelPkgCheckMs = now;
+                try {
+                    Object pm = sysContext.getClass().getMethod("getPackageManager").invoke(sysContext);
+                    panelPkgInstalled = pm != null
+                            && pm.getClass().getMethod("getPackageInfo", String.class, int.class)
+                                    .invoke(pm, PANEL_PKG, 0) != null;
+                } catch (Throwable ignored) {
+                    panelPkgInstalled = false;
+                }
+            }
+            if (!panelPkgInstalled) return;
+            try {
+                Class<?> intentCls = Class.forName("android.content.Intent");
+                Class<?> compCls = Class.forName("android.content.ComponentName");
+                Object intent = intentCls.getConstructor(String.class).newInstance(ACTION_PANEL_UPDATE);
+                Object comp = compCls.getConstructor(String.class, String.class).newInstance(PANEL_PKG, PANEL_RECEIVER);
+                intentCls.getMethod("setComponent", compCls).invoke(intent, comp);
+                intentCls.getMethod("addFlags", int.class).invoke(intent, FLAG_INCLUDE_STOPPED_PACKAGES);
+                Method putStr = intentCls.getMethod("putExtra", String.class, String.class);
+                Method putInt = intentCls.getMethod("putExtra", String.class, int.class);
+                Method putLong = intentCls.getMethod("putExtra", String.class, long.class);
+                putStr.invoke(intent, "bridgeVersion", BRIDGE_VERSION);
+                putInt.invoke(intent, "commaTone", snap.commaTone);
+                putStr.invoke(intent, "commaValue", snap.commaValue);
+                putStr.invoke(intent, "commaSub", snap.commaSub);
+                putInt.invoke(intent, "gpsTone", snap.gpsTone);
+                putStr.invoke(intent, "gpsValue", snap.gpsValue);
+                putStr.invoke(intent, "gpsSub", snap.gpsSub);
+                putInt.invoke(intent, "gpsMeterPct", snap.gpsMeterPct);
+                putInt.invoke(intent, "radioTone", snap.radioTone);
+                putStr.invoke(intent, "radioIcon", snap.radioIcon);
+                putStr.invoke(intent, "radioValue", snap.radioValue);
+                putStr.invoke(intent, "radioSub", snap.radioSub);
+                putLong.invoke(intent, "timestampMs", snap.timestampMs);
+                sysContext.getClass().getMethod("sendBroadcast", intentCls).invoke(sysContext, intent);
             } catch (Throwable ignored) {
             }
         }
@@ -5404,7 +5898,7 @@ public class CarrotBridgeMain {
             return readWlanNetInfo().localIp;
         }
 
-        private static boolean isSoftApMode(String wlanIp) {
+        static boolean isSoftApMode(String wlanIp) {
             if ("softap".equals(getSystemProperty("tcc.wifi.firmware.mode", ""))
                     && "ok".equals(getSystemProperty("wlan.driver.status", ""))) {
                 return true;
@@ -5414,8 +5908,12 @@ public class CarrotBridgeMain {
 
         /** "ap" | "wifi" | "off" from config/hotspot_auto.conf + config/wifi_auto.conf. */
         private static String currentBootWirelessMode() {
-            if (isBootAutoHotspotEnabled()) return "ap";
-            if (isBootAutoWifiEnabled()) return "wifi";
+            return currentBootWirelessMode(installDir);
+        }
+
+        static String currentBootWirelessMode(String dir) {
+            if (isBootAutoHotspotEnabled(dir)) return "ap";
+            if (isBootAutoWifiEnabled(dir)) return "wifi";
             return "off";
         }
 
@@ -5465,10 +5963,10 @@ public class CarrotBridgeMain {
         }
 
         // Status tones {foreground, background, border}: 정상 (green) / 추측항법·무선 (blue) / 확인 필요 (amber) / 꺼짐 (grey)
-        private static final int TONE_OK = 0;
-        private static final int TONE_INFO = 1;
-        private static final int TONE_WARN = 2;
-        private static final int TONE_OFF = 3;
+        static final int TONE_OK = 0;
+        static final int TONE_INFO = 1;
+        static final int TONE_WARN = 2;
+        static final int TONE_OFF = 3;
         private static final int[][] TONES = {
                 {C_OK, 0xFF0F2A22, 0xFF1F5A45},
                 {C_INFO, 0xFF0E2233, 0xFF1D4A66},
@@ -6135,19 +6633,21 @@ public class CarrotBridgeMain {
                 } catch (Throwable ignored) {
                 }
                 String versionText = "v" + BRIDGE_VERSION + shortUpdateStatus(autoUpdText);
-                boolean txOn = commaTxEnabled;
-                String commaIp = discoveredCarrotIp;
-                boolean commaAlive = txOn && !commaIp.isEmpty() && (now - discoveredCarrotTimeMs) < 30000L;
-                int commaTone = !txOn ? TONE_OFF : (commaAlive ? TONE_OK : TONE_WARN);
-                int gpsState = getGpsStatusState(st, now);
-                int gpsTone = gpsState == 2 ? TONE_OK : (gpsState == 1 ? TONE_INFO : TONE_WARN);
-                String ip = readWlanIpv4();
-                boolean apMode = isSoftApMode(ip);
-                boolean radioOn = apMode || !ip.isEmpty();
-                String radioIcon = apMode ? "hotspot" : "wifi";
-                int radioTone = radioOn ? TONE_INFO : TONE_OFF;
+                int arpCount = scanWlanArpPeers().size();
+                PanelSnapshot panel = buildPanelSnapshot(st, installDir, arpCount, now);
+                boolean txOn = panel.txOn;
+                String commaIp = panel.commaIp;
+                boolean commaAlive = panel.commaAlive;
+                int commaTone = panel.commaTone;
+                int gpsState = panel.gpsState;
+                int gpsTone = panel.gpsTone;
+                String ip = panel.wlanIp;
+                boolean apMode = panel.apMode;
+                boolean radioOn = panel.radioOn;
+                String radioIcon = panel.radioIcon;
+                int radioTone = panel.radioTone;
                 String bootMode = currentBootWirelessMode();
-                int routePts = latestRoutePointsCount;
+                int routePts = panel.routePts;
 
                 // ---------- Top bar ----------
                 setTextIfChanged(d.versionPill, versionText);
@@ -6186,16 +6686,7 @@ public class CarrotBridgeMain {
                 setTextIfChanged(d.countdownText, formatCountdownText(shownAtMs, timerPaused, autoCloseRemainingMs, now));
 
                 // Wireless status line (shared by the 무선 tile and the 무선 상태 diagnostics row)
-                boolean hotspotPaused = new File(HOTSPOT_PAUSE_FILE).isFile() && "ap".equals(bootMode);
-                String radioDetail;
-                if (apMode) {
-                    radioDetail = (ip.isEmpty() ? "" : ip + " · ") + "접속 기기 " + scanWlanArpPeers().size() + "대";
-                } else if (!ip.isEmpty()) {
-                    radioDetail = ip;
-                } else {
-                    radioDetail = "무선 연결 없음";
-                }
-                if (hotspotPaused) radioDetail += " · 핫스팟 자동 유지 일시중지";
+                String radioDetail = panel.radioSub;
 
                 if (statusTab) {
                     // ---------- 상태: route guidance ----------
@@ -6282,17 +6773,8 @@ public class CarrotBridgeMain {
                         setTextColor(d.commaTileValue, commaFg);
                         d.commaTileKey = cKey;
                     }
-                    setTextIfChanged(d.commaTileValue, !txOn ? "전송 꺼짐" : (commaAlive ? "연결됨" : "찾는 중"));
-                    String commaSub;
-                    if (!txOn) {
-                        commaSub = "설정 탭에서 다시 켤 수 있습니다";
-                    } else if (commaAlive) {
-                        commaSub = commaIp + " · " + String.format(Locale.US, "%.0f", carrotVEgoKph) + " km/h"
-                                + (routePts > 0 ? " · 경로 " + routePts + "pt" : "");
-                    } else {
-                        commaSub = commaIp.isEmpty() ? "같은 네트워크에 연결되면 자동으로 찾습니다" : commaIp + " (대기 중)";
-                    }
-                    setTextIfChanged(d.commaTileSub, commaSub);
+                    setTextIfChanged(d.commaTileValue, panel.commaValue);
+                    setTextIfChanged(d.commaTileSub, panel.commaSub);
 
                     int gpsFg = TONES[gpsTone][0];
                     String gKey = "gps#" + gpsTone;
@@ -6302,9 +6784,9 @@ public class CarrotBridgeMain {
                         u.bg(d.gpsMeterFill, gpsFg, gpsFg, 0f, 3f);
                         d.gpsTileKey = gKey;
                     }
-                    setTextIfChanged(d.gpsTileValue, formatGpsTileValue(st, now));
-                    setTextIfChanged(d.gpsTileSub, formatGpsTileSub(st, now));
-                    setBar(d.gpsMeterFill, d.gpsMeterRest, gpsSatMeterPct(st, now));
+                    setTextIfChanged(d.gpsTileValue, panel.gpsValue);
+                    setTextIfChanged(d.gpsTileSub, panel.gpsSub);
+                    setBar(d.gpsMeterFill, d.gpsMeterRest, panel.gpsMeterPct);
 
                     String rKey = radioIcon + "#" + radioTone;
                     if (!rKey.equals(d.radioTileKey)) {
@@ -6313,8 +6795,8 @@ public class CarrotBridgeMain {
                         setTextColor(d.radioTileValue, radioOn ? C_TEXT : C_FAINT);
                         d.radioTileKey = rKey;
                     }
-                    setTextIfChanged(d.radioTileValue, apMode ? "핫스팟(AP)" : (ip.isEmpty() ? "꺼짐" : "WiFi(Client)"));
-                    setTextIfChanged(d.radioTileSub, radioDetail);
+                    setTextIfChanged(d.radioTileValue, panel.radioValue);
+                    setTextIfChanged(d.radioTileSub, panel.radioSub);
                 } else {
                     // ---------- 설정: wireless & transmit ----------
                     styleSegment(u, d.segAp, "ap".equals(bootMode));
@@ -6366,9 +6848,9 @@ public class CarrotBridgeMain {
             postDelayedToUi(REFRESH_TASK, 500L);
         }
 
-        private static boolean isBootAutoHotspotEnabled() {
+        private static boolean isBootAutoHotspotEnabled(String dir) {
             try {
-                File conf = new File(installDir, "config/hotspot_auto.conf");
+                File conf = new File(dir, "config/hotspot_auto.conf");
                 if (conf.isFile()) {
                     String val = readFirstLineQuick(conf);
                     if ("0".equals(val)) return false;
@@ -6380,9 +6862,9 @@ public class CarrotBridgeMain {
             return !"0".equals(autoProp);
         }
 
-        private static boolean isBootAutoWifiEnabled() {
+        private static boolean isBootAutoWifiEnabled(String dir) {
             try {
-                File conf = new File(installDir, "config/wifi_auto.conf");
+                File conf = new File(dir, "config/wifi_auto.conf");
                 if (conf.isFile()) {
                     return "1".equals(readFirstLineQuick(conf));
                 }
@@ -6444,6 +6926,7 @@ public class CarrotBridgeMain {
                         }
                     } catch (Throwable ignored) {
                     }
+                    notifyPanelWidget(buildPanelSnapshot(navStateRef, installDir, latestArpPeers.size(), System.currentTimeMillis()));
                     postToUi(REFRESH_TASK);
                 }
             }, "SetBootWirelessMode").start();
@@ -6465,6 +6948,7 @@ public class CarrotBridgeMain {
             actionBannerMsg = nextState
                     ? "콤마 데이터 전송을 다시 켰습니다"
                     : "콤마 데이터 전송을 껐습니다";
+            notifyPanelWidget(buildPanelSnapshot(navStateRef, installDir, latestArpPeers.size(), System.currentTimeMillis()));
             postToUi(REFRESH_TASK);
         }
 
@@ -6658,6 +7142,8 @@ public class CarrotBridgeMain {
                 actionBannerMsg = "✅ 현재 최신 버전(v" + BRIDGE_VERSION + ")입니다. (" + nowStr + ")";
             } else if (rc == 10) {
                 actionBannerMsg = "🎉 업데이트 적용 완료! 브릿지 데몬을 재시작합니다...";
+            } else if (rc == 11) {
+                actionBannerMsg = "🎉 분할화면 패널 자동 설치 완료! (순정 분할화면 설정에서 CarrotNavi 체크) (" + nowStr + ")";
             } else {
                 actionBannerMsg = "⚠️ GitHub 연결 실패 (LTE/데이터 연결 상태를 확인해주세요)";
             }
@@ -7678,7 +8164,8 @@ public class CarrotBridgeMain {
                 || !OTA_RESTART_FLAG_PATH.startsWith("/dev/hkg_tmp/")
                 || !SVC_PID_FILE_PATH.startsWith("/dev/hkg_tmp/")
                 || !JAVA_PID_FILE_PATH.startsWith("/dev/hkg_tmp/")
-                || !HOTSPOT_PAUSE_FILE_PATH.startsWith("/dev/hkg_tmp/")) {
+                || !HOTSPOT_PAUSE_FILE_PATH.startsWith("/dev/hkg_tmp/")
+                || !PANEL_TMP_ZIP_PATH.startsWith("/dev/hkg_tmp/")) {
             throw new AssertionError("All volatile runtime paths must live under /dev/hkg_tmp/");
         }
         if (TRACE_MAX_BYTES < 256L * 1024L || TRACE_MAX_BYTES > 512L * 1024L) {
@@ -7729,6 +8216,78 @@ public class CarrotBridgeMain {
                 }
             }
             testTmpRoot.delete();
+        }
+
+        // PanelSnapshot + status JSON tests for HMG-API split-screen widget
+        NavState stPanel3d = new NavState();
+        applySvStatus(stPanel3d, 13, new float[]{32.5f, 41.0f, 28.0f}, 0x1F, 0x0F, nowV2);
+        stPanel3d.lat = 36.63581;
+        stPanel3d.lon = 127.48952;
+        stPanel3d.headingDeg = 83.0;
+        stPanel3d.lastGpsFixMs = nowV2;
+        stPanel3d.gpsFixStatus = 3;
+        PanelSnapshot p3d = buildPanelSnapshot(
+                stPanel3d, nowV2 + 50L, true, "192.168.0.103", nowV2, 55.4, 342,
+                "192.168.0.1", true, 2, false);
+        if (p3d.commaTone != 0 || !"연결됨".equals(p3d.commaValue)
+                || !"192.168.0.103 · 55 km/h · 경로 342pt".equals(p3d.commaSub)
+                || p3d.gpsTone != 0 || !"위성 3D · 9기".equals(p3d.gpsValue) || p3d.gpsMeterPct != 69
+                || !"hotspot".equals(p3d.radioIcon) || !"핫스팟(AP)".equals(p3d.radioValue)
+                || !"192.168.0.1 · 접속 기기 2대".equals(p3d.radioSub)) {
+            throw new AssertionError("PanelSnapshot 3D mismatch: " + p3d.signature());
+        }
+        PanelSnapshot pTunnel = buildPanelSnapshot(
+                stV2, nowV2 + 50L, false, "", 0L, 0.0, 0,
+                "", false, 0, false);
+        if (pTunnel.commaTone != 3 || !"전송 꺼짐".equals(pTunnel.commaValue)
+                || pTunnel.gpsTone != 1 || !"터널 DR · 0기".equals(pTunnel.gpsValue)
+                || !"꺼짐".equals(pTunnel.radioValue) || !"무선 연결 없음".equals(pTunnel.radioSub)) {
+            throw new AssertionError("PanelSnapshot tunnel/off mismatch: " + pTunnel.signature());
+        }
+        String statusJsonStr = buildStatusJsonString(stPanel3d, pkt.toJson(), new LinkedHashSet<String>(), p3d);
+        if (!statusJsonStr.contains("\"commaValue\": \"연결됨\"")
+                || !statusJsonStr.contains("\"gpsTileValue\": \"위성 3D · 9기\"")
+                || !statusJsonStr.contains("\"gpsMeterPct\": 69")
+                || !statusJsonStr.contains("\"radioValue\": \"핫스팟(AP)\"")
+                || !statusJsonStr.contains("\"lastPacket\":")) {
+            throw new AssertionError("Status JSON missing panel fields: " + statusJsonStr);
+        }
+
+        // HMG-API panel OTA sync logic tests
+        String sampleShaHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        if (!sampleShaHex.equals(parseSha256Text(sampleShaHex.toUpperCase(Locale.US) + "  carrotbridge-panel.zip\n"))
+                || !"".equals(parseSha256Text("not-a-sha256"))
+                || !"".equals(parseSha256Text(""))) {
+            throw new AssertionError("parseSha256Text mismatch");
+        }
+        if (compareSemver("1.0.1", "1.0.0") <= 0
+                || compareSemver("1.10.0", "1.2.0") <= 0
+                || compareSemver("1.0.0", "1.0.0") != 0
+                || compareSemver("1.0.0", "1.1.0") >= 0) {
+            throw new AssertionError("compareSemver mismatch");
+        }
+        if (needsHmgApiPanelSync(false, false, false, "1.0.0", "")
+                || needsHmgApiPanelSync(false, false, true, "1.0.0", "")
+                || !needsHmgApiPanelSync(true, false, false, "1.0.0", "")
+                || needsHmgApiPanelSync(true, true, false, "1.0.0", "1.0.0")
+                || !needsHmgApiPanelSync(true, true, true, "1.0.0", "1.0.0")
+                || !needsHmgApiPanelSync(true, true, false, "1.0.1", "1.0.0")
+                || needsHmgApiPanelSync(true, true, false, "1.0.0", "1.1.0")
+                || !needsHmgApiPanelSync(true, true, false, "1.0.0", "")) {
+            throw new AssertionError("needsHmgApiPanelSync decision matrix mismatch");
+        }
+        String sampleVerJson = "{\n"
+                + "  \"version\": \"1.3.6\",\n"
+                + "  \"release_panel_version\": \"1.0.0\",\n"
+                + "  \"release_panel_zip_url\": \"https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge-panel.zip\",\n"
+                + "  \"release_panel_zip_sha256_url\": \"https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge-panel.zip.sha256\"\n"
+                + "}\n";
+        if (!"1.0.0".equals(extractJsonString(sampleVerJson, "release_panel_version"))
+                || !"https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge-panel.zip"
+                        .equals(extractJsonString(sampleVerJson, "release_panel_zip_url"))
+                || !"https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge-panel.zip.sha256"
+                        .equals(extractJsonString(sampleVerJson, "release_panel_zip_sha256_url"))) {
+            throw new AssertionError("extractJsonString failed for release_panel_* fields");
         }
 
         System.out.println("SELF-TEST PASSED! Sample 7706 JSON:\n" + pkt.toJson());
