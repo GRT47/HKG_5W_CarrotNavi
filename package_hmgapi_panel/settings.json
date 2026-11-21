@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "settings": [
+    {
+      "key": "keep_lte_on_wifi",
+      "type": "toggle",
+      "default": true,
+      "title": "WiFi(Client) 연결 시 LTE 기본 회선 유지"
+    }
+  ]
+}

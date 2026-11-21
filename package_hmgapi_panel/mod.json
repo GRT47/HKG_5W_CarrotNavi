@@ -1,13 +1,17 @@
 {
   "id": "carrotbridge-panel",
-  "name": "CarrotNavi 분할화면",
-  "version": "1.0.0",
+  "name": "CarrotNavi 분할화면 · WiFi+LTE 공존",
+  "version": "1.1.0",
   "hmgapi": ">=1.0.0",
   "authors": ["GRT47"],
   "license": "MIT",
   "repo": "https://github.com/GRT47/HKG_5W_CarrotNavi",
-  "description": "HKG 5W CarrotNavi 연결 상태(콤마 기기 · 차량 GPS · 무선)를 순정 우측 분할화면 페이지로 표시합니다. 카드를 누르면 전체 대시보드가 열립니다.",
-  "live": true,
+  "description": "HKG 5W CarrotNavi 연결 상태를 순정 우측 분할화면 페이지로 표시하고, WiFi(Client) 연결 시에도 순정 LTE(rmnet0) 기본 회선이 끊어지지 않도록 유지합니다(keep_lte_on_wifi).",
+  "live": false,
+  "hooks": {
+    "jar": "hooks.jar",
+    "entry": "com.hkg.carrotbridge.hook.CarrotWifiLteHook"
+  },
   "apps": [
     {
       "apk": "app/CarrotPanel.apk",

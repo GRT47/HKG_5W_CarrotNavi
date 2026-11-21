@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build signed HMG-API split-screen panel mod (carrotbridge-panel.zip + carrotbridge-panel-<version>.zip)."""
+"""Build signed HMG-API split-screen panel & WiFi+LTE coexistence mod."""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import zipfile
 from pathlib import Path
@@ -26,6 +27,44 @@ APK_KEY_PASS = "carrotbridge"
 def _version_key(path: Path) -> tuple[int, ...]:
     nums = re.findall(r"\d+", path.name)
     return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def _parse_uleb128(data: bytes, off: int) -> tuple[int, int]:
+    val = 0
+    shift = 0
+    while True:
+        b = data[off]
+        off += 1
+        val |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            return val, off
+        shift += 7
+
+
+def verify_dex_classes(dex_bytes: bytes, expected_prefix: str) -> None:
+    """Verify DEX 035 defines only classes under expected_prefix (no leaked compile-only stubs)."""
+    if dex_bytes[:8] != b"dex\n035\x00":
+        raise RuntimeError(f"Unexpected DEX magic header: {dex_bytes[:8]!r} (expected b'dex\\n035\\x00')")
+    hdr = struct.unpack_from("<8sI20sIIIIIIIIIIIIIIIIII", dex_bytes, 0)
+    str_cnt, str_off = hdr[9], hdr[10]
+    type_cnt, type_off = hdr[11], hdr[12]
+    cls_cnt, cls_off = hdr[19], hdr[20]
+
+    strings = []
+    for i in range(str_cnt):
+        soff = struct.unpack_from("<I", dex_bytes, str_off + i * 4)[0]
+        _, pos = _parse_uleb128(dex_bytes, soff)
+        end = dex_bytes.find(b"\x00", pos)
+        strings.append(dex_bytes[pos:end].decode("utf-8", errors="replace"))
+
+    types = [strings[struct.unpack_from("<I", dex_bytes, type_off + i * 4)[0]] for i in range(type_cnt)]
+    if cls_cnt == 0:
+        raise RuntimeError("classes.dex has zero defined classes")
+    for i in range(cls_cnt):
+        c_idx = struct.unpack_from("<I", dex_bytes, cls_off + i * 32)[0]
+        cname = types[c_idx]
+        if not cname.startswith(expected_prefix):
+            raise RuntimeError(f"Stub or unexpected class leaked into classes.dex: {cname}")
 
 
 def find_sdk_root() -> Path:
@@ -113,6 +152,58 @@ def resolve_signing_keys(require_keys: bool) -> tuple[Path, Path, str, Path | No
     return author_key_path, apk_keystore_path, env_apk_pass, None
 
 
+def build_hooks_jar(
+    javac: str,
+    java: str,
+    d8: str,
+    android_jar: str,
+    hook_stub_classes: Path,
+    hook_classes: Path,
+    hook_dex_dir: Path,
+    out_jar: Path,
+) -> None:
+    """Compile compile-only HMG-API stubs + CarrotWifiLteHook, self-test, verify DEX 035, and write hooks.jar."""
+    stub_sources = [str(p) for p in sorted((BASE_DIR / "hook_stub").rglob("*.java"))]
+    hook_sources = [str(p) for p in sorted((BASE_DIR / "hook_src").rglob("*.java"))]
+    if not stub_sources or not hook_sources:
+        raise RuntimeError("Missing hook_stub or hook_src Java sources")
+
+    subprocess.run([
+        javac, "--release", "8", "-encoding", "UTF-8",
+        "-cp", android_jar, "-d", str(hook_stub_classes),
+        *stub_sources,
+    ], check=True)
+    subprocess.run([
+        javac, "--release", "8", "-encoding", "UTF-8",
+        "-cp", f"{android_jar}{os.pathsep}{hook_stub_classes}",
+        "-d", str(hook_classes),
+        *hook_sources,
+    ], check=True)
+
+    # Host self-test (touches only pure Java policy helpers)
+    subprocess.run([
+        java, "-cp", f"{hook_classes}{os.pathsep}{hook_stub_classes}{os.pathsep}{android_jar}",
+        "com.hkg.carrotbridge.hook.CarrotWifiLteHook",
+    ], check=True)
+
+    hook_class_files = [str(p) for p in sorted(hook_classes.rglob("*.class"))]
+    subprocess.run([
+        d8, "--release", "--min-api", "19", "--no-desugaring",
+        "--lib", android_jar,
+        "--classpath", str(hook_stub_classes),
+        "--output", str(hook_dex_dir),
+        *hook_class_files,
+    ], check=True)
+
+    dex_bytes = (hook_dex_dir / "classes.dex").read_bytes()
+    verify_dex_classes(dex_bytes, "Lcom/hkg/carrotbridge/hook/")
+
+    with zipfile.ZipFile(out_jar, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zi = zipfile.ZipInfo("classes.dex", date_time=(2026, 1, 1, 0, 0, 0))
+        zi.compress_type = zipfile.ZIP_DEFLATED
+        zf.writestr(zi, dex_bytes)
+
+
 def build(require_keys: bool = False) -> None:
     mod_meta = json.loads((BASE_DIR / "mod.json").read_text(encoding="utf-8"))
     mod_id = mod_meta["id"]
@@ -144,8 +235,11 @@ def build(require_keys: bool = False) -> None:
     gen_dir = BUILD_DIR / "gen"
     classes_dir = BUILD_DIR / "classes"
     dex_dir = BUILD_DIR / "dex"
+    hook_stub_classes = BUILD_DIR / "hook_stub_classes"
+    hook_classes = BUILD_DIR / "hook_classes"
+    hook_dex_dir = BUILD_DIR / "hook_dex"
     signer_classes = BUILD_DIR / "signer_classes"
-    for d in (gen_dir, classes_dir, dex_dir, signer_classes, STAGE_DIR):
+    for d in (gen_dir, classes_dir, dex_dir, hook_stub_classes, hook_classes, hook_dex_dir, signer_classes, STAGE_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
     ci_keys_dir: Path | None = None
@@ -167,7 +261,7 @@ def build(require_keys: bool = False) -> None:
             str(res_zip),
         ], check=True)
 
-        # 2. Compile Java sources + generated R.java -> DEX 035
+        # 2. Compile widget APK Java sources + generated R.java -> DEX 035
         java_files = [str(p) for p in sorted((BASE_DIR / "app" / "java").rglob("*.java"))]
         gen_files = [str(p) for p in sorted(gen_dir.rglob("*.java"))]
         subprocess.run([
@@ -183,8 +277,7 @@ def build(require_keys: bool = False) -> None:
         ], check=True)
 
         dex_bytes = (dex_dir / "classes.dex").read_bytes()
-        if dex_bytes[:8] != b"dex\n035\x00":
-            raise RuntimeError(f"Unexpected DEX magic: {dex_bytes[:8]!r} (expected DEX 035)")
+        verify_dex_classes(dex_bytes, "Lcom/hkg/carrotbridge/panel/")
 
         # 3. Merge classes.dex into base.apk, zipalign, and v1-sign (Android 4.4 requires v1 JAR signature)
         unsigned_apk = BUILD_DIR / "unsigned.apk"
@@ -226,9 +319,16 @@ def build(require_keys: bool = False) -> None:
         ], check=True)
         subprocess.run([apksigner, "verify", "--min-sdk-version", "19", str(stage_apk)], check=True)
 
-        # 4. Stage mod.json (normalized LF) & sign mod directory with HMG-API ECDSA P-256 key
-        stage_mod_json = STAGE_DIR / "mod.json"
-        stage_mod_json.write_bytes((BASE_DIR / "mod.json").read_bytes().replace(b"\r\n", b"\n"))
+        # 4. Build system_server ConnectivityService hook jar (hooks.jar)
+        hooks_jar_rel = mod_meta.get("hooks", {}).get("jar", "hooks.jar")
+        stage_hooks_jar = STAGE_DIR / hooks_jar_rel
+        build_hooks_jar(javac, java, d8, android_jar, hook_stub_classes, hook_classes, hook_dex_dir, stage_hooks_jar)
+
+        # 5. Stage mod.json + settings.json (normalized LF) & sign mod directory with HMG-API ECDSA P-256 key
+        (STAGE_DIR / "mod.json").write_bytes((BASE_DIR / "mod.json").read_bytes().replace(b"\r\n", b"\n"))
+        settings_src = BASE_DIR / "settings.json"
+        if settings_src.is_file():
+            (STAGE_DIR / "settings.json").write_bytes(settings_src.read_bytes().replace(b"\r\n", b"\n"))
 
         subprocess.run([
             javac, "--release", "8", "-encoding", "UTF-8",
@@ -241,7 +341,7 @@ def build(require_keys: bool = False) -> None:
         subprocess.run([java, "-cp", str(signer_classes), "HmgModSigner", "sign", str(STAGE_DIR), str(author_key_path)], check=True)
         subprocess.run([java, "-cp", str(signer_classes), "HmgModSigner", "verify", str(STAGE_DIR)], check=True)
 
-        # 5. Package deterministic release zip + SHA-256 + local versioned copy for USB updates
+        # 6. Package deterministic release zip + SHA-256 + local versioned copy for USB updates
         release_zip = BUILD_DIR / f"{mod_id}.zip"
         with zipfile.ZipFile(release_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for fp in sorted(STAGE_DIR.rglob("*")):
@@ -259,6 +359,7 @@ def build(require_keys: bool = False) -> None:
         shutil.copy2(release_zip, versioned_zip)
 
         print(f"Built signed APK:      {stage_apk} ({stage_apk.stat().st_size} bytes)")
+        print(f"Built hooks JAR:       {stage_hooks_jar} ({stage_hooks_jar.stat().st_size} bytes)")
         print(f"Built release mod zip: {release_zip} ({release_zip.stat().st_size} bytes, sha256={zip_sha[:16]}...)")
         print(f"Built USB mod copy:    {versioned_zip} ({versioned_zip.stat().st_size} bytes)")
     finally:
