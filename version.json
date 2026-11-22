@@ -4,7 +4,7 @@
   "branch": "main",
   "release_jar_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar",
   "release_jar_sha256_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar.sha256",
-  "release_panel_version": "1.2.0",
+  "release_panel_version": "1.2.1",
   "release_panel_zip_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge-panel.zip",
   "release_panel_zip_sha256_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge-panel.zip.sha256",
   "files": {
@@ -18,7 +18,7 @@
     },
     "scripts/tbt-dump.sh": {
       "remote": "package_carrotnavi_bridge/scripts/tbt-dump.sh",
-      "sha256": "20ca8ec2270e8701bf0107d2e17b0799d2268d47ca546f23ffe4507f8e2dd959"
+      "sha256": "dd16b8272ca824ba37a415b6045bd9f95cb31d51d5076ebc2d35468687f4660f"
     },
     "config/bridge_config.json": {
       "remote": "package_carrotnavi_bridge/config/bridge_config.json",

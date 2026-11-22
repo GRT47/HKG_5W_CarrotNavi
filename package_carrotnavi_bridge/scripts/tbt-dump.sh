@@ -22,6 +22,16 @@ getprop > "$LOCAL_DUMP_DIR/getprop.txt" 2>&1
 ip addr > "$LOCAL_DUMP_DIR/ip_addr.txt" 2>&1
 ip route show table all > "$LOCAL_DUMP_DIR/ip_route_all.txt" 2>&1
 cat /proc/net/arp > "$LOCAL_DUMP_DIR/arp_table.txt" 2>&1
+ip rule show > "$LOCAL_DUMP_DIR/ip_rule.txt" 2>&1
+dumpsys connectivity > "$LOCAL_DUMP_DIR/dumpsys_connectivity.txt" 2>&1
+[ -f "/data/hmgapi/public/state.json" ] && cp "/data/hmgapi/public/state.json" "$LOCAL_DUMP_DIR/hmgapi_state.json" 2>/dev/null
+if [ -f "/data/hmgapi/logs/hmgapi/log.log" ]; then
+    if [ -x "/system/bin/busybox" ]; then
+        /system/bin/busybox tail -n 200 "/data/hmgapi/logs/hmgapi/log.log" > "$LOCAL_DUMP_DIR/hmgapi_log_recent.txt" 2>&1
+    else
+        tail -n 200 "/data/hmgapi/logs/hmgapi/log.log" > "$LOCAL_DUMP_DIR/hmgapi_log_recent.txt" 2>&1
+    fi
+fi
 
 if [ -f "$RAM_TMP/carrotbridge_status.json" ]; then
     cp "$RAM_TMP/carrotbridge_status.json" "$LOCAL_DUMP_DIR/carrotbridge_status.json" 2>/dev/null
@@ -62,7 +72,8 @@ fi
     ps | grep -E "hostapd|wpa_supplicant|dnsmasq|dhcpcd"
 } > "$LOCAL_DUMP_DIR/wireless_state.txt" 2>&1
 logcat -d -v time WifiService:V WifiStateMachine:V WifiController:V WifiSettings:V SoftapController:V \
-    Tethering:V PhoneProjection:I CarrotBridge:I *:S > "$LOCAL_DUMP_DIR/logcat_wifi_recent.txt" 2>&1
+    Tethering:V ConnectivityService:D MusicStreamingService:D AsyncTaskConnect3APN:D \
+    PhoneProjection:I CarrotBridge:I HMG-API:I *:S > "$LOCAL_DUMP_DIR/logcat_wifi_recent.txt" 2>&1
 if [ -f "$RAM_TMP/carrotbridge_svc.log" ]; then
     cp "$RAM_TMP/carrotbridge_svc.log" "$LOCAL_DUMP_DIR/carrotbridge_svc.log" 2>/dev/null
 elif [ -f "/data/local/tmp/carrotbridge_svc.log" ]; then

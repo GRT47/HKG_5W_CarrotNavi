@@ -40,6 +40,7 @@ public final class CarrotWifiLteHook extends ModEntry {
     private static volatile boolean hookEnabled = true;
     private static volatile boolean keepLteOnWifi = true;
     private static volatile boolean receiverRegistered = false;
+    private static volatile String lastIpv6DisabledIface = null;
 
     private static final ThreadLocal<Integer> SUPPRESS_WIFI_DEFAULT_DEPTH = new ThreadLocal<Integer>();
     private static final ThreadLocal<Boolean> IN_ENFORCE_PREF = new ThreadLocal<Boolean>();
@@ -71,12 +72,16 @@ public final class CarrotWifiLteHook extends ModEntry {
 
     static boolean shouldSuppressWifiDefaultForConnect(
             boolean active, int netType, int activeDefaultNet, boolean mobileConnected) {
-        return active && netType == TYPE_WIFI && (activeDefaultNet == TYPE_MOBILE || mobileConnected);
+        return active && netType == TYPE_WIFI;
     }
 
     static boolean shouldSuppressWifiDefaultForDisconnect(
             boolean active, int netType, int activeDefaultNet) {
-        return active && netType == TYPE_WIFI && activeDefaultNet == TYPE_MOBILE;
+        return active && netType == TYPE_WIFI && activeDefaultNet != TYPE_WIFI;
+    }
+
+    static boolean shouldDisableWifiIpv6(boolean active, int netType) {
+        return active && netType == TYPE_WIFI;
     }
 
     static boolean shouldPreferMobileOverWifi(
@@ -248,7 +253,8 @@ public final class CarrotWifiLteHook extends ModEntry {
                         if (shouldSuppressWifiDefaultForConnect(isActive(), netType, activeDefault, mobileConn)) {
                             pushSuppressWifiDefault();
                             hcSuppressPushed.set(Boolean.TRUE);
-                            logInfo("kept MOBILE default while connecting WIFI as secondary");
+                            logInfo("kept WIFI secondary (activeDefault=" + activeDefault
+                                    + ", mobileConn=" + mobileConn + ")");
                         } else if (shouldPreferMobileOverWifi(isActive(), netType, activeDefault)) {
                             IN_MOBILE_TAKEOVER.set(Boolean.TRUE);
                             hcTakeoverPushed.set(Boolean.TRUE);
@@ -266,6 +272,20 @@ public final class CarrotWifiLteHook extends ModEntry {
                     if (Boolean.TRUE.equals(hcTakeoverPushed.get())) {
                         hcTakeoverPushed.remove();
                         IN_MOBILE_TAKEOVER.remove();
+                    }
+                    try {
+                        if (param.args != null && param.args.length >= 1 && param.args[0] instanceof NetworkInfo) {
+                            int netType = ((NetworkInfo) param.args[0]).getType();
+                            if (shouldDisableWifiIpv6(isActive(), netType)) {
+                                String iface = getWifiInterfaceName(param.thisObject);
+                                if (iface != null) {
+                                    setWifiIpv6Enabled(param.thisObject, iface, false);
+                                    lastIpv6DisabledIface = iface;
+                                    logInfo("disabled IPv6 on " + iface + " while keeping LTE default");
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
                     }
                 }
             });
@@ -345,6 +365,67 @@ public final class CarrotWifiLteHook extends ModEntry {
                 protected void afterHookedMethod(Param param) {
                     if (Boolean.TRUE.equals(hdPushed.get())) {
                         hdPushed.remove();
+                        popSuppressWifiDefault();
+                    }
+                    try {
+                        if (param.args != null && param.args.length >= 1 && param.args[0] instanceof NetworkInfo) {
+                            if (((NetworkInfo) param.args[0]).getType() == TYPE_WIFI && lastIpv6DisabledIface != null) {
+                                String iface = lastIpv6DisabledIface;
+                                lastIpv6DisabledIface = null;
+                                setWifiIpv6Enabled(param.thisObject, iface, true);
+                                logInfo("re-enabled IPv6 on " + iface + " after WIFI disconnect");
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+
+            // 9b. handleConnectionFailure: prevent WIFI failures from triggering default-network failover
+            final ThreadLocal<Boolean> hcfPushed = new ThreadLocal<Boolean>();
+            Hooks.findAndHookMethod(csCls, "handleConnectionFailure", "android.net.NetworkInfo", new MethodHook() {
+                @Override
+                protected void beforeHookedMethod(Param param) {
+                    try {
+                        if (param.args == null || param.args.length < 1 || !(param.args[0] instanceof NetworkInfo)) return;
+                        NetworkInfo info = (NetworkInfo) param.args[0];
+                        int activeDefault = getActiveDefaultNetwork(param.thisObject);
+                        boolean mobileConn = isNetworkConnected(param.thisObject, TYPE_MOBILE);
+                        if (shouldSuppressWifiDefaultForConnect(isActive(), info.getType(), activeDefault, mobileConn)) {
+                            pushSuppressWifiDefault();
+                            hcfPushed.set(Boolean.TRUE);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                @Override
+                protected void afterHookedMethod(Param param) {
+                    if (Boolean.TRUE.equals(hcfPushed.get())) {
+                        hcfPushed.remove();
+                        popSuppressWifiDefault();
+                    }
+                }
+            });
+
+            // 9c. tryFailover: prevent temporary LTE drops from failing over default network to WIFI
+            final ThreadLocal<Boolean> tfPushed = new ThreadLocal<Boolean>();
+            Hooks.findAndHookMethod(csCls, "tryFailover", int.class, new MethodHook() {
+                @Override
+                protected void beforeHookedMethod(Param param) {
+                    try {
+                        if (isActive()) {
+                            pushSuppressWifiDefault();
+                            tfPushed.set(Boolean.TRUE);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                @Override
+                protected void afterHookedMethod(Param param) {
+                    if (Boolean.TRUE.equals(tfPushed.get())) {
+                        tfPushed.remove();
                         popSuppressWifiDefault();
                     }
                 }
@@ -433,8 +514,60 @@ public final class CarrotWifiLteHook extends ModEntry {
                     Hooks.callMethod(cs, "addRoute", wifiLp, route, Boolean.FALSE, Boolean.FALSE);
                 }
             }
+            Object nameObj = Hooks.callMethod(wifiLp, "getInterfaceName");
+            if (nameObj instanceof String && !((String) nameObj).isEmpty()) {
+                String iface = (String) nameObj;
+                setWifiIpv6Enabled(cs, iface, false);
+                lastIpv6DisabledIface = iface;
+                logInfo("disabled IPv6 on " + iface + " while keeping LTE default");
+            }
         } catch (Throwable t) {
             logError("demoteWifiDefaultRoutes failed", t);
+        }
+    }
+
+    private static String getWifiInterfaceName(Object cs) {
+        if (cs == null) return null;
+        try {
+            Object arrObj = Hooks.getObjectField(cs, "mNetTrackers");
+            if (arrObj instanceof Object[]) {
+                Object[] trackers = (Object[]) arrObj;
+                if (TYPE_WIFI < trackers.length && trackers[TYPE_WIFI] != null) {
+                    Object lp = Hooks.callMethod(trackers[TYPE_WIFI], "getLinkProperties");
+                    if (lp != null) {
+                        Object nameObj = Hooks.callMethod(lp, "getInterfaceName");
+                        if (nameObj instanceof String && !((String) nameObj).isEmpty()) {
+                            return (String) nameObj;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Object lpsObj = Hooks.getObjectField(cs, "mCurrentLinkProperties");
+            if (lpsObj instanceof Object[]) {
+                Object[] lps = (Object[]) lpsObj;
+                if (TYPE_WIFI < lps.length && lps[TYPE_WIFI] != null) {
+                    Object nameObj = Hooks.callMethod(lps[TYPE_WIFI], "getInterfaceName");
+                    if (nameObj instanceof String && !((String) nameObj).isEmpty()) {
+                        return (String) nameObj;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "wlan0";
+    }
+
+    private static void setWifiIpv6Enabled(Object cs, String iface, boolean enable) {
+        if (cs == null || iface == null || iface.isEmpty()) return;
+        try {
+            Object netd = Hooks.getObjectField(cs, "mNetd");
+            if (netd == null) return;
+            Hooks.callMethod(netd, enable ? "enableIpv6" : "disableIpv6", iface);
+        } catch (Throwable t) {
+            logError((enable ? "enableIpv6" : "disableIpv6") + " failed for " + iface, t);
         }
     }
 
@@ -466,16 +599,22 @@ public final class CarrotWifiLteHook extends ModEntry {
     public static void runSelfTest() {
         if (!shouldSuppressWifiDefaultForConnect(true, TYPE_WIFI, TYPE_MOBILE, true)
                 || !shouldSuppressWifiDefaultForConnect(true, TYPE_WIFI, -1, true)
-                || shouldSuppressWifiDefaultForConnect(true, TYPE_WIFI, -1, false)
+                || !shouldSuppressWifiDefaultForConnect(true, TYPE_WIFI, -1, false)
                 || shouldSuppressWifiDefaultForConnect(true, TYPE_MOBILE, TYPE_WIFI, false)
                 || shouldSuppressWifiDefaultForConnect(false, TYPE_WIFI, TYPE_MOBILE, true)) {
             throw new AssertionError("shouldSuppressWifiDefaultForConnect matrix failed");
         }
         if (!shouldSuppressWifiDefaultForDisconnect(true, TYPE_WIFI, TYPE_MOBILE)
+                || !shouldSuppressWifiDefaultForDisconnect(true, TYPE_WIFI, -1)
                 || shouldSuppressWifiDefaultForDisconnect(true, TYPE_WIFI, TYPE_WIFI)
                 || shouldSuppressWifiDefaultForDisconnect(true, TYPE_MOBILE, TYPE_MOBILE)
                 || shouldSuppressWifiDefaultForDisconnect(false, TYPE_WIFI, TYPE_MOBILE)) {
             throw new AssertionError("shouldSuppressWifiDefaultForDisconnect matrix failed");
+        }
+        if (!shouldDisableWifiIpv6(true, TYPE_WIFI)
+                || shouldDisableWifiIpv6(true, TYPE_MOBILE)
+                || shouldDisableWifiIpv6(false, TYPE_WIFI)) {
+            throw new AssertionError("shouldDisableWifiIpv6 matrix failed");
         }
         if (!shouldPreferMobileOverWifi(true, TYPE_MOBILE, TYPE_WIFI)
                 || shouldPreferMobileOverWifi(true, TYPE_WIFI, TYPE_MOBILE)
